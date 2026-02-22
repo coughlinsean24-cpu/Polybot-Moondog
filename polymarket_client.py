@@ -576,3 +576,169 @@ def get_adaptive_poll_interval(secs_remaining: float) -> float:
         return 3.0
     else:
         return 1.0
+
+
+# ── Market Scanner ──────────────────────────────────────────────────────────
+# Queries the Gamma API broadly for active binary markets across all categories,
+# returning a standardized list for the dashboard scanner tab.
+
+@dataclass
+class ScannedMarket:
+    """A market discovered by the scanner — not necessarily Up/Down crypto."""
+    market_id: str                # conditionId
+    question: str                 # Full question text
+    token_id_yes: str             # Token for outcome 1 (Up / Yes / Over / Team A)
+    token_id_no: str              # Token for outcome 2 (Down / No / Under / Team B)
+    outcome_yes: str              # Label for outcome 1
+    outcome_no: str               # Label for outcome 2
+    end_time: datetime            # Market close time
+    liquidity: float = 0.0       # Reported liquidity (USD)
+    volume: float = 0.0          # Reported volume (USD)
+    category: str = "other"      # crypto-5m, crypto-15m, sports, esports, etc.
+    slug: str = ""               # Event slug
+    best_ask_yes: float = 0.0    # Best ask for outcome 1 (fetched separately)
+    best_ask_no: float = 0.0     # Best ask for outcome 2 (fetched separately)
+
+
+def _classify_market(slug: str, question: str) -> str:
+    """Classify a market into a category based on slug and question text."""
+    q = question.lower()
+    s = slug.lower() if slug else ""
+    if "updown-5m-" in s:
+        return "crypto-5m"
+    if "updown-15m-" in s:
+        return "crypto-15m"
+    if any(x in s for x in ["nba", "nhl", "nfl", "mlb", "mls", "epl", "ucl", "afl"]):
+        return "sports"
+    if any(x in s for x in ["esport", "league-of-legends", "dota", "csgo", "valorant", "lol"]):
+        return "esports"
+    if any(x in q for x in ["over", "under", "total"]) and any(x in q for x in ["kills", "goals", "points", "runs"]):
+        return "over-under"
+    if any(x in q for x in ["temperature", "weather", "snow", "rain", "precipitation"]):
+        return "weather"
+    return "other"
+
+
+def scan_active_markets(
+    max_hours_to_expiry: float = 24.0,
+    min_liquidity: float = 0.0,
+    max_liquidity: float = 999_999.0,
+    limit: int = 200,
+) -> list[ScannedMarket]:
+    """
+    Scan the Gamma API for ALL active binary (2-outcome) markets.
+
+    Fetches recently-created active markets and filters client-side for:
+    - Binary outcomes only (exactly 2 outcomes)
+    - Within time-to-expiry range
+    - Within liquidity range
+
+    Returns a list of ScannedMarket objects sorted by time to expiry.
+    """
+    url = f"{config.GAMMA_URL}/markets"
+    now = datetime.now(timezone.utc)
+    results: list[ScannedMarket] = []
+    seen_ids: set[str] = set()
+
+    def _parse_market(m: dict) -> ScannedMarket | None:
+        """Parse a raw Gamma market dict into a ScannedMarket."""
+        cid = m.get("conditionId", "")
+        if not cid or cid in seen_ids:
+            return None
+        if m.get("closed", False):
+            return None
+
+        # Must be binary (exactly 2 outcomes)
+        try:
+            outcomes_raw = m.get("outcomes", "[]")
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+        try:
+            tokens_raw = m.get("clobTokenIds", "[]")
+            tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        if len(outcomes) != 2 or len(tokens) != 2:
+            return None
+
+        # Parse end time
+        end_str = m.get("endDate", "")
+        if not end_str:
+            return None
+        try:
+            end_time = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+        # Time filter
+        secs_left = (end_time - now).total_seconds()
+        if secs_left < 0 or secs_left > max_hours_to_expiry * 3600:
+            return None
+
+        # Liquidity filter (client-side since API params are unreliable)
+        liq = float(m.get("liquidity", 0) or 0)
+        vol = float(m.get("volume", 0) or 0)
+        if liq < min_liquidity or liq > max_liquidity:
+            return None
+
+        slug = m.get("slug", "") or m.get("groupItemTitle", "") or ""
+        question = m.get("question", "")
+        category = _classify_market(slug, question)
+
+        seen_ids.add(cid)
+        return ScannedMarket(
+            market_id=cid,
+            question=question,
+            token_id_yes=tokens[0],
+            token_id_no=tokens[1],
+            outcome_yes=outcomes[0],
+            outcome_no=outcomes[1],
+            end_time=end_time,
+            liquidity=liq,
+            volume=vol,
+            category=category,
+            slug=slug,
+        )
+
+    # Query 1: Most recently created active markets (catches new short-lived ones)
+    def _fetch_batch(params: dict) -> list[dict]:
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else [data]
+        except Exception as e:
+            log_error("scan_active_markets", e)
+            return []
+
+    queries = [
+        {"active": "true", "closed": "false", "order": "startDate",
+         "ascending": "false", "limit": str(limit)},
+        {"active": "true", "closed": "false", "order": "endDate",
+         "ascending": "true", "limit": str(limit)},
+    ]
+
+    # Fetch both queries in parallel
+    all_raw: list[dict] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_fetch_batch, q) for q in queries]
+        for f in as_completed(futures):
+            all_raw.extend(f.result())
+
+    for m in all_raw:
+        parsed = _parse_market(m)
+        if parsed:
+            results.append(parsed)
+
+    # Sort by time to expiry (soonest first)
+    results.sort(key=lambda m: m.end_time)
+
+    log.debug(
+        f"[SCANNER] Found {len(results)} binary markets "
+        f"(scanned {len(all_raw)} raw markets, "
+        f"max_hours={max_hours_to_expiry}, liq={min_liquidity}-{max_liquidity})"
+    )
+    return results

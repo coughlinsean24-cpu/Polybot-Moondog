@@ -40,12 +40,12 @@ from logger import (
     log_resolution,
 )
 from polymarket_client import (
-    MarketWindow, OrderBookSnapshot,
+    MarketWindow, OrderBookSnapshot, ScannedMarket,
     get_clob_client, fetch_active_btc_markets, fetch_active_markets,
     fetch_orderbook, fetch_orderbooks_parallel,
     place_limit_buy, cancel_order, get_order_status,
     seconds_until, get_adaptive_poll_interval,
-    check_market_resolution,
+    check_market_resolution, scan_active_markets,
 )
 import polymarket_client as _pm
 from ws_feed import PriceFeed
@@ -79,6 +79,8 @@ def _save_settings():
                 "exit_before_close": engine.scalper.cfg.exit_before_close,
                 "max_open_positions": engine.scalper.cfg.max_open_positions,
             },
+            "scanner": dict(engine.scanner_cfg),
+            "scanner_auto_bid": engine.scanner_auto_bid,
         }
         with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -123,6 +125,19 @@ def _load_settings():
             if "cooldown_secs" in sc: engine.scalper.cfg.cooldown_secs = float(sc["cooldown_secs"])
             if "exit_before_close" in sc: engine.scalper.cfg.exit_before_close = float(sc["exit_before_close"])
             if "max_open_positions" in sc: engine.scalper.cfg.max_open_positions = int(sc["max_open_positions"])
+        # Scanner config
+        scanner = data.get("scanner", {})
+        if scanner and isinstance(scanner, dict):
+            for k, v in scanner.items():
+                if k in engine.scanner_cfg:
+                    if k in ("categories", "auto_bid_categories"):
+                        if isinstance(v, list):
+                            engine.scanner_cfg[k] = v
+                    elif k in ("scan_interval", "auto_bid_size"):
+                        engine.scanner_cfg[k] = int(v)
+                    else:
+                        engine.scanner_cfg[k] = float(v)
+        engine.scanner_auto_bid = bool(data.get("scanner_auto_bid", False))
         log.info(f"[SETTINGS] Restored from {_SETTINGS_FILE}")
         enabled = [a for a, c in engine.asset_config.items() if c.get('enabled')]
         log.info(f"[SETTINGS] Assets enabled: {enabled}, bid_price={engine.bid_price}, tokens={engine.tokens_per_side}")
@@ -371,6 +386,26 @@ class Engine:
 
         # ── Scalper (separate strategy) ──
         self.scalper: Scalper = Scalper(self.btc_feed, self.ws_feed)
+
+        # ── Market Scanner ──
+        self.scanner_results: list[dict] = []      # List of dicts for dashboard
+        self.scanner_last_scan: float = 0.0         # Timestamp of last scan
+        self.scanner_running: bool = False           # Whether scanner loop is active
+        self.scanner_auto_bid: bool = False          # Auto-bid on matching markets
+        self.scanner_thread = None
+        # Scanner filter settings (UI-editable)
+        self.scanner_cfg = {
+            "max_hours": 24.0,          # Max hours to expiry
+            "min_liquidity": 0.0,       # Min liquidity ($)
+            "max_liquidity": 999999.0,  # Max liquidity ($)
+            "scan_interval": 30,        # Seconds between scans
+            "categories": ["crypto-5m", "crypto-15m", "sports", "esports", "over-under", "weather", "other"],
+            "auto_bid_price": 0.05,     # Price for auto-bid
+            "auto_bid_size": 100,       # Tokens per side for auto-bid
+            "auto_bid_max_ask": 0.15,   # Max ask price to auto-bid
+            "auto_bid_min_liq": 50.0,   # Min liquidity for auto-bid
+            "auto_bid_categories": [],  # Categories eligible for auto-bid (empty = none)
+        }
 
     def reset_daily_counter(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1551,6 +1586,11 @@ def push_state():
         "learner": ai_learner.stats(),
         "learner_predictions": ai_learner.get_recent_predictions(),
         "scalper": engine.scalper.stats(),
+        "scanner_results": engine.scanner_results,
+        "scanner_running": engine.scanner_running,
+        "scanner_auto_bid": engine.scanner_auto_bid,
+        "scanner_cfg": dict(engine.scanner_cfg),
+        "scanner_last_scan": engine.scanner_last_scan,
     }
     socketio.emit("state", data)
 
@@ -1574,6 +1614,8 @@ def index():
         sv_ob_max_imbalance=engine.ob_max_imbalance,
         sv_running=engine.running,
         sv_scalper=engine.scalper.cfg,
+        sv_scanner_cfg=dict(engine.scanner_cfg),
+        sv_scanner_auto_bid=engine.scanner_auto_bid,
     )
 
 
@@ -1906,6 +1948,242 @@ def on_update_scalper_params(data):
         engine.scalper.add_log(f"Bad param update: {e}", "error")
 
 
+# ── Market Scanner SocketIO Events ──────────────────────────────────────────
+
+def _scanner_log(msg: str, level: str = "info"):
+    """Emit a log message to both main log and scanner-specific log channel."""
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    engine.activity_log.appendleft({"ts": ts, "msg": msg, "level": level})
+    socketio.emit("log", {"ts": ts, "msg": msg, "level": level})
+    socketio.emit("scanner_log", {"ts": ts, "msg": msg, "level": level})
+
+def _run_scanner():
+    """Background scanner loop — queries Gamma API periodically."""
+    _scanner_log("Market Scanner started", "info")
+    while engine.scanner_running:
+        try:
+            cfg = engine.scanner_cfg
+            markets = scan_active_markets(
+                max_hours_to_expiry=cfg["max_hours"],
+                min_liquidity=cfg["min_liquidity"],
+                max_liquidity=cfg["max_liquidity"],
+            )
+
+            # Filter by selected categories
+            allowed_cats = set(cfg.get("categories", []))
+            if allowed_cats:
+                markets = [m for m in markets if m.category in allowed_cats]
+
+            # Fetch best ask prices for top markets (limit to 40 to avoid rate-limiting)
+            top_markets = markets[:40]
+            if top_markets:
+                token_pairs = [(m.token_id_yes, m.token_id_no) for m in top_markets]
+                books = fetch_orderbooks_parallel(token_pairs)
+                for m in top_markets:
+                    pair = books.get(m.token_id_yes)
+                    if pair:
+                        book_yes, book_no = pair
+                        m.best_ask_yes = book_yes.best_ask if book_yes.valid else 0
+                        m.best_ask_no = book_no.best_ask if book_no.valid else 0
+
+            # Convert to dicts for dashboard
+            now = datetime.now(timezone.utc)
+            result_dicts = []
+            for m in markets:
+                secs = (m.end_time - now).total_seconds()
+                result_dicts.append({
+                    "market_id": m.market_id,
+                    "question": m.question,
+                    "outcome_yes": m.outcome_yes,
+                    "outcome_no": m.outcome_no,
+                    "secs": round(secs, 0),
+                    "end_time": m.end_time.isoformat(),
+                    "liquidity": round(m.liquidity, 2),
+                    "volume": round(m.volume, 2),
+                    "category": m.category,
+                    "slug": m.slug,
+                    "best_ask_yes": round(m.best_ask_yes, 3) if m.best_ask_yes > 0 else 0,
+                    "best_ask_no": round(m.best_ask_no, 3) if m.best_ask_no > 0 else 0,
+                    "combined": round(m.best_ask_yes + m.best_ask_no, 3) if m.best_ask_yes > 0 and m.best_ask_no > 0 else 0,
+                    "token_id_yes": m.token_id_yes,
+                    "token_id_no": m.token_id_no,
+                })
+
+            engine.scanner_results = result_dicts
+            engine.scanner_last_scan = time.time()
+
+            # Auto-bid logic
+            if engine.scanner_auto_bid and cfg.get("auto_bid_categories"):
+                _scanner_auto_bid(top_markets, cfg)
+
+            cat_key = "category"
+            cat_set = set(r[cat_key] for r in result_dicts)
+            cat_summary = ", ".join(
+                f"{cat}:{sum(1 for r in result_dicts if r[cat_key] == cat)}"
+                for cat in cat_set
+            )
+            _scanner_log(
+                f"Scanner: {len(result_dicts)} markets found ({cat_summary})",
+                "info",
+            )
+        except Exception as e:
+            log_error("scanner_loop", e)
+            _scanner_log(f"Scanner error: {e}", "error")
+
+        # Wait for next scan interval
+        interval = engine.scanner_cfg.get("scan_interval", 30)
+        for _ in range(int(interval)):
+            if not engine.scanner_running:
+                break
+            time.sleep(1)
+
+    _scanner_log("Market Scanner stopped", "warn")
+
+
+def _scanner_auto_bid(markets: list, cfg: dict):
+    """Auto-bid on scanner markets matching criteria."""
+    auto_cats = set(cfg.get("auto_bid_categories", []))
+    max_ask = cfg.get("auto_bid_max_ask", 0.15)
+    min_liq = cfg.get("auto_bid_min_liq", 50.0)
+    bid_price = min(cfg.get("auto_bid_price", 0.05), config.HARD_MAX_BID_PRICE)
+    bid_size = cfg.get("auto_bid_size", 100)
+
+    for m in markets:
+        if m.category not in auto_cats:
+            continue
+        if m.liquidity < min_liq:
+            continue
+        # Skip if already in watch list or bids posted
+        if m.market_id in engine.bids_posted:
+            continue
+        # Skip crypto markets already handled by main bot
+        if m.category in ("crypto-5m",) and m.market_id in engine.watch_list:
+            continue
+        # Check ask prices
+        if m.best_ask_yes <= 0 or m.best_ask_no <= 0:
+            continue
+        if m.best_ask_yes > max_ask or m.best_ask_no > max_ask:
+            continue
+
+        # Place bids on both sides
+        _scanner_log(
+            f"SCANNER AUTO-BID: {m.question}  "
+            f"${bid_price} x {bid_size}/side  "
+            f"(asks: {m.outcome_yes}=${m.best_ask_yes:.3f} {m.outcome_no}=${m.best_ask_no:.3f}  "
+            f"liq=${m.liquidity:.0f})",
+            "trade",
+        )
+
+        oid_yes = place_limit_buy(
+            token_id=m.token_id_yes, price=bid_price,
+            size=bid_size, market_id=m.market_id,
+        )
+        oid_no = place_limit_buy(
+            token_id=m.token_id_no, price=bid_price,
+            size=bid_size, market_id=m.market_id,
+        )
+
+        if oid_yes or oid_no:
+            _scanner_log(
+                f"SCANNER BIDS POSTED: {m.question[:60]}  "
+                f"(yes={oid_yes is not None}, no={oid_no is not None})",
+                "trade",
+            )
+        else:
+            _scanner_log(f"SCANNER BIDS FAILED: {m.question[:60]}", "error")
+
+
+@socketio.on("start_scanner")
+def on_start_scanner():
+    if engine.scanner_running:
+        return
+    engine.scanner_running = True
+    engine.scanner_thread = threading.Thread(target=_run_scanner, daemon=True)
+    engine.scanner_thread.start()
+    push_state()
+
+
+@socketio.on("stop_scanner")
+def on_stop_scanner():
+    engine.scanner_running = False
+    _scanner_log("Scanner stop requested", "warn")
+    push_state()
+
+
+@socketio.on("update_scanner_params")
+def on_update_scanner_params(data):
+    """Live-update scanner filter parameters from dashboard."""
+    try:
+        cfg = engine.scanner_cfg
+        if "max_hours" in data:
+            cfg["max_hours"] = max(0.1, min(168.0, float(data["max_hours"])))
+        if "min_liquidity" in data:
+            cfg["min_liquidity"] = max(0.0, float(data["min_liquidity"]))
+        if "max_liquidity" in data:
+            cfg["max_liquidity"] = max(0.0, float(data["max_liquidity"]))
+        if "scan_interval" in data:
+            cfg["scan_interval"] = max(10, min(300, int(data["scan_interval"])))
+        if "categories" in data:
+            cfg["categories"] = [c for c in data["categories"] if isinstance(c, str)]
+        if "auto_bid_price" in data:
+            cfg["auto_bid_price"] = max(0.01, min(config.HARD_MAX_BID_PRICE, float(data["auto_bid_price"])))
+        if "auto_bid_size" in data:
+            cfg["auto_bid_size"] = max(10, min(10000, int(data["auto_bid_size"])))
+        if "auto_bid_max_ask" in data:
+            cfg["auto_bid_max_ask"] = max(0.01, min(0.90, float(data["auto_bid_max_ask"])))
+        if "auto_bid_min_liq" in data:
+            cfg["auto_bid_min_liq"] = max(0.0, float(data["auto_bid_min_liq"]))
+        if "auto_bid_categories" in data:
+            cfg["auto_bid_categories"] = [c for c in data["auto_bid_categories"] if isinstance(c, str)]
+        _scanner_log("Scanner params updated", "info")
+        _save_settings()
+        push_state()
+    except (ValueError, TypeError) as e:
+        _scanner_log(f"Bad scanner param: {e}", "error")
+
+
+@socketio.on("toggle_scanner_auto_bid")
+def on_toggle_scanner_auto_bid():
+    engine.scanner_auto_bid = not engine.scanner_auto_bid
+    state = "ON" if engine.scanner_auto_bid else "OFF"
+    _scanner_log(f"Scanner auto-bid {state}", "info")
+    _save_settings()
+    push_state()
+
+
+@socketio.on("scanner_manual_bid")
+def on_scanner_manual_bid(data):
+    """Place a manual bid on a scanned market from the dashboard."""
+    try:
+        market_id = data.get("market_id", "")
+        token_yes = data.get("token_id_yes", "") or data.get("token_yes", "")
+        token_no = data.get("token_id_no", "") or data.get("token_no", "")
+        price = min(float(data.get("bid_price", data.get("price", 0.05))), config.HARD_MAX_BID_PRICE)
+        size = max(10, min(10000, int(data.get("tokens", data.get("size", 100)))))
+
+        if not market_id or not token_yes or not token_no:
+            _scanner_log("Manual bid failed: missing market data", "error")
+            return
+
+        question = data.get("question", market_id[:16])
+        _scanner_log(
+            f"MANUAL BID: {question[:60]}  ${price} x {size}/side",
+            "trade",
+        )
+
+        oid_yes = place_limit_buy(token_id=token_yes, price=price, size=size, market_id=market_id)
+        oid_no = place_limit_buy(token_id=token_no, price=price, size=size, market_id=market_id)
+
+        if oid_yes or oid_no:
+            _scanner_log(f"MANUAL BIDS POSTED: {question[:60]}", "trade")
+        else:
+            _scanner_log(f"MANUAL BIDS FAILED: {question[:60]}", "error")
+
+        push_state()
+    except Exception as e:
+        _scanner_log(f"Manual bid error: {e}", "error")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  HTML DASHBOARD (single-page, embedded)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2187,6 +2465,80 @@ DASHBOARD_HTML = r"""
   .pos-state.selling { background: #2d2000; color: var(--orange); }
   .pos-state.exited { background: #1c2333; color: var(--dim); }
 
+  /* ── Scanner-specific styles ── */
+  .scanner-controls {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 10px 24px; display: flex; align-items: flex-start; gap: 16px;
+    flex-wrap: wrap;
+  }
+  .scanner-section-label {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--dim); margin-bottom: 4px;
+  }
+  .scanner-filter-group {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .scanner-cat-row {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+  .scanner-cat-row label {
+    font-size: 11px; color: var(--text); cursor: pointer;
+    display: flex; align-items: center; gap: 3px;
+  }
+  .scanner-cat-row input[type="checkbox"] { accent-color: var(--cyan); }
+  .scanner-stats-bar {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+    padding: 12px 24px 0 24px;
+  }
+  .scanner-status {
+    font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 3px;
+    display: inline-block; margin-left: 8px;
+  }
+  .scanner-status.on { background: #0d2818; color: var(--green); }
+  .scanner-status.off { background: #1c2333; color: var(--dim); }
+  .scanner-results-wrap {
+    padding: 12px 24px;
+  }
+  .scanner-results-wrap table {
+    font-size: 12px;
+  }
+  .scanner-results-wrap th {
+    font-size: 10px; white-space: nowrap;
+  }
+  .scanner-results-wrap td {
+    font-size: 11px; white-space: nowrap;
+  }
+  .scanner-autobid-section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 16px; margin-top: 4px;
+  }
+  .cat-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 9px; font-weight: 700; text-transform: uppercase;
+  }
+  .cat-badge.crypto-5m { background: #0c2d4a; color: var(--cyan); }
+  .cat-badge.crypto-15m { background: #0c2d4a; color: #5bcefa; }
+  .cat-badge.sports { background: #2d2000; color: var(--orange); }
+  .cat-badge.esports { background: #2d0040; color: #c78dff; }
+  .cat-badge.over-under { background: #2d2000; color: var(--yellow); }
+  .cat-badge.weather { background: #002d1a; color: #5bfa8d; }
+  .cat-badge.other { background: #1c2333; color: var(--dim); }
+  .btn-bid-sm {
+    padding: 2px 8px; border: 1px solid var(--cyan); background: transparent;
+    color: var(--cyan); border-radius: 3px; font-size: 10px; cursor: pointer;
+    font-weight: 700; text-transform: uppercase;
+  }
+  .btn-bid-sm:hover { background: var(--cyan); color: #000; }
+  .scan-row-input {
+    width: 62px; padding: 2px 4px; font-size: 11px; text-align: center;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 3px;
+  }
+  .scan-row-input:focus { border-color: var(--cyan); outline: none; }
+  .scan-row-actions {
+    display: flex; align-items: center; gap: 4px; justify-content: center;
+  }
+
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -2209,6 +2561,7 @@ DASHBOARD_HTML = r"""
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('limit-bid')" id="tab-btn-limit-bid">Limit Bid Strategy</button>
   <button class="tab-btn" onclick="switchTab('scalper')" id="tab-btn-scalper">Scalper</button>
+  <button class="tab-btn" onclick="switchTab('scanner')" id="tab-btn-scanner">Market Scanner</button>
 </div>
 
 <!-- ══════ TAB 1: LIMIT BID STRATEGY ══════ -->
@@ -2531,10 +2884,161 @@ DASHBOARD_HTML = r"""
 
 </div><!-- /tab-scalper -->
 
+<!-- ══════ TAB 3: MARKET SCANNER ══════ -->
+<div class="tab-content" id="tab-scanner">
+
+<!-- Scanner Filter Controls -->
+<div class="scanner-controls">
+  <div>
+    <div class="scanner-section-label">Scan Filters</div>
+    <div class="scanner-filter-group">
+      <div class="control-group">
+        <label>Max Hours to Expiry</label>
+        <input type="number" id="scan-max-hours" step="0.5" min="0.1" max="168" value="{{ sv_scanner_cfg.max_hours }}">
+      </div>
+      <div class="control-group">
+        <label>Min Liquidity $</label>
+        <input type="number" id="scan-min-liq" step="1" min="0" max="100000" value="{{ sv_scanner_cfg.min_liquidity }}">
+      </div>
+      <div class="control-group">
+        <label>Max Liquidity $</label>
+        <input type="number" id="scan-max-liq" step="10" min="0" max="999999" value="{{ sv_scanner_cfg.max_liquidity }}">
+      </div>
+      <div class="control-group">
+        <label>Scan Interval (sec)</label>
+        <input type="number" id="scan-interval" step="5" min="10" max="300" value="{{ sv_scanner_cfg.scan_interval }}">
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="scanner-section-label">Categories</div>
+    <div class="scanner-cat-row" id="scan-cat-row">
+      <label><input type="checkbox" value="crypto-5m" class="scan-cat-cb"> Crypto 5m</label>
+      <label><input type="checkbox" value="crypto-15m" class="scan-cat-cb"> Crypto 15m</label>
+      <label><input type="checkbox" value="sports" class="scan-cat-cb"> Sports</label>
+      <label><input type="checkbox" value="esports" class="scan-cat-cb"> Esports</label>
+      <label><input type="checkbox" value="over-under" class="scan-cat-cb"> Over/Under</label>
+      <label><input type="checkbox" value="weather" class="scan-cat-cb"> Weather</label>
+      <label><input type="checkbox" value="other" class="scan-cat-cb"> Other</label>
+    </div>
+  </div>
+  <div style="display:flex; align-items:flex-end; gap:8px; margin-left:auto;">
+    <button class="btn btn-apply" onclick="applyScannerParams()">Apply</button>
+    <button class="btn btn-start" id="btn-scanner" onclick="toggleScanner()">START SCANNER</button>
+  </div>
+</div>
+
+<!-- Scanner Stats Bar -->
+<div class="scanner-stats-bar">
+  <div class="stat-card">
+    <div class="stat-label">Markets Found</div>
+    <div class="stat-value cyan" id="scan-st-found">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Scanner Status</div>
+    <div class="stat-value" id="scan-st-status"><span class="scanner-status off">STOPPED</span></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Last Scan</div>
+    <div class="stat-value" id="scan-st-last" style="font-size:13px; color:var(--dim)">--</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Auto-Bid</div>
+    <div class="stat-value" id="scan-st-autobid"><span class="scanner-status off">OFF</span></div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Categories</div>
+    <div class="stat-value" id="scan-st-cats" style="font-size:12px; color:var(--dim)">--</div>
+  </div>
+</div>
+
+<!-- Auto-Bid Configuration -->
+<div style="padding: 12px 24px 0 24px;">
+  <div class="scanner-autobid-section">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+      <div class="scanner-section-label" style="margin:0">Auto-Bid Settings</div>
+      <button class="btn-sm" id="btn-scan-autobid" onclick="toggleScannerAutoBid()" style="min-width:60px;">OFF</button>
+    </div>
+    <div class="scanner-filter-group">
+      <div class="control-group">
+        <label>Bid Price $</label>
+        <input type="number" id="scan-ab-price" step="0.01" min="0.01" max="0.50" value="{{ sv_scanner_cfg.auto_bid_price }}">
+      </div>
+      <div class="control-group">
+        <label>Tokens/Side</label>
+        <input type="number" id="scan-ab-size" step="10" min="10" max="10000" value="{{ sv_scanner_cfg.auto_bid_size }}">
+      </div>
+      <div class="control-group">
+        <label>Max Ask $</label>
+        <input type="number" id="scan-ab-max-ask" step="0.01" min="0.01" max="0.50" value="{{ sv_scanner_cfg.auto_bid_max_ask }}">
+      </div>
+      <div class="control-group">
+        <label>Min Liquidity $</label>
+        <input type="number" id="scan-ab-min-liq" step="1" min="0" max="10000" value="{{ sv_scanner_cfg.auto_bid_min_liq }}">
+      </div>
+    </div>
+    <div style="margin-top:6px;">
+      <div class="scanner-section-label">Auto-Bid Categories</div>
+      <div class="scanner-cat-row" id="scan-ab-cat-row">
+        <label><input type="checkbox" value="crypto-5m" class="scan-ab-cat-cb"> Crypto 5m</label>
+        <label><input type="checkbox" value="crypto-15m" class="scan-ab-cat-cb"> Crypto 15m</label>
+        <label><input type="checkbox" value="sports" class="scan-ab-cat-cb"> Sports</label>
+        <label><input type="checkbox" value="esports" class="scan-ab-cat-cb"> Esports</label>
+        <label><input type="checkbox" value="over-under" class="scan-ab-cat-cb"> Over/Under</label>
+        <label><input type="checkbox" value="weather" class="scan-ab-cat-cb"> Weather</label>
+        <label><input type="checkbox" value="other" class="scan-ab-cat-cb"> Other</label>
+      </div>
+    </div>
+    <button class="btn btn-apply" onclick="applyScannerParams()" style="margin-top:8px;">Apply</button>
+  </div>
+</div>
+
+<!-- Scanner Results Table -->
+<div class="scanner-results-wrap">
+  <div class="card">
+    <div class="card-title">Scanned Markets <span id="scan-count-label" style="color:var(--dim);font-size:11px;margin-left:8px;">(0)</span></div>
+    <div class="card-body" style="padding:0; max-height:500px; overflow-y:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Category</th>
+            <th style="text-align:right">Time Left</th>
+            <th style="text-align:right">Liquidity</th>
+            <th style="text-align:right">Ask YES</th>
+            <th style="text-align:right">Ask NO</th>
+            <th style="text-align:right">Combined</th>
+            <th style="text-align:center">Bid $</th>
+            <th style="text-align:center">Shares</th>
+            <th style="text-align:center">Action</th>
+          </tr>
+        </thead>
+        <tbody id="scan-results-body">
+          <tr><td colspan="10" class="empty">Scanner not started</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Scanner Log -->
+<div style="padding: 0 24px 24px 24px;">
+  <div class="card log-card" style="grid-column:auto;">
+    <div class="card-title">Scanner Log</div>
+    <div class="card-body log-body" id="scan-log-body">
+      <div class="empty">Waiting for scanner activity...</div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /tab-scanner -->
+
 <script>
 const socket = io();
 let botRunning = {{ 'true' if sv_running else 'false' }};
 let scalperRunning = false;
+let scannerRunning = false;
+let scannerAutoBid = {{ 'true' if sv_scanner_auto_bid else 'false' }};
 let socketConnected = false;
 
 // ── Tab Switching ──
@@ -2573,7 +3077,9 @@ _acAssets.forEach(a => _acFields.forEach(f => _acInputIds.push('inp-ac-' + a + '
 
 ['inp-price','inp-tokens','inp-window-open','inp-window-close',
  'inp-ob-min-size','inp-ob-max-imbalance',
- 'sc-trade-size','sc-entry-max','sc-profit','sc-stop','sc-cooldown','sc-exit-before','sc-max-pos'].concat(_acInputIds).forEach(id => {
+ 'sc-trade-size','sc-entry-max','sc-profit','sc-stop','sc-cooldown','sc-exit-before','sc-max-pos',
+ 'scan-max-hours','scan-min-liq','scan-max-liq','scan-interval',
+ 'scan-ab-price','scan-ab-size','scan-ab-max-ask','scan-ab-min-liq'].concat(_acInputIds).forEach(id => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('focus', () => markDirty(id));
@@ -2581,6 +3087,72 @@ _acAssets.forEach(a => _acFields.forEach(f => _acInputIds.push('inp-ac-' + a + '
   el.addEventListener('keydown', () => markDirty(id));
   el.addEventListener('mousedown', () => markDirty(id));
 });
+
+// ── Scanner: Initialize category checkboxes from server ──
+(function initScannerCats() {
+  const cats = {{ sv_scanner_cfg.categories | tojson }};
+  const abCats = {{ sv_scanner_cfg.auto_bid_categories | tojson }};
+  document.querySelectorAll('.scan-cat-cb').forEach(cb => {
+    cb.checked = cats.includes(cb.value);
+  });
+  document.querySelectorAll('.scan-ab-cat-cb').forEach(cb => {
+    cb.checked = abCats.includes(cb.value);
+  });
+  // Init auto-bid button state
+  const abBtn = document.getElementById('btn-scan-autobid');
+  if (scannerAutoBid) {
+    abBtn.textContent = 'ON'; abBtn.className = 'btn-sm btn-toggle-on';
+  } else {
+    abBtn.textContent = 'OFF'; abBtn.className = 'btn-sm btn-toggle-off';
+  }
+})();
+
+// ── Scanner Functions ──
+function applyScannerParams() {
+  const cats = [];
+  document.querySelectorAll('.scan-cat-cb').forEach(cb => { if (cb.checked) cats.push(cb.value); });
+  const abCats = [];
+  document.querySelectorAll('.scan-ab-cat-cb').forEach(cb => { if (cb.checked) abCats.push(cb.value); });
+  socket.emit('update_scanner_params', {
+    max_hours: parseFloat(document.getElementById('scan-max-hours').value),
+    min_liquidity: parseFloat(document.getElementById('scan-min-liq').value),
+    max_liquidity: parseFloat(document.getElementById('scan-max-liq').value),
+    scan_interval: parseInt(document.getElementById('scan-interval').value),
+    categories: cats,
+    auto_bid_price: parseFloat(document.getElementById('scan-ab-price').value),
+    auto_bid_size: parseInt(document.getElementById('scan-ab-size').value),
+    auto_bid_max_ask: parseFloat(document.getElementById('scan-ab-max-ask').value),
+    auto_bid_min_liq: parseFloat(document.getElementById('scan-ab-min-liq').value),
+    auto_bid_categories: abCats
+  });
+}
+
+function toggleScanner() {
+  if (scannerRunning) {
+    socket.emit('stop_scanner');
+  } else {
+    socket.emit('start_scanner');
+  }
+}
+
+function toggleScannerAutoBid() {
+  socket.emit('toggle_scanner_auto_bid');
+}
+
+function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
+  const priceEl = document.getElementById('scan-row-price-' + rowIdx);
+  const sizeEl = document.getElementById('scan-row-size-' + rowIdx);
+  const price = priceEl ? parseFloat(priceEl.value) || 0.05 : 0.05;
+  const size = sizeEl ? parseInt(sizeEl.value) || 100 : 100;
+  socket.emit('scanner_manual_bid', {
+    market_id: marketId,
+    token_id_yes: tokenYes,
+    token_id_no: tokenNo,
+    question: question,
+    bid_price: price,
+    tokens: size
+  });
+}
 
 // ── Cost preview live update ──
 function updateCostPreview() {
@@ -3056,6 +3628,157 @@ socket.on('state', (d) => {
       scLogEl.innerHTML = logHtml;
     }
   }
+
+  // ══════════ SCANNER TAB RENDERING ══════════
+  scannerRunning = d.scanner_running || false;
+  scannerAutoBid = d.scanner_auto_bid || false;
+
+  // Scanner button
+  const scanBtn = document.getElementById('btn-scanner');
+  if (scannerRunning) {
+    scanBtn.textContent = 'STOP SCANNER';
+    scanBtn.className = 'btn btn-stop';
+  } else {
+    scanBtn.textContent = 'START SCANNER';
+    scanBtn.className = 'btn btn-start';
+  }
+
+  // Scanner status badge
+  const scanStatusEl = document.getElementById('scan-st-status');
+  if (scannerRunning) {
+    scanStatusEl.innerHTML = '<span class="scanner-status on">RUNNING</span>';
+  } else {
+    scanStatusEl.innerHTML = '<span class="scanner-status off">STOPPED</span>';
+  }
+
+  // Auto-bid badge + button
+  const abBadge = document.getElementById('scan-st-autobid');
+  const abBtn2 = document.getElementById('btn-scan-autobid');
+  if (scannerAutoBid) {
+    abBadge.innerHTML = '<span class="scanner-status on">ON</span>';
+    abBtn2.textContent = 'ON'; abBtn2.className = 'btn-sm btn-toggle-on';
+  } else {
+    abBadge.innerHTML = '<span class="scanner-status off">OFF</span>';
+    abBtn2.textContent = 'OFF'; abBtn2.className = 'btn-sm btn-toggle-off';
+  }
+
+  // Last scan time
+  if (d.scanner_last_scan > 0) {
+    const ago = Math.round((Date.now() / 1000) - d.scanner_last_scan);
+    document.getElementById('scan-st-last').textContent = ago < 5 ? 'just now' : ago + 's ago';
+  }
+
+  // Scanner config sync (dirty-flag protected)
+  if (d.scanner_cfg) {
+    const sc2 = d.scanner_cfg;
+    if (!isDirty('scan-max-hours') && document.activeElement.id !== 'scan-max-hours')
+      document.getElementById('scan-max-hours').value = sc2.max_hours;
+    if (!isDirty('scan-min-liq') && document.activeElement.id !== 'scan-min-liq')
+      document.getElementById('scan-min-liq').value = sc2.min_liquidity;
+    if (!isDirty('scan-max-liq') && document.activeElement.id !== 'scan-max-liq')
+      document.getElementById('scan-max-liq').value = sc2.max_liquidity;
+    if (!isDirty('scan-interval') && document.activeElement.id !== 'scan-interval')
+      document.getElementById('scan-interval').value = sc2.scan_interval;
+    if (!isDirty('scan-ab-price') && document.activeElement.id !== 'scan-ab-price')
+      document.getElementById('scan-ab-price').value = sc2.auto_bid_price;
+    if (!isDirty('scan-ab-size') && document.activeElement.id !== 'scan-ab-size')
+      document.getElementById('scan-ab-size').value = sc2.auto_bid_size;
+    if (!isDirty('scan-ab-max-ask') && document.activeElement.id !== 'scan-ab-max-ask')
+      document.getElementById('scan-ab-max-ask').value = sc2.auto_bid_max_ask;
+    if (!isDirty('scan-ab-min-liq') && document.activeElement.id !== 'scan-ab-min-liq')
+      document.getElementById('scan-ab-min-liq').value = sc2.auto_bid_min_liq;
+
+    // Category checkboxes (only sync when not focused)
+    if (document.activeElement.className !== 'scan-cat-cb') {
+      document.querySelectorAll('.scan-cat-cb').forEach(cb => {
+        cb.checked = (sc2.categories || []).includes(cb.value);
+      });
+    }
+    if (document.activeElement.className !== 'scan-ab-cat-cb') {
+      document.querySelectorAll('.scan-ab-cat-cb').forEach(cb => {
+        cb.checked = (sc2.auto_bid_categories || []).includes(cb.value);
+      });
+    }
+
+    // Categories stat
+    const catCounts = {};
+    (d.scanner_results || []).forEach(m => {
+      catCounts[m.category] = (catCounts[m.category] || 0) + 1;
+    });
+    const catParts = Object.entries(catCounts).map(([k,v]) => k + ':' + v);
+    document.getElementById('scan-st-cats').textContent = catParts.length > 0 ? catParts.join(', ') : '--';
+  }
+
+  // Scanner results table
+  const scanResults = d.scanner_results || [];
+  document.getElementById('scan-st-found').textContent = scanResults.length;
+  document.getElementById('scan-count-label').textContent = '(' + scanResults.length + ')';
+
+  const scanBody = document.getElementById('scan-results-body');
+  if (scanResults.length === 0) {
+    scanBody.innerHTML = '<tr><td colspan="10" class="empty">' +
+      (scannerRunning ? 'Scanning...' : 'Scanner not started') + '</td></tr>';
+  } else {
+    // Preserve per-row input values across state updates
+    const prevPrices = {};
+    const prevSizes = {};
+    scanBody.querySelectorAll('input[id^="scan-row-price-"]').forEach(el => {
+      const idx = el.id.replace('scan-row-price-', '');
+      if (document.activeElement === el || el.dataset.dirty === '1') prevPrices[idx] = el.value;
+    });
+    scanBody.querySelectorAll('input[id^="scan-row-size-"]').forEach(el => {
+      const idx = el.id.replace('scan-row-size-', '');
+      if (document.activeElement === el || el.dataset.dirty === '1') prevSizes[idx] = el.value;
+    });
+
+    const defaultPrice = parseFloat(document.getElementById('scan-ab-price').value) || 0.05;
+    const defaultSize = parseInt(document.getElementById('scan-ab-size').value) || 100;
+    let sHtml = '';
+    scanResults.forEach((m, idx) => {
+      const secsLeft = Math.max(0, Math.round((new Date(m.end_time).getTime() / 1000) - (Date.now() / 1000)));
+      const timeClass = secsLeft <= 60 ? 'hot' : secsLeft <= 300 ? 'warm' : 'cool';
+      const askY = m.best_ask_yes > 0 ? '$' + m.best_ask_yes.toFixed(3) : '--';
+      const askN = m.best_ask_no > 0 ? '$' + m.best_ask_no.toFixed(3) : '--';
+      const combined = (m.best_ask_yes > 0 && m.best_ask_no > 0) ?
+        (m.best_ask_yes + m.best_ask_no) : 0;
+      const combStr = combined > 0 ? '$' + combined.toFixed(3) : '--';
+      const combClass = combined > 0 && combined < 0.50 ? 'good' :
+                         combined > 0 && combined < 1.0 ? 'mid' : 'high';
+      const catCls = m.category.replace(/[^a-z0-9-]/g, '');
+      const question = (m.question || '').length > 60 ?
+        m.question.substring(0, 57) + '...' : (m.question || '--');
+      // Escape for JS onclick
+      const escQ = (m.question || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+      // Use preserved value if user was editing, otherwise default
+      const rowPrice = (idx in prevPrices) ? prevPrices[idx] : defaultPrice;
+      const rowSize = (idx in prevSizes) ? prevSizes[idx] : defaultSize;
+      sHtml += '<tr>' +
+        '<td title="' + (m.question || '').replace(/"/g, '&quot;') + '">' + question + '</td>' +
+        '<td><span class="cat-badge ' + catCls + '">' + m.category + '</span></td>' +
+        '<td class="time-cell ' + timeClass + '" style="text-align:right">' + fmtTime(secsLeft) + '</td>' +
+        '<td style="text-align:right">$' + (m.liquidity || 0).toFixed(0) + '</td>' +
+        '<td class="price" style="text-align:right">' + askY + '</td>' +
+        '<td class="price" style="text-align:right">' + askN + '</td>' +
+        '<td class="price ' + combClass + '" style="text-align:right">' + combStr + '</td>' +
+        '<td style="text-align:center">' +
+          '<input type="number" class="scan-row-input" id="scan-row-price-' + idx + '" ' +
+          'step="0.01" min="0.01" max="0.50" value="' + rowPrice + '" ' +
+          'oninput="this.dataset.dirty=1">' +
+        '</td>' +
+        '<td style="text-align:center">' +
+          '<input type="number" class="scan-row-input" id="scan-row-size-' + idx + '" ' +
+          'step="10" min="10" max="10000" value="' + rowSize + '" ' +
+          'oninput="this.dataset.dirty=1">' +
+        '</td>' +
+        '<td style="text-align:center">' +
+          '<button class="btn-bid-sm" onclick="scannerManualBid(' + idx + ',\'' + m.market_id + '\',\'' +
+          m.token_id_yes + '\',\'' + m.token_id_no + '\',\'' + escQ + '\')">' +
+          'BID</button>' +
+        '</td>' +
+        '</tr>';
+    });
+    scanBody.innerHTML = sHtml;
+  }
 });
 
 // ── Fast per-asset price tick (200ms) ──
@@ -3097,6 +3820,17 @@ socket.on('log', (e) => {
 // ── Scalper log push ──
 socket.on('scalper_log', (e) => {
   const logEl = document.getElementById('sc-log-body');
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  div.innerHTML = '<span class="log-ts">' + e.ts +
+    '</span><span class="log-msg ' + (e.level || 'info') + '">' + e.msg + '</span>';
+  logEl.prepend(div);
+  while (logEl.children.length > 50) logEl.removeChild(logEl.lastChild);
+});
+
+// ── Scanner log push ──
+socket.on('scanner_log', (e) => {
+  const logEl = document.getElementById('scan-log-body');
   const div = document.createElement('div');
   div.className = 'log-line';
   div.innerHTML = '<span class="log-ts">' + e.ts +
