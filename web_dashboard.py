@@ -112,6 +112,8 @@ def _load_settings():
                     if k in engine.asset_config[a]:
                         if k == "enabled":
                             engine.asset_config[a][k] = bool(v)
+                        elif k in ("tokens_per_side", "bid_window_open"):
+                            engine.asset_config[a][k] = int(v)
                         else:
                             engine.asset_config[a][k] = float(v)
         engine.btc_dollar_range = engine.asset_config.get("BTC", {}).get("dollar_range", 2.0)
@@ -159,6 +161,8 @@ def _load_settings():
 ASSET_FILTERS = {
     "BTC": {
         "bid_price": 0.02,              # $0.02 per share
+        "tokens_per_side": 100,         # shares per side (per-asset)
+        "bid_window_open": 120,         # seconds before close to start posting
         "distance_pct_max": 0.0008,     # 0.080%  (~$78 at $97k)
         "candle_range_max": 50.0,       # $50 max 5-min candle
         "dollar_range": 2.0,            # $2 default UI-editable range
@@ -167,6 +171,8 @@ ASSET_FILTERS = {
     },
     "ETH": {
         "bid_price": 0.02,              # $0.02 per share
+        "tokens_per_side": 100,         # shares per side (per-asset)
+        "bid_window_open": 120,         # seconds before close to start posting
         "distance_pct_max": 0.0010,     # 0.10%  (~$2.70 at $2700)
         "candle_range_max": 8.0,        # $8 max 5-min candle
         "dollar_range": 1.0,            # $1 default
@@ -175,6 +181,8 @@ ASSET_FILTERS = {
     },
     "SOL": {
         "bid_price": 0.02,              # $0.02 per share
+        "tokens_per_side": 100,         # shares per side (per-asset)
+        "bid_window_open": 120,         # seconds before close to start posting
         "distance_pct_max": 0.0015,     # 0.15%  (~$0.25 at $170)
         "candle_range_max": 0.80,       # $0.80 max
         "dollar_range": 0.15,           # $0.15 default
@@ -183,6 +191,8 @@ ASSET_FILTERS = {
     },
     "XRP": {
         "bid_price": 0.02,              # $0.02 per share
+        "tokens_per_side": 100,         # shares per side (per-asset)
+        "bid_window_open": 120,         # seconds before close to start posting
         "distance_pct_max": 0.0020,     # 0.20%  (~$0.005 at $2.50)
         "candle_range_max": 0.010,      # $0.01 max
         "dollar_range": 0.003,          # $0.003 default
@@ -342,6 +352,8 @@ class Engine:
             self.asset_config[a] = {
                 "enabled": False,           # user must enable via UI
                 "bid_price": f["bid_price"],
+                "tokens_per_side": f.get("tokens_per_side", config.TOKENS_PER_SIDE),
+                "bid_window_open": f.get("bid_window_open", config.BID_WINDOW_OPEN),
                 "distance_pct_max": f["distance_pct_max"],
                 "candle_range_max": f["candle_range_max"],
                 "dollar_range": f["dollar_range"],
@@ -556,12 +568,15 @@ def post_bids(market: MarketWindow) -> bool:
         return False
 
     secs = seconds_until(market.end_time)
-    if secs > engine.bid_window_open or secs < engine.bid_window_close:
-        return False
 
     # ── Per-Asset Enabled Check ────────────────────────────────────────────
     asset = market.asset
     ac = engine.asset_config.get(asset, {})
+
+    # Per-asset bid window (fall back to global)
+    asset_window_open = ac.get("bid_window_open", engine.bid_window_open)
+    if secs > asset_window_open or secs < engine.bid_window_close:
+        return False
     if not ac.get("enabled", False):
         return False   # asset disabled by user — silently skip
 
@@ -733,9 +748,10 @@ def post_bids(market: MarketWindow) -> bool:
     )
     # ────────────────────────────────────────────────────────────────────
 
-    # Use live-editable values — per-asset bid price, clamped by hard safety caps
-    tokens = min(engine.tokens_per_side, config.HARD_MAX_TOKENS)
+    # Use live-editable values — per-asset bid price & tokens, clamped by hard safety caps
     ac = engine.asset_config.get(asset, {})
+    asset_tokens = ac.get("tokens_per_side", engine.tokens_per_side)
+    tokens = min(asset_tokens, config.HARD_MAX_TOKENS)
     asset_bid_price = ac.get("bid_price", engine.bid_price)
     price = min(asset_bid_price, config.HARD_MAX_BID_PRICE)
     log.info(
@@ -1339,8 +1355,10 @@ def bot_loop():
                         continue
                     secs = seconds_until(market.end_time)
                     # Activity log: show evaluation countdown during bid window
-                    in_eval = engine.bid_window_close <= secs <= engine.bid_window_open + 5
-                    in_bid  = engine.bid_window_close <= secs <= engine.bid_window_open
+                    _ac = engine.asset_config.get(market.asset, {})
+                    _asset_wo = _ac.get("bid_window_open", engine.bid_window_open)
+                    in_eval = engine.bid_window_close <= secs <= _asset_wo + 5
+                    in_bid  = engine.bid_window_close <= secs <= _asset_wo
                     if in_eval and _bid_log_due:
                         try:
                             _log_bid_eval(market, secs)
@@ -1773,7 +1791,8 @@ def on_update_params(data):
         new_asset_config = {a: dict(c) for a, c in engine.asset_config.items()}
         incoming_cfg = data.get("asset_config", {})
         if isinstance(incoming_cfg, dict):
-            _editable_keys = ("enabled", "bid_price", "distance_pct_max", "candle_range_max",
+            _editable_keys = ("enabled", "bid_price", "tokens_per_side", "bid_window_open",
+                              "distance_pct_max", "candle_range_max",
                               "dollar_range", "expansion_max", "expansion_floor")
             for ak, av in incoming_cfg.items():
                 if ak not in new_asset_config:
@@ -1783,6 +1802,11 @@ def on_update_params(data):
                         if pk in av:
                             if pk == "enabled":
                                 new_asset_config[ak][pk] = bool(av[pk])
+                            elif pk in ("tokens_per_side", "bid_window_open"):
+                                try:
+                                    new_asset_config[ak][pk] = int(av[pk])
+                                except (ValueError, TypeError):
+                                    pass
                             else:
                                 try:
                                     new_asset_config[ak][pk] = float(av[pk])
@@ -1811,6 +1835,17 @@ def on_update_params(data):
             bp = _acfg.get("bid_price", 0.02)
             if bp <= 0 or bp > config.HARD_MAX_BID_PRICE:
                 engine.add_log(f"Invalid {_ak} bid price: ${bp} (must be $0.01-${config.HARD_MAX_BID_PRICE})", "error")
+                return
+            _at = _acfg.get("tokens_per_side", 100)
+            if _at < 1 or _at > config.HARD_MAX_TOKENS:
+                engine.add_log(f"Invalid {_ak} shares/side: {_at} (must be 1-{config.HARD_MAX_TOKENS})", "error")
+                return
+            _aw = _acfg.get("bid_window_open", 120)
+            if _aw < 5 or _aw > 600:
+                engine.add_log(f"Invalid {_ak} bid start: {_aw}s (must be 5-600)", "error")
+                return
+            if _aw <= new_window_close:
+                engine.add_log(f"{_ak} bid start ({_aw}s) must be > bid stop ({new_window_close}s)", "error")
                 return
             dr = _acfg.get("dollar_range", 0)
             if dr < 0 or dr > 5000:
@@ -1841,6 +1876,11 @@ def on_update_params(data):
             new_c = new_asset_config[_ak]
             if new_c.get("enabled") != old_c.get("enabled"):
                 changes.append(f"{_ak} {'ON' if new_c['enabled'] else 'OFF'}")
+            for _pk in ("tokens_per_side", "bid_window_open"):
+                old_v = old_c.get(_pk, 0)
+                new_v = new_c.get(_pk, 0)
+                if new_v != old_v:
+                    changes.append(f"{_ak}.{_pk} {old_v}->{new_v}")
             for _pk in ("bid_price", "distance_pct_max", "candle_range_max", "dollar_range", "expansion_max", "expansion_floor"):
                 old_v = old_c.get(_pk, 0)
                 new_v = new_c.get(_pk, 0)
@@ -2574,12 +2614,12 @@ DASHBOARD_HTML = r"""
     <input type="number" id="inp-price" step="0.01" min="0.01" max="0.50" value="{{ sv_bid_price }}">
   </div>
   <div class="control-group">
-    <label>Shares/Side</label>
-    <input type="number" id="inp-tokens" step="10" min="1" max="10000" value="{{ sv_tokens }}">
+    <label>Shares/Side (all)</label>
+    <input type="number" id="inp-tokens" step="10" min="1" max="10000" value="{{ sv_tokens }}" title="Set all assets' shares/side at once">
   </div>
   <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
-    <label>Bid Start (sec)</label>
-    <input type="number" id="inp-window-open" step="5" min="5" max="600" value="{{ sv_window_open }}" title="Seconds before close to START posting bids">
+    <label>Bid Start (all)</label>
+    <input type="number" id="inp-window-open" step="5" min="5" max="600" value="{{ sv_window_open }}" title="Set all assets' bid start time at once (seconds before close)">
   </div>
   <div class="control-group">
     <label>Bid Stop (sec)</label>
@@ -2634,6 +2674,8 @@ DASHBOARD_HTML = r"""
         <tr style="color:var(--dim); text-transform:uppercase; font-weight:600;">
           <th style="text-align:left; padding:4px 8px;">Asset</th>
           <th style="text-align:center; padding:4px 8px;">Bid $ <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">The price you pay per share on each side (Up &amp; Down). Lower = cheaper but less likely to fill. Cost per market = bid $ &times; tokens &times; 2 sides.</span></span></th>
+          <th style="text-align:center; padding:4px 8px;">Shares/Side <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Number of shares to bid on each side (Up &amp; Down) for this asset. Total cost = bid $ &times; shares &times; 2.</span></span></th>
+          <th style="text-align:center; padding:4px 8px;">Bid Start <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Seconds before market close to START posting bids for this asset. Higher = earlier entry.</span></span></th>
           <th style="text-align:center; padding:4px 8px;">Dollar Range <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max dollar distance the asset price can be from the 5-min candle open before bids are skipped. Filters out markets where price has already moved too far. 0 = disabled.</span></span></th>
           <th style="text-align:center; padding:4px 8px;">Dist % Max <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max percentage distance from candle open as a decimal (e.g. 0.0008 = 0.08%). Skips markets where price has moved too far relative to the asset&rsquo;s value. 0 = disabled.</span></span></th>
           <th style="text-align:center; padding:4px 8px;">Candle Range Max <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max allowed high-low range (in $) of the current 5-min candle. Skips volatile candles where outcome is more unpredictable. 0 = disabled.</span></span></th>
@@ -2650,6 +2692,16 @@ DASHBOARD_HTML = r"""
             <input type="number" id="inp-ac-{{ _a }}-bid_price" step="0.01" min="0.01" max="0.50"
               value="{{ _c.get('bid_price', 0.02) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--green); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
               title="{{ _a }}: Bid price per share">
+          </td>
+          <td style="text-align:center; padding:4px 4px;">
+            <input type="number" id="inp-ac-{{ _a }}-tokens_per_side" step="10" min="1" max="10000"
+              value="{{ _c.get('tokens_per_side', 100) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--yellow); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
+              title="{{ _a }}: Shares per side">
+          </td>
+          <td style="text-align:center; padding:4px 4px;">
+            <input type="number" id="inp-ac-{{ _a }}-bid_window_open" step="5" min="5" max="600"
+              value="{{ _c.get('bid_window_open', 120) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--yellow); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
+              title="{{ _a }}: Seconds before close to start bidding">
           </td>
           <td style="text-align:center; padding:4px 4px;">
             <input type="number" id="inp-ac-{{ _a }}-dollar_range" step="any" min="0" max="5000"
@@ -3070,7 +3122,7 @@ const dirtyInputs = {};
 function markDirty(id) { dirtyInputs[id] = Date.now(); }
 function isDirty(id) { return dirtyInputs[id] && (Date.now() - dirtyInputs[id]) < 3000; }
 // Build list of per-asset config input IDs for dirty tracking
-const _acFields = ['bid_price','dollar_range','distance_pct_max','candle_range_max','expansion_max','expansion_floor'];
+const _acFields = ['bid_price','tokens_per_side','bid_window_open','dollar_range','distance_pct_max','candle_range_max','expansion_max','expansion_floor'];
 const _acAssets = ['BTC','ETH','SOL','XRP'];
 const _acInputIds = [];
 _acAssets.forEach(a => _acFields.forEach(f => _acInputIds.push('inp-ac-' + a + '-' + f)));
@@ -3156,7 +3208,6 @@ function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
 
 // ── Cost preview live update ──
 function updateCostPreview() {
-  const t = parseInt(document.getElementById('inp-tokens').value) || 0;
   let totalCost = 0;
   let totalPayout = 0;
   const parts = [];
@@ -3164,6 +3215,7 @@ function updateCostPreview() {
     const enEl = document.getElementById('inp-enabled-' + a);
     if (!enEl || !enEl.checked) return;
     const bp = parseFloat(document.getElementById('inp-ac-' + a + '-bid_price').value) || 0;
+    const t = parseInt(document.getElementById('inp-ac-' + a + '-tokens_per_side').value) || 0;
     const c = bp * t * 2;
     const p = t * 1.0;
     totalCost += c;
@@ -3188,11 +3240,13 @@ function updateCostPreview() {
     document.getElementById('cost-per-asset').textContent = '(' + parts.join(' | ') + ')';
   }
 }
-// Listen to global inputs + all per-asset bid price changes
+// Listen to global inputs + all per-asset bid price & token changes
 document.getElementById('inp-tokens').addEventListener('input', updateCostPreview);
 _acAssets.forEach(a => {
   const bp = document.getElementById('inp-ac-' + a + '-bid_price');
   if (bp) bp.addEventListener('input', updateCostPreview);
+  const tk = document.getElementById('inp-ac-' + a + '-tokens_per_side');
+  if (tk) tk.addEventListener('input', updateCostPreview);
   const en = document.getElementById('inp-enabled-' + a);
   if (en) en.addEventListener('change', updateCostPreview);
 });
@@ -3231,6 +3285,20 @@ function applyParams() {
       if (el) el.value = price;
     });
   }
+  // If user changed the global "Shares/Side", propagate to all per-asset tokens
+  if (isDirty('inp-tokens')) {
+    _acAssets.forEach(a => {
+      const el = document.getElementById('inp-ac-' + a + '-tokens_per_side');
+      if (el) el.value = tokens;
+    });
+  }
+  // If user changed the global "Bid Start", propagate to all per-asset window open
+  if (isDirty('inp-window-open')) {
+    _acAssets.forEach(a => {
+      const el = document.getElementById('inp-ac-' + a + '-bid_window_open');
+      if (el) el.value = windowOpen;
+    });
+  }
 
   // Build full per-asset config from UI
   const assetConfig = {};
@@ -3238,6 +3306,8 @@ function applyParams() {
     assetConfig[a] = {
       enabled: document.getElementById('inp-enabled-' + a).checked,
       bid_price: parseFloat(document.getElementById('inp-ac-' + a + '-bid_price').value) || 0.02,
+      tokens_per_side: parseInt(document.getElementById('inp-ac-' + a + '-tokens_per_side').value) || 100,
+      bid_window_open: parseInt(document.getElementById('inp-ac-' + a + '-bid_window_open').value) || 120,
       dollar_range: parseFloat(document.getElementById('inp-ac-' + a + '-dollar_range').value) || 0,
       distance_pct_max: parseFloat(document.getElementById('inp-ac-' + a + '-distance_pct_max').value) || 0,
       candle_range_max: parseFloat(document.getElementById('inp-ac-' + a + '-candle_range_max').value) || 0,
