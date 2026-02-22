@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime data (regenerated)
+logs/
+data/
+learner_data/
+
+# Persisted settings (per-deployment, contains no secrets)
+settings.json
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Secrets / keys (if ever added)
+.env
+*.pem
+*.key
