@@ -324,6 +324,54 @@ class BidRecord:
         }
 
 
+class AfterHoursEvent:
+    """Tracks a single fill event that occurred near market close.
+    Captures timing, price proximity to the target line (candle open),
+    and which side filled — for post-hoc pattern analysis."""
+
+    def __init__(self, market_id: str, question: str, asset: str):
+        self.market_id = market_id
+        self.question = question
+        self.asset = asset
+        self.ts: float = time.time()               # Unix timestamp of fill detection
+        self.ts_str: str = ""                       # Human-readable UTC time
+        self.side: str = ""                         # "UP", "DOWN", or "BOTH"
+        self.fill_size: float = 0.0                 # Shares filled (max of up/down for BOTH)
+        self.secs_to_close: float = 0.0            # + = pre-close, - = post-close
+        self.up_ask: float = 0.0                   # UP ask at detection time
+        self.down_ask: float = 0.0                 # DOWN ask at detection time
+        self.combined_ask: float = 0.0             # UP + DOWN
+        self.ask_diff: float = 0.0                 # |UP - DOWN| (symmetry indicator)
+        self.price_distance: float = 0.0           # |price - candle_open| in $
+        self.price_distance_pct: float = 0.0       # distance as % of price
+        self.candle_range: float = 0.0             # 5-min candle high-low range
+        self.asset_price: float = 0.0              # Current asset price
+        self.candle_open: float = 0.0              # 5-min candle open price
+        self.on_the_line: bool = False             # True if price very close to open
+
+    def to_dict(self) -> dict:
+        return {
+            "market_id": self.market_id,
+            "question": self.question,
+            "asset": self.asset,
+            "ts": self.ts,
+            "ts_str": self.ts_str,
+            "side": self.side,
+            "fill_size": self.fill_size,
+            "secs_to_close": round(self.secs_to_close, 1),
+            "up_ask": round(self.up_ask, 4),
+            "down_ask": round(self.down_ask, 4),
+            "combined_ask": round(self.combined_ask, 4),
+            "ask_diff": round(self.ask_diff, 4),
+            "price_distance": round(self.price_distance, 4),
+            "price_distance_pct": round(self.price_distance_pct * 100, 4),
+            "candle_range": round(self.candle_range, 4),
+            "asset_price": round(self.asset_price, 2),
+            "candle_open": round(self.candle_open, 2),
+            "on_the_line": self.on_the_line,
+        }
+
+
 class Engine:
     """Bot engine state & control."""
 
@@ -398,6 +446,11 @@ class Engine:
 
         # ── Scalper (separate strategy) ──
         self.scalper: Scalper = Scalper(self.btc_feed, self.ws_feed)
+
+        # ── After-Hours Fill Tracker ──
+        # Stores fill events that occurred close to market close (positive = pre-close,
+        # negative = post-close). Cleared on bot restart; persists for the session.
+        self.afterhours_events: deque = deque(maxlen=500)
 
         # ── Market Scanner ──
         self.scanner_results: list[dict] = []      # List of dicts for dashboard
@@ -919,11 +972,60 @@ def _log_ob_filter(market: MarketWindow, ob_detail: dict, decision: str, secs_re
         pass  # non-critical
 
 
+def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, market=None):
+    """Capture a fill event with timing and price-proximity context for the After-Hours tab.
+    Called immediately when a fill is detected on any side."""
+    try:
+        # Get the market window for timing & price data
+        if market is None:
+            market = engine.watch_list.get(bid.market_id)
+
+        asset = getattr(market, "asset", "BTC") if market else "BTC"
+        ev = AfterHoursEvent(bid.market_id, bid.question, asset)
+        ev.ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ev.side = side
+        ev.fill_size = fill_size
+
+        # Seconds relative to market close: positive = still open, negative = already closed
+        if market:
+            ev.secs_to_close = seconds_until(market.end_time)
+        else:
+            ev.secs_to_close = 0.0
+
+        # Orderbook prices at fill detection time
+        if market:
+            ws_up = engine.ws_feed.get_price(market.token_id_up)
+            ws_down = engine.ws_feed.get_price(market.token_id_down)
+            if ws_up and ws_up.valid:
+                ev.up_ask = ws_up.best_ask
+            if ws_down and ws_down.valid:
+                ev.down_ask = ws_down.best_ask
+            ev.combined_ask = round(ev.up_ask + ev.down_ask, 4)
+            ev.ask_diff = round(abs(ev.up_ask - ev.down_ask), 4)
+
+        # Asset price vs candle open (proximity to the "line")
+        ast = engine.btc_feed.get(asset)
+        if ast and ast.price > 0:
+            ev.asset_price = ast.price
+            ev.candle_open = ast.candle_open
+            ev.price_distance = ast.distance
+            ev.price_distance_pct = (ast.distance / ast.price) if ast.price > 0 else 0.0
+            ev.candle_range = ast.candle_range
+            # "On the line" = price within 0.05% of candle open (asset-neutral threshold)
+            ev.on_the_line = ev.price_distance_pct < 0.0005
+
+        engine.afterhours_events.appendleft(ev.to_dict())
+    except Exception as _ah_err:
+        log.debug(f"[afterhours] record error: {_ah_err}")
+
+
 def check_fills():
     """Check all posted bids for fills and track P&L accurately."""
     for mid, bid in list(engine.bids_posted.items()):
         if bid.cancelled:
             continue
+
+        market = engine.watch_list.get(mid)
 
         if bid.order_id_up and not bid.up_filled:
             try:
@@ -939,6 +1041,9 @@ def check_fills():
                         f"FILL UP: {bid.up_fill_size:.0f} sh @ ${bid.bid_price} (${fill_cost:.2f})  {bid.question}",
                         "fill",
                     )
+                    # Record after-hours event (only for single UP fill — BOTH handled below)
+                    if not bid.down_filled:
+                        _record_afterhours_fill(bid, "UP", bid.up_fill_size, market)
             except Exception as e:
                 log_error(f"check_fill_up {mid}", e)
 
@@ -956,6 +1061,9 @@ def check_fills():
                         f"FILL DOWN: {bid.down_fill_size:.0f} sh @ ${bid.bid_price} (${fill_cost:.2f})  {bid.question}",
                         "fill",
                     )
+                    # Record after-hours event (only for single DOWN fill — BOTH handled below)
+                    if not bid.up_filled:
+                        _record_afterhours_fill(bid, "DOWN", bid.down_fill_size, market)
             except Exception as e:
                 log_error(f"check_fill_down {mid}", e)
 
@@ -970,6 +1078,8 @@ def check_fills():
                 f"BOTH FILLED! {bid.question}  Cost: ${total_cost:.2f}  Payout: ${payout:.2f}  Profit: ${profit:.2f}",
                 "profit",
             )
+            # Record BOTH fill event (overrides any prior single-side record for this market)
+            _record_afterhours_fill(bid, "BOTH", max(bid.up_fill_size, bid.down_fill_size), market)
         # Single side filled — track estimated payout (resolves to $1 if wins, $0 if loses)
         elif (bid.up_filled or bid.down_filled) and bid.cancelled and not getattr(bid, '_single_logged', False):
             bid._single_logged = True
@@ -1609,6 +1719,7 @@ def push_state():
         "scanner_auto_bid": engine.scanner_auto_bid,
         "scanner_cfg": dict(engine.scanner_cfg),
         "scanner_last_scan": engine.scanner_last_scan,
+        "afterhours_events": list(engine.afterhours_events),
     }
     socketio.emit("state", data)
 
@@ -2224,6 +2335,13 @@ def on_scanner_manual_bid(data):
         _scanner_log(f"Manual bid error: {e}", "error")
 
 
+@socketio.on("clear_afterhours")
+def on_clear_afterhours():
+    """Clear the after-hours fill events buffer (client request)."""
+    engine.afterhours_events.clear()
+    push_state()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  HTML DASHBOARD (single-page, embedded)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2579,6 +2697,66 @@ DASHBOARD_HTML = r"""
     display: flex; align-items: center; gap: 4px; justify-content: center;
   }
 
+  /* ── After-Hours Tracker styles ── */
+  .ah-controls {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 10px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .ah-stats-bar {
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px;
+    padding: 12px 24px 0 24px;
+  }
+  .ah-wrap {
+    padding: 12px 24px;
+  }
+  .ah-wrap table {
+    font-size: 11px; width: 100%; border-collapse: collapse;
+  }
+  .ah-wrap th {
+    font-size: 10px; white-space: nowrap; padding: 4px 6px;
+    text-align: left; color: var(--dim); text-transform: uppercase;
+    border-bottom: 1px solid var(--border); position: sticky; top: 0;
+    background: var(--card);
+  }
+  .ah-wrap td {
+    font-size: 11px; font-family: monospace; padding: 3px 6px;
+    border-bottom: 1px solid #1c2333; white-space: nowrap;
+  }
+  .ah-wrap tr:hover td { background: #1c2333; }
+  /* Side badges */
+  .ah-side { font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 3px; }
+  .ah-side.UP { background: #0c2d0c; color: var(--green); }
+  .ah-side.DOWN { background: #2d0c0c; color: var(--red); }
+  .ah-side.BOTH { background: #0c2d4a; color: var(--cyan); }
+  /* Timing cell: positive (pre-close) vs negative (post-close) */
+  .ah-pre { color: var(--green); }
+  .ah-post { color: var(--red); }
+  .ah-at-line { color: var(--cyan); font-weight: 700; }
+  /* Summary breakdown cards */
+  .ah-breakdown {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    padding: 12px 24px;
+  }
+  .ah-breakdown-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .ah-breakdown-card h4 {
+    font-size: 11px; text-transform: uppercase; color: var(--dim);
+    letter-spacing: 0.5px; margin-bottom: 10px;
+  }
+  .ah-breakdown-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 3px 0; font-size: 12px; font-family: monospace;
+  }
+  .ah-breakdown-label { color: var(--dim); }
+  .ah-breakdown-val { font-weight: 700; }
+  .ah-table-wrap {
+    max-height: 420px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -2602,6 +2780,7 @@ DASHBOARD_HTML = r"""
   <button class="tab-btn active" onclick="switchTab('limit-bid')" id="tab-btn-limit-bid">Limit Bid Strategy</button>
   <button class="tab-btn" onclick="switchTab('scalper')" id="tab-btn-scalper">Scalper</button>
   <button class="tab-btn" onclick="switchTab('scanner')" id="tab-btn-scanner">Market Scanner</button>
+  <button class="tab-btn" onclick="switchTab('afterhours')" id="tab-btn-afterhours">After-Hours Fills <span id="ah-tab-badge" style="background:#0c2d4a;color:var(--cyan);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
 </div>
 
 <!-- ══════ TAB 1: LIMIT BID STRATEGY ══════ -->
@@ -3084,6 +3263,137 @@ DASHBOARD_HTML = r"""
 </div>
 
 </div><!-- /tab-scanner -->
+
+<!-- ══════ TAB 4: AFTER-HOURS FILLS ══════ -->
+<div class="tab-content" id="tab-afterhours">
+
+<!-- Filter Controls -->
+<div class="ah-controls">
+  <div class="control-group">
+    <label>Asset</label>
+    <select id="ah-filter-asset" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
+      <option value="ALL">ALL</option>
+      <option value="BTC">BTC</option>
+      <option value="ETH">ETH</option>
+      <option value="SOL">SOL</option>
+      <option value="XRP">XRP</option>
+    </select>
+  </div>
+  <div class="control-group">
+    <label>Side</label>
+    <select id="ah-filter-side" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
+      <option value="ALL">ALL</option>
+      <option value="UP">UP only</option>
+      <option value="DOWN">DOWN only</option>
+      <option value="BOTH">BOTH filled</option>
+    </select>
+  </div>
+  <div class="control-group">
+    <label>Timing</label>
+    <select id="ah-filter-timing" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
+      <option value="ALL">All timing</option>
+      <option value="PRE">Pre-close only</option>
+      <option value="POST">Post-close only</option>
+    </select>
+  </div>
+  <div class="control-group">
+    <label>Max Dist %</label>
+    <input type="number" id="ah-filter-dist" step="0.01" min="0" max="5" value="0"
+      title="Only show fills where price was within this % of candle open. 0 = show all."
+      style="width:80px;">
+  </div>
+  <div class="control-group">
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+      <input type="checkbox" id="ah-filter-online" title="Only show fills where price was at the target line (<0.05%)">
+      On-Line Only
+    </label>
+  </div>
+  <button class="btn btn-apply" onclick="ahApplyFilter()">Filter</button>
+  <button class="btn" style="background:var(--border);color:var(--text);" onclick="ahClearEvents()">Clear</button>
+  <div style="flex:1"></div>
+  <div class="cost-preview" style="font-size:11px;">
+    Session fills: <span class="val" id="ah-total-count">0</span>
+    &nbsp;|&nbsp; Pre-close: <span class="val green" id="ah-pre-count">0</span>
+    &nbsp;|&nbsp; Post-close: <span class="val red" id="ah-post-count">0</span>
+  </div>
+</div>
+
+<!-- Stats Bar -->
+<div class="ah-stats-bar">
+  <div class="stat-card"><div class="stat-label">Total Fills</div><div class="stat-value cyan" id="ah-st-total">0</div></div>
+  <div class="stat-card"><div class="stat-label">UP Fills</div><div class="stat-value green" id="ah-st-up">0</div></div>
+  <div class="stat-card"><div class="stat-label">DOWN Fills</div><div class="stat-value red" id="ah-st-down">0</div></div>
+  <div class="stat-card"><div class="stat-label">BOTH Filled</div><div class="stat-value cyan" id="ah-st-both">0</div></div>
+  <div class="stat-card"><div class="stat-label">On The Line</div><div class="stat-value yellow" id="ah-st-online">0</div></div>
+  <div class="stat-card"><div class="stat-label">Avg Secs to Close</div><div class="stat-value" id="ah-st-avg-secs">--</div></div>
+  <div class="stat-card"><div class="stat-label">Post-Close %</div><div class="stat-value" id="ah-st-post-pct">--</div></div>
+</div>
+
+<!-- Breakdown Cards -->
+<div class="ah-breakdown">
+  <!-- By Side -->
+  <div class="ah-breakdown-card">
+    <h4>Fills by Side (when on-line, &lt;0.05% from open)</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">UP</span><span class="ah-breakdown-val green" id="ah-bk-up-online">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">DOWN</span><span class="ah-breakdown-val red" id="ah-bk-down-online">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">BOTH</span><span class="ah-breakdown-val cyan" id="ah-bk-both-online">0</span></div>
+    <div class="ah-breakdown-row" style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;">
+      <span class="ah-breakdown-label">UP rate</span>
+      <span class="ah-breakdown-val" id="ah-bk-up-rate">--</span>
+    </div>
+    <div class="ah-breakdown-row">
+      <span class="ah-breakdown-label">DOWN rate</span>
+      <span class="ah-breakdown-val" id="ah-bk-down-rate">--</span>
+    </div>
+  </div>
+  <!-- By Timing -->
+  <div class="ah-breakdown-card">
+    <h4>Fill Timing Distribution</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">&gt; 10s pre-close</span><span class="ah-breakdown-val green" id="ah-bk-t-early">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">0-10s pre-close</span><span class="ah-breakdown-val green" id="ah-bk-t-pre10">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">At close (±1s)</span><span class="ah-breakdown-val yellow" id="ah-bk-t-atclose">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">0-10s post-close</span><span class="ah-breakdown-val red" id="ah-bk-t-post10">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">&gt; 10s post-close</span><span class="ah-breakdown-val red" id="ah-bk-t-late">0</span></div>
+  </div>
+  <!-- By Asset -->
+  <div class="ah-breakdown-card">
+    <h4>Fills by Asset</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">BTC</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-BTC">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">ETH</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-ETH">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">SOL</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-SOL">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">XRP</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-XRP">0</span></div>
+  </div>
+</div>
+
+<!-- Events Table -->
+<div class="ah-wrap">
+  <div class="ah-table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Asset</th>
+          <th>Market</th>
+          <th>Side</th>
+          <th>Shares</th>
+          <th title="Seconds from market close: + means before close, - means after close">Secs to Close</th>
+          <th>UP Ask</th>
+          <th>DOWN Ask</th>
+          <th title="UP + DOWN combined ask">Combined</th>
+          <th title="Dollar distance of asset price from 5-min candle open">Dist $</th>
+          <th title="Distance as % of asset price">Dist %</th>
+          <th title="5-min candle high-low range">Candle $</th>
+          <th title="Price was within 0.05% of candle open at fill time">Line</th>
+        </tr>
+      </thead>
+      <tbody id="ah-events-body">
+        <tr><td colspan="13" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+</div><!-- /tab-afterhours -->
 
 <script>
 const socket = io();
@@ -3849,7 +4159,164 @@ socket.on('state', (d) => {
     });
     scanBody.innerHTML = sHtml;
   }
+
+  // ══════════ AFTER-HOURS FILLS TAB ══════════
+  const ahEvents = d.afterhours_events || [];
+  ahRenderAll(ahEvents);
 });
+
+// ── After-Hours Fills: state & render ──
+let _ahAllEvents = [];   // full list from server
+
+function ahRenderAll(events) {
+  _ahAllEvents = events || [];
+  // Update tab badge
+  const badge = document.getElementById('ah-tab-badge');
+  if (badge) badge.textContent = _ahAllEvents.length;
+
+  // Top-bar counters
+  const preCount = _ahAllEvents.filter(e => e.secs_to_close > 0).length;
+  const postCount = _ahAllEvents.filter(e => e.secs_to_close <= 0).length;
+  const el = id => document.getElementById(id);
+  if (el('ah-total-count')) el('ah-total-count').textContent = _ahAllEvents.length;
+  if (el('ah-pre-count'))   el('ah-pre-count').textContent  = preCount;
+  if (el('ah-post-count'))  el('ah-post-count').textContent = postCount;
+
+  ahUpdateStats(_ahAllEvents);
+  ahApplyFilter();   // renders filtered table
+}
+
+function ahUpdateStats(events) {
+  const el = id => document.getElementById(id);
+  if (!el('ah-st-total')) return;   // tab not rendered
+
+  const upEvs    = events.filter(e => e.side === 'UP');
+  const downEvs  = events.filter(e => e.side === 'DOWN');
+  const bothEvs  = events.filter(e => e.side === 'BOTH');
+  const onlineEvs = events.filter(e => e.on_the_line);
+
+  el('ah-st-total').textContent  = events.length;
+  el('ah-st-up').textContent     = upEvs.length;
+  el('ah-st-down').textContent   = downEvs.length;
+  el('ah-st-both').textContent   = bothEvs.length;
+  el('ah-st-online').textContent = onlineEvs.length;
+
+  // Average secs to close
+  if (events.length > 0) {
+    const avg = events.reduce((a, e) => a + e.secs_to_close, 0) / events.length;
+    el('ah-st-avg-secs').textContent = avg.toFixed(1) + 's';
+    el('ah-st-avg-secs').style.color = avg >= 0 ? 'var(--green)' : 'var(--red)';
+  } else {
+    el('ah-st-avg-secs').textContent = '--';
+    el('ah-st-avg-secs').style.color = '';
+  }
+
+  // Post-close %
+  const postCnt = events.filter(e => e.secs_to_close < 0).length;
+  if (events.length > 0) {
+    el('ah-st-post-pct').textContent = Math.round(postCnt / events.length * 100) + '%';
+  } else {
+    el('ah-st-post-pct').textContent = '--';
+  }
+
+  // Breakdown: on-line fills by side
+  const olUp   = onlineEvs.filter(e => e.side === 'UP').length;
+  const olDown = onlineEvs.filter(e => e.side === 'DOWN').length;
+  const olBoth = onlineEvs.filter(e => e.side === 'BOTH').length;
+  const olTotal = olUp + olDown + olBoth;
+  el('ah-bk-up-online').textContent   = olUp;
+  el('ah-bk-down-online').textContent = olDown;
+  el('ah-bk-both-online').textContent = olBoth;
+  el('ah-bk-up-rate').textContent   = olTotal > 0 ? Math.round(olUp   / olTotal * 100) + '%' : '--';
+  el('ah-bk-down-rate').textContent = olTotal > 0 ? Math.round(olDown / olTotal * 100) + '%' : '--';
+
+  // Timing buckets
+  el('ah-bk-t-early').textContent   = events.filter(e => e.secs_to_close > 10).length;
+  el('ah-bk-t-pre10').textContent   = events.filter(e => e.secs_to_close > 1 && e.secs_to_close <= 10).length;
+  el('ah-bk-t-atclose').textContent = events.filter(e => e.secs_to_close >= -1 && e.secs_to_close <= 1).length;
+  el('ah-bk-t-post10').textContent  = events.filter(e => e.secs_to_close < -1 && e.secs_to_close >= -10).length;
+  el('ah-bk-t-late').textContent    = events.filter(e => e.secs_to_close < -10).length;
+
+  // By asset
+  ['BTC','ETH','SOL','XRP'].forEach(a => {
+    const cnt = events.filter(e => e.asset === a).length;
+    const aEl = el('ah-bk-asset-' + a);
+    if (aEl) aEl.textContent = cnt;
+  });
+}
+
+function ahApplyFilter() {
+  const filterAsset  = document.getElementById('ah-filter-asset')  ? document.getElementById('ah-filter-asset').value  : 'ALL';
+  const filterSide   = document.getElementById('ah-filter-side')   ? document.getElementById('ah-filter-side').value   : 'ALL';
+  const filterTiming = document.getElementById('ah-filter-timing') ? document.getElementById('ah-filter-timing').value : 'ALL';
+  const filterDist   = document.getElementById('ah-filter-dist')   ? parseFloat(document.getElementById('ah-filter-dist').value) || 0 : 0;
+  const filterOnline = document.getElementById('ah-filter-online') ? document.getElementById('ah-filter-online').checked : false;
+
+  let filtered = _ahAllEvents.filter(e => {
+    if (filterAsset !== 'ALL' && e.asset !== filterAsset) return false;
+    if (filterSide  !== 'ALL' && e.side  !== filterSide)  return false;
+    if (filterTiming === 'PRE'  && e.secs_to_close <= 0)  return false;
+    if (filterTiming === 'POST' && e.secs_to_close > 0)   return false;
+    if (filterDist > 0 && e.price_distance_pct > filterDist) return false;
+    if (filterOnline && !e.on_the_line) return false;
+    return true;
+  });
+
+  ahRenderTable(filtered);
+}
+
+function ahRenderTable(events) {
+  const tbody = document.getElementById('ah-events-body');
+  if (!tbody) return;
+  if (events.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">No events match current filters.</td></tr>';
+    return;
+  }
+
+  let html = '';
+  events.forEach(e => {
+    const secsStr = (e.secs_to_close > 0 ? '+' : '') + e.secs_to_close.toFixed(1) + 's';
+    const secsCls = e.secs_to_close > 0 ? 'ah-pre' : 'ah-post';
+    const sideCls = 'ah-side ' + e.side;
+    const lineMark = e.on_the_line ? '<span class="ah-at-line" title="Price was within 0.05% of candle open">&#x25CF;</span>' : '';
+    const distPctStr = e.price_distance_pct > 0 ? e.price_distance_pct.toFixed(4) + '%' : '--';
+    const distDolStr = e.price_distance > 0 ?
+      (e.price_distance > 1 ? '$' + e.price_distance.toFixed(2) : '$' + e.price_distance.toFixed(4)) : '--';
+    const candleStr  = e.candle_range > 0 ?
+      (e.candle_range > 1 ? '$' + e.candle_range.toFixed(2) : '$' + e.candle_range.toFixed(4)) : '--';
+    const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
+    const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
+    const combStr    = e.combined_ask > 0 ? '$' + e.combined_ask.toFixed(3) : '--';
+
+    // Compact market name: strip long question, show time range if present
+    let mktName = e.question || '';
+    const tmMatch = mktName.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
+    mktName = tmMatch ? tmMatch[1] : (mktName.length > 40 ? mktName.substring(0, 37) + '...' : mktName);
+
+    html += '<tr>' +
+      '<td>' + (e.ts_str || '--') + '</td>' +
+      '<td style="font-weight:700;color:var(--cyan)">' + (e.asset || '--') + '</td>' +
+      '<td title="' + (e.question || '').replace(/"/g, '&quot;') + '">' + mktName + '</td>' +
+      '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
+      '<td>' + (e.fill_size > 0 ? Math.round(e.fill_size) : '--') + '</td>' +
+      '<td class="' + secsCls + '">' + secsStr + '</td>' +
+      '<td>' + upAskStr + '</td>' +
+      '<td>' + downAskStr + '</td>' +
+      '<td>' + combStr + '</td>' +
+      '<td>' + distDolStr + '</td>' +
+      '<td>' + distPctStr + '</td>' +
+      '<td>' + candleStr + '</td>' +
+      '<td style="text-align:center">' + lineMark + '</td>' +
+      '</tr>';
+  });
+  tbody.innerHTML = html;
+}
+
+function ahClearEvents() {
+  _ahAllEvents = [];
+  ahRenderAll([]);
+  socket.emit('clear_afterhours');
+}
 
 // ── Fast per-asset price tick (200ms) ──
 socket.on('price_tick', (d) => {
