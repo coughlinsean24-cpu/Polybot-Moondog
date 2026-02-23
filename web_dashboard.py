@@ -2207,6 +2207,59 @@ def export_trades():
     )
 
 
+@app.route("/export-afterhours")
+def export_afterhours():
+    """Export all PCM observed fills as CSV for pattern analysis."""
+    events = list(engine.afterhours_events)
+
+    output = io.StringIO()
+    fieldnames = [
+        "timestamp", "asset", "question", "market_id",
+        "side", "fill_price", "fill_amount", "fill_cost",
+        "secs_after_close", "snap_label",
+        "up_ask", "down_ask", "combined_ask",
+        "winner", "won", "is_ours",
+        "asset_price", "candle_open", "price_distance",
+        "candle_range", "range_pct", "on_the_line",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+
+    for ev in events:
+        writer.writerow({
+            "timestamp": ev.get("ts_str", ""),
+            "asset": ev.get("asset", ""),
+            "question": ev.get("question", ""),
+            "market_id": ev.get("market_id", ""),
+            "side": ev.get("side", ""),
+            "fill_price": ev.get("fill_price", ""),
+            "fill_amount": ev.get("fill_amount", ""),
+            "fill_cost": ev.get("fill_cost", ""),
+            "secs_after_close": ev.get("secs_after_close", ""),
+            "snap_label": ev.get("snap_label", ""),
+            "up_ask": ev.get("up_ask", ""),
+            "down_ask": ev.get("down_ask", ""),
+            "combined_ask": ev.get("combined_ask", ""),
+            "winner": ev.get("winner", ""),
+            "won": ev.get("won", ""),
+            "is_ours": ev.get("is_ours", ""),
+            "asset_price": ev.get("asset_price", ""),
+            "candle_open": ev.get("candle_open", ""),
+            "price_distance": ev.get("price_distance", ""),
+            "candle_range": ev.get("candle_range", ""),
+            "range_pct": ev.get("range_pct", ""),
+            "on_the_line": ev.get("on_the_line", ""),
+        })
+
+    csv_data = output.getvalue()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=afterhours_fills_{today}.csv"},
+    )
+
+
 # ── SocketIO Events ─────────────────────────────────────────────────────────
 
 @socketio.on("connect")
@@ -3661,6 +3714,7 @@ DASHBOARD_HTML = r"""
     </label>
   </div>
   <button class="btn btn-apply" onclick="ahApplyFilter()">Filter</button>
+  <button class="btn" style="background:#1a6b3c;color:#fff;" onclick="ahExportCSV()">&#x2B73; Export CSV</button>
   <button class="btn" style="background:var(--border);color:var(--text);" onclick="ahClearEvents()">Clear</button>
   <div style="flex:1"></div>
   <div class="cost-preview" style="font-size:11px;">
@@ -4714,6 +4768,36 @@ function ahRenderTable(events) {
       '</tr>';
   });
   tbody.innerHTML = html;
+}
+
+function ahExportCSV() {
+  // Client-side CSV from currently filtered data — includes all columns for pattern analysis
+  if (_ahAllEvents.length === 0) { alert('No after-hours data to export.'); return; }
+  const cols = ['timestamp','asset','question','market_id','side','fill_price','fill_amount','fill_cost',
+    'secs_after_close','snap_label','up_ask','down_ask','combined_ask','winner','won','is_ours',
+    'asset_price','candle_open','price_distance','candle_range','range_pct','on_the_line'];
+  const header = cols.join(',');
+  const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const rows = _ahAllEvents.map(e => {
+    const r = e._raw || e;
+    return cols.map(c => {
+      if (c === 'timestamp') return esc(e.ts_str);
+      if (c === 'secs_after_close') return esc(e.secs_after);
+      if (c === 'combined_ask') return esc(r.combined_ask || '');
+      return esc(r[c] != null ? r[c] : (e[c] != null ? e[c] : ''));
+    }).join(',');
+  });
+  const csv = header + '\n' + rows.join('\n');
+  const blob = new Blob([csv], {type: 'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const d = new Date().toISOString().slice(0,10);
+  a.download = 'afterhours_fills_' + d + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function ahClearEvents() {
