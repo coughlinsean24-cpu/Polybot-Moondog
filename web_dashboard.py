@@ -3209,6 +3209,79 @@ DASHBOARD_HTML = r"""
     background: var(--card); border: 1px solid var(--border);
     border-radius: 8px;
   }
+  /* ── Accordion Groups ── */
+  .ah-groups-wrap {
+    padding: 12px 24px; display: flex; flex-direction: column; gap: 8px;
+    max-height: 600px; overflow-y: auto;
+  }
+  .ah-group {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .ah-group.expanded { border-color: var(--cyan); }
+  .ah-group-header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+    cursor: pointer; user-select: none; transition: background 0.15s;
+  }
+  .ah-group-header:hover { background: #1c2333; }
+  .ah-group-chevron {
+    font-size: 12px; color: var(--dim); transition: transform 0.2s;
+    width: 16px; text-align: center; flex-shrink: 0;
+  }
+  .ah-group.expanded .ah-group-chevron { transform: rotate(90deg); }
+  .ah-group-time {
+    font-family: monospace; font-size: 13px; font-weight: 700;
+    color: var(--cyan); min-width: 160px;
+  }
+  .ah-group-assets {
+    display: flex; gap: 4px; flex-shrink: 0;
+  }
+  .ah-group-asset-badge {
+    font-size: 10px; font-weight: 700; padding: 1px 6px;
+    border-radius: 3px; background: #0c2d4a; color: var(--cyan);
+  }
+  .ah-group-meta {
+    display: flex; gap: 12px; align-items: center; font-size: 11px;
+    font-family: monospace; color: var(--dim); flex: 1;
+  }
+  .ah-group-meta .gm-fills { color: var(--text); font-weight: 700; }
+  .ah-group-meta .gm-up { color: var(--green); }
+  .ah-group-meta .gm-down { color: var(--red); }
+  .ah-group-meta .gm-cheap { color: var(--yellow); }
+  .ah-group-winner {
+    font-size: 11px; font-weight: 700; padding: 2px 8px;
+    border-radius: 3px; flex-shrink: 0;
+  }
+  .ah-group-winner.win { background: #0c2d0c; color: var(--green); }
+  .ah-group-winner.loss { background: #2d0c0c; color: var(--red); }
+  .ah-group-winner.pending { background: #1c2333; color: var(--dim); }
+  .ah-group-winner.mixed { background: #2d2d0c; color: var(--yellow); }
+  .ah-group-body {
+    display: none; border-top: 1px solid var(--border);
+  }
+  .ah-group.expanded .ah-group-body { display: block; }
+  .ah-group-body table {
+    font-size: 11px; width: 100%; border-collapse: collapse;
+  }
+  .ah-group-body th {
+    font-size: 10px; white-space: nowrap; padding: 4px 6px;
+    text-align: left; color: var(--dim); text-transform: uppercase;
+    border-bottom: 1px solid var(--border); background: var(--card);
+  }
+  .ah-group-body td {
+    font-size: 11px; font-family: monospace; padding: 3px 6px;
+    border-bottom: 1px solid #1c2333; white-space: nowrap;
+  }
+  .ah-group-body tr:hover td { background: #1c2333; }
+  .ah-group-expand-all {
+    display: flex; gap: 8px; padding: 0 24px 8px 24px;
+  }
+  .ah-group-expand-all button {
+    font-size: 11px; padding: 4px 12px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--dim); cursor: pointer; font-family: monospace;
+  }
+  .ah-group-expand-all button:hover { color: var(--cyan); border-color: var(--cyan); }
 
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
@@ -3834,33 +3907,17 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
-<!-- Events Table -->
-<div class="ah-wrap">
-  <div class="ah-table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Asset</th>
-          <th>Market</th>
-          <th>Side</th>
-          <th title="Shares filled">Shares</th>
-          <th title="Fill price (bid level where fill was detected)">Price $</th>
-          <th title="Total cost: price * shares">Cost $</th>
-          <th title="Seconds after market close">After Close</th>
-          <th title="Snapshot interval where fill was detected">Snapshot</th>
-          <th title="Which side won the market (Up/Down)">Winner</th>
-          <th title="WIN = filled on winning side, LOSS = filled on losing side">Result</th>
-          <th>UP Ask</th>
-          <th>DOWN Ask</th>
-          <th title="Distance as % of 5-min candle range (universal metric)">Range %</th>
-          <th title="Observed from market orderbook or our own bid">Source</th>
-        </tr>
-      </thead>
-      <tbody id="ah-events-body">
-        <tr><td colspan="15" class="empty">Monitoring all crypto 5m markets for post-close fills. Data appears after each market closes.</td></tr>
-      </tbody>
-    </table>
+<!-- Expand/Collapse All -->
+<div class="ah-group-expand-all">
+  <button onclick="ahExpandAll()">&#x25BC; Expand All</button>
+  <button onclick="ahCollapseAll()">&#x25B6; Collapse All</button>
+  <span style="font-size:11px;color:var(--dim);margin-left:8px;font-family:monospace;" id="ah-group-count">0 timeframes</span>
+</div>
+
+<!-- Grouped Events (accordion) -->
+<div class="ah-groups-wrap" id="ah-groups-container">
+  <div style="text-align:center;padding:40px;color:var(--dim);font-size:13px;">
+    Monitoring all crypto 5m markets for post-close fills. Data appears after each market closes.
   </div>
 </div>
 
@@ -4764,66 +4821,146 @@ function ahApplyFilter() {
     return true;
   });
 
-  ahRenderTable(filtered);
+  ahRenderGroups(filtered);
 }
 
-function ahRenderTable(events) {
-  const tbody = document.getElementById('ah-events-body');
-  if (!tbody) return;
+function ahRenderGroups(events) {
+  const container = document.getElementById('ah-groups-container');
+  const countEl = document.getElementById('ah-group-count');
+  if (!container) return;
+
   if (events.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="15" class="empty">No events match current filters.</td></tr>';
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--dim);font-size:13px;">No events match current filters.</div>';
+    if (countEl) countEl.textContent = '0 timeframes';
     return;
   }
 
-  let html = '';
+  // ── Group events by market_id ──
+  const groups = {};
   events.forEach(e => {
-    const sideCls = 'ah-side ' + e.side;
-    const secsStr = e.secs_after.toFixed(0) + 's';
-    const priceStr = '$' + e.fill_price.toFixed(2);
-    const costStr  = '$' + e.fill_cost.toFixed(2);
-    const sharesStr = e.fill_amount > 0 ? Math.round(e.fill_amount).toString() : '--';
-    const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
-    const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
-    const rangePctStr = (e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
-    const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
-
-    // Winner / Result styling
-    const winnerStr = e.winner !== '--' ? e.winner : '<span style="color:#666">--</span>';
-    let resultStr = e.won;
-    let resultCls = '';
-    if (e.won === 'WIN')  resultCls = 'color:var(--green);font-weight:700';
-    else if (e.won === 'LOSS') resultCls = 'color:var(--red);font-weight:700';
-    else resultCls = 'color:#666';
-
-    // Source badge
-    const srcStr = e.is_ours
-      ? '<span style="background:var(--green);color:#000;padding:1px 6px;border-radius:3px;font-size:11px">OUR BID</span>'
-      : '<span style="background:var(--border);color:var(--cyan);padding:1px 6px;border-radius:3px;font-size:11px">OBSERVED</span>';
-
-    // Compact market name
-    let mktName = e.question;
-    const tmMatch = mktName.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
-    mktName = tmMatch ? tmMatch[1] : (mktName.length > 40 ? mktName.substring(0, 37) + '...' : mktName);
-
-    html += '<tr>' +
-      '<td>' + e.ts_str + '</td>' +
-      '<td style="font-weight:700;color:var(--cyan)">' + e.asset + '</td>' +
-      '<td title="' + e.question.replace(/"/g, '&quot;') + '">' + mktName + '</td>' +
-      '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
-      '<td>' + sharesStr + '</td>' +
-      '<td style="color:var(--yellow)">' + priceStr + '</td>' +
-      '<td>' + costStr + '</td>' +
-      '<td>' + secsStr + '</td>' +
-      '<td style="font-size:11px">' + (e.snap_label || '--') + '</td>' +
-      '<td>' + winnerStr + '</td>' +
-      '<td style="' + resultCls + '">' + resultStr + '</td>' +
-      '<td>' + upAskStr + '</td>' +
-      '<td>' + downAskStr + '</td>' +
-      '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
-      '<td>' + srcStr + '</td>' +
-      '</tr>';
+    const key = e.market_id || 'unknown';
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(e);
   });
-  tbody.innerHTML = html;
+
+  // ── Sort groups by most recent fill timestamp (newest first) ──
+  const sortedKeys = Object.keys(groups).sort((a, b) => {
+    const aTs = Math.max(...groups[a].map(e => e._raw?.ts || 0));
+    const bTs = Math.max(...groups[b].map(e => e._raw?.ts || 0));
+    return bTs - aTs;
+  });
+
+  if (countEl) countEl.textContent = sortedKeys.length + ' timeframe' + (sortedKeys.length !== 1 ? 's' : '');
+
+  let html = '';
+  sortedKeys.forEach((key, idx) => {
+    const evs = groups[key];
+    const first = evs[0];
+
+    // Extract time window from question
+    let timeLabel = first.question;
+    const tmMatch = timeLabel.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
+    timeLabel = tmMatch ? tmMatch[1] : (timeLabel.length > 50 ? timeLabel.substring(0, 47) + '...' : timeLabel);
+
+    // Collect unique assets in this group
+    const assets = [...new Set(evs.map(e => e.asset))];
+
+    // Stats for header
+    const upCount = evs.filter(e => e.side === 'UP').length;
+    const downCount = evs.filter(e => e.side === 'DOWN').length;
+    const cheapCount = evs.filter(e => e.fill_price <= 0.02).length;
+    const wins = evs.filter(e => e.won === 'WIN').length;
+    const losses = evs.filter(e => e.won === 'LOSS').length;
+    const pending = evs.filter(e => e.won === 'pending').length;
+
+    // Winner status badge
+    let winnerCls = 'pending';
+    let winnerText = 'PENDING';
+    if (pending === 0 && wins > 0 && losses === 0) { winnerCls = 'win'; winnerText = wins + ' WIN' + (wins > 1 ? 'S' : ''); }
+    else if (pending === 0 && losses > 0 && wins === 0) { winnerCls = 'loss'; winnerText = losses + ' LOSS' + (losses > 1 ? 'ES' : ''); }
+    else if (wins > 0 && losses > 0) { winnerCls = 'mixed'; winnerText = wins + 'W / ' + losses + 'L'; }
+    else if (pending > 0 && (wins > 0 || losses > 0)) { winnerCls = 'mixed'; winnerText = (wins + losses) + ' resolved, ' + pending + ' pending'; }
+
+    // Determine actual winner side from events
+    const winnerSide = evs.find(e => e.winner !== '--' && e.winner !== 'pending');
+    const winnerSideStr = winnerSide ? winnerSide.winner : '';
+
+    // Asset badges
+    const assetBadges = assets.map(a => '<span class="ah-group-asset-badge">' + a + '</span>').join('');
+
+    html += '<div class="ah-group" data-group-idx="' + idx + '">' +
+      '<div class="ah-group-header" onclick="ahToggleGroup(this)">' +
+        '<span class="ah-group-chevron">&#x25B6;</span>' +
+        '<span class="ah-group-time">' + timeLabel + '</span>' +
+        '<span class="ah-group-assets">' + assetBadges + '</span>' +
+        '<span class="ah-group-meta">' +
+          '<span class="gm-fills">' + evs.length + ' fill' + (evs.length !== 1 ? 's' : '') + '</span>' +
+          '<span class="gm-up">&#x25B2; ' + upCount + '</span>' +
+          '<span class="gm-down">&#x25BC; ' + downCount + '</span>' +
+          (cheapCount > 0 ? '<span class="gm-cheap">' + cheapCount + ' cheap</span>' : '') +
+          (winnerSideStr ? '<span style="color:var(--dim)">Winner: <b style="color:' + (winnerSideStr === 'Up' ? 'var(--green)' : 'var(--red)') + '">' + winnerSideStr + '</b></span>' : '') +
+        '</span>' +
+        '<span class="ah-group-winner ' + winnerCls + '">' + winnerText + '</span>' +
+      '</div>' +
+      '<div class="ah-group-body">' +
+        '<table><thead><tr>' +
+          '<th>Time</th><th>Side</th><th>Shares</th><th>Price $</th><th>Cost $</th>' +
+          '<th>After Close</th><th>Snapshot</th><th>Winner</th><th>Result</th>' +
+          '<th>UP Ask</th><th>DOWN Ask</th><th>Range %</th><th>Source</th>' +
+        '</tr></thead><tbody>';
+
+    evs.forEach(e => {
+      const sideCls = 'ah-side ' + e.side;
+      const secsStr = e.secs_after.toFixed(0) + 's';
+      const priceStr = '$' + e.fill_price.toFixed(2);
+      const costStr  = '$' + e.fill_cost.toFixed(2);
+      const sharesStr = e.fill_amount > 0 ? Math.round(e.fill_amount).toString() : '--';
+      const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
+      const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
+      const rangePctStr = (e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
+      const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
+      const winnerStr = e.winner !== '--' ? e.winner : '<span style="color:#666">--</span>';
+      let resultStr = e.won;
+      let resultCls = '';
+      if (e.won === 'WIN')  resultCls = 'color:var(--green);font-weight:700';
+      else if (e.won === 'LOSS') resultCls = 'color:var(--red);font-weight:700';
+      else resultCls = 'color:#666';
+      const srcStr = e.is_ours
+        ? '<span style="background:var(--green);color:#000;padding:1px 6px;border-radius:3px;font-size:11px">OUR BID</span>'
+        : '<span style="background:var(--border);color:var(--cyan);padding:1px 6px;border-radius:3px;font-size:11px">OBSERVED</span>';
+
+      html += '<tr>' +
+        '<td>' + e.ts_str + '</td>' +
+        '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
+        '<td>' + sharesStr + '</td>' +
+        '<td style="color:var(--yellow)">' + priceStr + '</td>' +
+        '<td>' + costStr + '</td>' +
+        '<td>' + secsStr + '</td>' +
+        '<td style="font-size:11px">' + (e.snap_label || '--') + '</td>' +
+        '<td>' + winnerStr + '</td>' +
+        '<td style="' + resultCls + '">' + resultStr + '</td>' +
+        '<td>' + upAskStr + '</td>' +
+        '<td>' + downAskStr + '</td>' +
+        '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
+        '<td>' + srcStr + '</td>' +
+        '</tr>';
+    });
+
+    html += '</tbody></table></div></div>';
+  });
+
+  container.innerHTML = html;
+}
+
+function ahToggleGroup(headerEl) {
+  const group = headerEl.parentElement;
+  group.classList.toggle('expanded');
+}
+function ahExpandAll() {
+  document.querySelectorAll('.ah-group').forEach(g => g.classList.add('expanded'));
+}
+function ahCollapseAll() {
+  document.querySelectorAll('.ah-group').forEach(g => g.classList.remove('expanded'));
 }
 
 function ahExportCSV() {
