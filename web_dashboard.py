@@ -345,6 +345,7 @@ class AfterHoursEvent:
         self.ask_diff: float = 0.0                 # |UP - DOWN| (symmetry indicator)
         self.price_distance: float = 0.0           # |price - candle_open| in $
         self.price_distance_pct: float = 0.0       # distance as % of price
+        self.range_pct: float = 0.0                # distance as % of candle range (universal)
         self.candle_range: float = 0.0             # 5-min candle high-low range
         self.asset_price: float = 0.0              # Current asset price
         self.candle_open: float = 0.0              # 5-min candle open price
@@ -367,6 +368,7 @@ class AfterHoursEvent:
             "ask_diff": round(self.ask_diff, 4),
             "price_distance": round(self.price_distance, 4),
             "price_distance_pct": round(self.price_distance_pct * 100, 4),
+            "range_pct": round(self.range_pct * 100, 2),
             "candle_range": round(self.candle_range, 4),
             "asset_price": round(self.asset_price, 2),
             "candle_open": round(self.candle_open, 2),
@@ -1014,8 +1016,10 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
             ev.price_distance = ast.distance
             ev.price_distance_pct = (ast.distance / ast.price) if ast.price > 0 else 0.0
             ev.candle_range = ast.candle_range
-            # "On the line" = price within 0.05% of candle open (asset-neutral threshold)
-            ev.on_the_line = ev.price_distance_pct < 0.0005
+            # range_pct = distance as fraction of candle range (universal across assets)
+            ev.range_pct = (ast.distance / ast.candle_range) if ast.candle_range > 0 else 0.0
+            # "On the line" = price within 25% of the candle range from the open
+            ev.on_the_line = ev.range_pct < 0.25 if ast.candle_range > 0 else ev.price_distance_pct < 0.0005
 
         engine.afterhours_events.appendleft(ev.to_dict())
     except Exception as _ah_err:
@@ -2718,7 +2722,7 @@ DASHBOARD_HTML = r"""
     padding: 10px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }
   .ah-stats-bar {
-    display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px;
+    display: grid; grid-template-columns: repeat(8, 1fr); gap: 12px;
     padding: 12px 24px 0 24px;
   }
   .ah-wrap {
@@ -3307,20 +3311,21 @@ DASHBOARD_HTML = r"""
     <label>Timing</label>
     <select id="ah-filter-timing" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
       <option value="ALL">All timing</option>
+      <option value="LAST60" selected>Last 60s (±60s)</option>
       <option value="PRE">Pre-close only</option>
       <option value="POST">Post-close only</option>
     </select>
   </div>
   <div class="control-group">
-    <label>Max Dist %</label>
-    <input type="number" id="ah-filter-dist" step="0.01" min="0" max="5" value="0"
-      title="Only show fills where price was within this % of candle open. 0 = show all."
+    <label title="Distance from candle open as % of candle range. Works the same for BTC, ETH, SOL, XRP. 0 = show all.">Max Range %</label>
+    <input type="number" id="ah-filter-range-pct" step="5" min="0" max="100" value="0"
+      title="Only show fills where price was within this % of the 5-min candle range from the open. 0 = show all. 25 = close to target."
       style="width:80px;">
   </div>
   <div class="control-group">
     <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
-      <input type="checkbox" id="ah-filter-online" title="Only show fills where price was at the target line (<0.05%)">
-      On-Line Only
+      <input type="checkbox" id="ah-filter-online" title="Only show fills where price was within 25% of candle range from open">
+      Near Line
     </label>
   </div>
   <button class="btn btn-apply" onclick="ahApplyFilter()">Filter</button>
@@ -3339,16 +3344,17 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">UP Fills</div><div class="stat-value green" id="ah-st-up">0</div></div>
   <div class="stat-card"><div class="stat-label">DOWN Fills</div><div class="stat-value red" id="ah-st-down">0</div></div>
   <div class="stat-card"><div class="stat-label">BOTH Filled</div><div class="stat-value cyan" id="ah-st-both">0</div></div>
-  <div class="stat-card"><div class="stat-label">On The Line</div><div class="stat-value yellow" id="ah-st-online">0</div></div>
-  <div class="stat-card"><div class="stat-label">Avg Secs to Close</div><div class="stat-value" id="ah-st-avg-secs">--</div></div>
-  <div class="stat-card"><div class="stat-label">Post-Close %</div><div class="stat-value" id="ah-st-post-pct">--</div></div>
+  <div class="stat-card"><div class="stat-label">Near Line (&lt;25%)</div><div class="stat-value yellow" id="ah-st-online">0</div></div>
+  <div class="stat-card"><div class="stat-label">Near Close (±60s)</div><div class="stat-value" id="ah-st-near-close">0</div></div>
+  <div class="stat-card"><div class="stat-label">Post-Close Fills</div><div class="stat-value red" id="ah-st-post-count">0</div></div>
+  <div class="stat-card"><div class="stat-label">Post + Near Line</div><div class="stat-value yellow" id="ah-st-post-online">0</div></div>
 </div>
 
 <!-- Breakdown Cards -->
 <div class="ah-breakdown">
   <!-- By Side -->
   <div class="ah-breakdown-card">
-    <h4>Fills by Side (when on-line, &lt;0.05% from open)</h4>
+    <h4>Fills by Side (near line, &lt;25% of range)</h4>
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">UP</span><span class="ah-breakdown-val green" id="ah-bk-up-online">0</span></div>
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">DOWN</span><span class="ah-breakdown-val red" id="ah-bk-down-online">0</span></div>
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">BOTH</span><span class="ah-breakdown-val cyan" id="ah-bk-both-online">0</span></div>
@@ -3398,12 +3404,13 @@ DASHBOARD_HTML = r"""
           <th title="UP + DOWN combined ask">Combined</th>
           <th title="Dollar distance of asset price from 5-min candle open">Dist $</th>
           <th title="Distance as % of asset price">Dist %</th>
+          <th title="Distance as % of 5-min candle range (universal metric)">Range %</th>
           <th title="5-min candle high-low range">Candle $</th>
-          <th title="Price was within 0.05% of candle open at fill time">Line</th>
+          <th title="Price was within 25% of candle range from open">Line</th>
         </tr>
       </thead>
       <tbody id="ah-events-body">
-        <tr><td colspan="14" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
+        <tr><td colspan="15" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
       </tbody>
     </table>
   </div>
@@ -4217,23 +4224,17 @@ function ahUpdateStats(events) {
   el('ah-st-both').textContent   = bothEvs.length;
   el('ah-st-online').textContent = onlineEvs.length;
 
-  // Average secs to close
-  if (events.length > 0) {
-    const avg = events.reduce((a, e) => a + e.secs_to_close, 0) / events.length;
-    el('ah-st-avg-secs').textContent = avg.toFixed(1) + 's';
-    el('ah-st-avg-secs').style.color = avg >= 0 ? 'var(--green)' : 'var(--red)';
-  } else {
-    el('ah-st-avg-secs').textContent = '--';
-    el('ah-st-avg-secs').style.color = '';
-  }
+  // Near Close (±60s)
+  const nearCloseEvs = events.filter(e => Math.abs(e.secs_to_close) <= 60);
+  el('ah-st-near-close').textContent = nearCloseEvs.length;
 
-  // Post-close %
-  const postCnt = events.filter(e => e.secs_to_close < 0).length;
-  if (events.length > 0) {
-    el('ah-st-post-pct').textContent = Math.round(postCnt / events.length * 100) + '%';
-  } else {
-    el('ah-st-post-pct').textContent = '--';
-  }
+  // Post-close fills
+  const postEvs = events.filter(e => e.secs_to_close < 0);
+  el('ah-st-post-count').textContent = postEvs.length;
+
+  // Post-close + near line (the key stat you're tracking)
+  const postOnline = postEvs.filter(e => e.on_the_line).length;
+  el('ah-st-post-online').textContent = postOnline;
 
   // Breakdown: on-line fills by side
   const olUp   = onlineEvs.filter(e => e.side === 'UP').length;
@@ -4265,15 +4266,16 @@ function ahApplyFilter() {
   const filterAsset  = document.getElementById('ah-filter-asset')  ? document.getElementById('ah-filter-asset').value  : 'ALL';
   const filterSide   = document.getElementById('ah-filter-side')   ? document.getElementById('ah-filter-side').value   : 'ALL';
   const filterTiming = document.getElementById('ah-filter-timing') ? document.getElementById('ah-filter-timing').value : 'ALL';
-  const filterDist   = document.getElementById('ah-filter-dist')   ? parseFloat(document.getElementById('ah-filter-dist').value) || 0 : 0;
+  const filterRangePct = document.getElementById('ah-filter-range-pct') ? parseFloat(document.getElementById('ah-filter-range-pct').value) || 0 : 0;
   const filterOnline = document.getElementById('ah-filter-online') ? document.getElementById('ah-filter-online').checked : false;
 
   let filtered = _ahAllEvents.filter(e => {
     if (filterAsset !== 'ALL' && e.asset !== filterAsset) return false;
     if (filterSide  !== 'ALL' && e.side  !== filterSide)  return false;
-    if (filterTiming === 'PRE'  && e.secs_to_close <= 0)  return false;
-    if (filterTiming === 'POST' && e.secs_to_close > 0)   return false;
-    if (filterDist > 0 && e.price_distance_pct > filterDist) return false;
+    if (filterTiming === 'PRE'    && e.secs_to_close <= 0) return false;
+    if (filterTiming === 'POST'   && e.secs_to_close > 0)  return false;
+    if (filterTiming === 'LAST60' && Math.abs(e.secs_to_close) > 60) return false;
+    if (filterRangePct > 0 && e.range_pct > filterRangePct) return false;
     if (filterOnline && !e.on_the_line) return false;
     return true;
   });
@@ -4285,7 +4287,7 @@ function ahRenderTable(events) {
   const tbody = document.getElementById('ah-events-body');
   if (!tbody) return;
   if (events.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="14" class="empty">No events match current filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">No events match current filters.</td></tr>';
     return;
   }
 
@@ -4294,8 +4296,10 @@ function ahRenderTable(events) {
     const secsStr = (e.secs_to_close > 0 ? '+' : '') + e.secs_to_close.toFixed(1) + 's';
     const secsCls = e.secs_to_close > 0 ? 'ah-pre' : 'ah-post';
     const sideCls = 'ah-side ' + e.side;
-    const lineMark = e.on_the_line ? '<span class="ah-at-line" title="Price was within 0.05% of candle open">&#x25CF;</span>' : '';
+    const lineMark = e.on_the_line ? '<span class="ah-at-line" title="Price within 25% of candle range from open">&#x25CF;</span>' : '';
     const distPctStr = e.price_distance_pct > 0 ? e.price_distance_pct.toFixed(4) + '%' : '--';
+    const rangePctStr = (e.range_pct !== undefined && e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
+    const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
     const distDolStr = e.price_distance > 0 ?
       (e.price_distance > 1 ? '$' + e.price_distance.toFixed(2) : '$' + e.price_distance.toFixed(4)) : '--';
     const candleStr  = e.candle_range > 0 ?
@@ -4322,6 +4326,7 @@ function ahRenderTable(events) {
       '<td>' + combStr + '</td>' +
       '<td>' + distDolStr + '</td>' +
       '<td>' + distPctStr + '</td>' +
+      '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
       '<td>' + candleStr + '</td>' +
       '<td style="text-align:center">' + lineMark + '</td>' +
       '</tr>';
