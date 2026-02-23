@@ -448,6 +448,7 @@ class Engine:
         self.scalper: Scalper = Scalper(self.btc_feed, self.ws_feed)
 
         # ── After-Hours Fill Tracker ──
+        self.afterhours_observed: set = set()  # market_ids already passively observed
         # Stores fill events that occurred close to market close (positive = pre-close,
         # negative = post-close). Cleared on bot restart; persists for the session.
         self.afterhours_events: deque = deque(maxlen=500)
@@ -1019,6 +1020,55 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
         log.debug(f"[afterhours] record error: {_ah_err}")
 
 
+def scan_afterhours_passive():
+    """Passively observe ALL watch-list markets near expiration — even when no bids were placed.
+
+    Records one snapshot (side="OBS") per market the first time it enters the
+    -60s … +15s window around close.  This lets the After-Hours tab show what
+    the market and asset price looked like at expiration regardless of whether
+    we traded, so we can analyse post-expiration price behaviour near the target.
+    """
+    for mid, market in list(engine.watch_list.items()):
+        if mid in engine.afterhours_observed:
+            continue
+        secs = seconds_until(market.end_time)
+        # Window: from 15 s before close to 60 s after close
+        if secs > 15 or secs < -60:
+            continue
+        try:
+            asset = getattr(market, "asset", "BTC")
+            ast = engine.btc_feed.get(asset)
+            if not ast or ast.price <= 0:
+                continue
+
+            ev = AfterHoursEvent(mid, market.question, asset)
+            ev.ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            ev.side = "OBS"
+            ev.fill_size = 0.0
+            ev.secs_to_close = secs
+
+            ws_up   = engine.ws_feed.get_price(market.token_id_up)
+            ws_down = engine.ws_feed.get_price(market.token_id_down)
+            if ws_up and ws_up.valid:
+                ev.up_ask = ws_up.best_ask
+            if ws_down and ws_down.valid:
+                ev.down_ask = ws_down.best_ask
+            ev.combined_ask = round(ev.up_ask + ev.down_ask, 4)
+            ev.ask_diff     = round(abs(ev.up_ask - ev.down_ask), 4)
+
+            ev.asset_price       = ast.price
+            ev.candle_open       = ast.candle_open
+            ev.price_distance    = ast.distance
+            ev.price_distance_pct = (ast.distance / ast.price) if ast.price > 0 else 0.0
+            ev.candle_range      = ast.candle_range
+            ev.on_the_line       = ev.price_distance_pct < 0.0005
+
+            engine.afterhours_events.appendleft(ev.to_dict())
+            engine.afterhours_observed.add(mid)
+        except Exception as _pe:
+            log.debug(f"[afterhours-passive] {mid}: {_pe}")
+
+
 def check_fills():
     """Check all posted bids for fills and track P&L accurately."""
     for mid, bid in list(engine.bids_posted.items()):
@@ -1419,6 +1469,7 @@ def bot_loop():
     last_heartbeat = 0
     last_push = 0
     last_btc_fetch = 0
+    last_ah_scan = 0
 
     while engine.running:
         try:
@@ -1489,6 +1540,11 @@ def bot_loop():
             if now_ts - last_fill_check >= 3.0:
                 check_fills()
                 last_fill_check = now_ts
+
+            # Passive after-hours observations (all markets near expiration, every 5s)
+            if now_ts - last_ah_scan >= 5.0:
+                scan_afterhours_passive()
+                last_ah_scan = now_ts
 
             # Monitor OB imbalance for active bids (log-only, every 2s)
             if now_ts - last_ob_monitor >= 2.0 and engine.bids_posted:
@@ -2339,6 +2395,7 @@ def on_scanner_manual_bid(data):
 def on_clear_afterhours():
     """Clear the after-hours fill events buffer (client request)."""
     engine.afterhours_events.clear()
+    engine.afterhours_observed.clear()
     push_state()
 
 
@@ -2728,6 +2785,7 @@ DASHBOARD_HTML = r"""
   .ah-side.UP { background: #0c2d0c; color: var(--green); }
   .ah-side.DOWN { background: #2d0c0c; color: var(--red); }
   .ah-side.BOTH { background: #0c2d4a; color: var(--cyan); }
+  .ah-side.OBS { background: #1e1e2e; color: #8888aa; border: 1px solid #444; }
   /* Timing cell: positive (pre-close) vs negative (post-close) */
   .ah-pre { color: var(--green); }
   .ah-post { color: var(--red); }
@@ -3286,6 +3344,7 @@ DASHBOARD_HTML = r"""
       <option value="UP">UP only</option>
       <option value="DOWN">DOWN only</option>
       <option value="BOTH">BOTH filled</option>
+      <option value="OBS">OBS (passive)</option>
     </select>
   </div>
   <div class="control-group">
@@ -3387,7 +3446,7 @@ DASHBOARD_HTML = r"""
         </tr>
       </thead>
       <tbody id="ah-events-body">
-        <tr><td colspan="13" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
+        <tr><td colspan="13" class="empty">No events recorded yet. Fills (UP/DOWN/BOTH) appear when orders match; OBS snapshots appear automatically for every market near expiration, even when no orders are placed.</td></tr>
       </tbody>
     </table>
   </div>
