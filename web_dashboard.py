@@ -612,7 +612,9 @@ class PostCloseMonitor:
                     elif fd["side"] == "DOWN":
                         ev.won = "WIN" if winner == "Down" else "LOSS"
 
-                engine.afterhours_events.appendleft(ev.to_dict())
+                ev_d = ev.to_dict()
+                engine.afterhours_events.appendleft(ev_d)
+                _ah_save_event(ev_d)
 
             if fills_detected:
                 win_count = sum(1 for fd in fills_detected
@@ -632,6 +634,55 @@ class PostCloseMonitor:
         finally:
             with self._lock:
                 self._monitored.discard(market.market_id)
+
+
+# ── After-Hours Persistence Helpers ──────────────────────────────────────────
+
+_AH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "afterhours_fills.jsonl")
+
+
+def _ah_save_event(ev_dict: dict):
+    """Append a single event dict to the persistent JSONL file."""
+    try:
+        os.makedirs(os.path.dirname(_AH_FILE), exist_ok=True)
+        with open(_AH_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev_dict, default=str) + "\n")
+    except Exception as e:
+        log.debug(f"[AH-persist] save error: {e}")
+
+
+def _ah_save_all():
+    """Rewrite the entire JSONL file from the current deque (after resolution updates or clear)."""
+    try:
+        os.makedirs(os.path.dirname(_AH_FILE), exist_ok=True)
+        with open(_AH_FILE, "w", encoding="utf-8") as f:
+            for ev in engine.afterhours_events:
+                f.write(json.dumps(ev, default=str) + "\n")
+    except Exception as e:
+        log.debug(f"[AH-persist] save-all error: {e}")
+
+
+def _ah_load():
+    """Load persisted events back into engine.afterhours_events on startup."""
+    if not os.path.exists(_AH_FILE):
+        return
+    count = 0
+    try:
+        with open(_AH_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    engine.afterhours_events.append(ev)
+                    count += 1
+                except json.JSONDecodeError:
+                    continue
+        if count:
+            log.info(f"[AH-persist] Loaded {count} events from disk")
+    except Exception as e:
+        log.debug(f"[AH-persist] load error: {e}")
 
 
 class Engine:
@@ -754,6 +805,7 @@ class Engine:
 
 
 engine = Engine()
+_ah_load()   # Restore persisted after-hours events from disk
 engine.scalper._socketio = socketio  # Give scalper access to SocketIO for live log pushes
 
 # Apply config defaults to scalper
@@ -1286,7 +1338,9 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
         # Compute fill cost
         ev.fill_cost = ev.bid_price * ev.fill_size
 
-        engine.afterhours_events.appendleft(ev.to_dict())
+        ev_d = ev.to_dict()
+        engine.afterhours_events.appendleft(ev_d)
+        _ah_save_event(ev_d)
     except Exception as _ah_err:
         log.debug(f"[afterhours] record error: {_ah_err}")
 
@@ -1310,6 +1364,7 @@ def _update_afterhours_resolution(market_id: str, winner: str):
                 ev["won"] = "WIN" if winner == "Down" else "LOSS"
             else:
                 ev["won"] = "pending"
+        _ah_save_all()   # persist resolution updates
     except Exception as _e:
         log.debug(f"[afterhours] resolution update error: {_e}")
 
@@ -2736,6 +2791,7 @@ def on_scanner_manual_bid(data):
 def on_clear_afterhours():
     """Clear the after-hours fill events buffer (client request)."""
     engine.afterhours_events.clear()
+    _ah_save_all()   # clear the disk file too
     push_state()
 
 
