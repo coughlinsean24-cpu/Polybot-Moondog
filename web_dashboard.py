@@ -337,6 +337,7 @@ class AfterHoursEvent:
         self.ts_str: str = ""                       # Human-readable UTC time
         self.side: str = ""                         # "UP", "DOWN", or "BOTH"
         self.fill_size: float = 0.0                 # Shares filled (max of up/down for BOTH)
+        self.bid_price: float = 0.0                # Bid price that was used for this order
         self.secs_to_close: float = 0.0            # + = pre-close, - = post-close
         self.up_ask: float = 0.0                   # UP ask at detection time
         self.down_ask: float = 0.0                 # DOWN ask at detection time
@@ -358,6 +359,7 @@ class AfterHoursEvent:
             "ts_str": self.ts_str,
             "side": self.side,
             "fill_size": self.fill_size,
+            "bid_price": round(self.bid_price, 4),
             "secs_to_close": round(self.secs_to_close, 1),
             "up_ask": round(self.up_ask, 4),
             "down_ask": round(self.down_ask, 4),
@@ -985,6 +987,7 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
         ev.ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
         ev.side = side
         ev.fill_size = fill_size
+        ev.bid_price = getattr(bid, 'bid_price', 0.0)
 
         # Seconds relative to market close: positive = still open, negative = already closed
         if market:
@@ -1027,12 +1030,16 @@ def check_fills():
 
         market = engine.watch_list.get(mid)
 
+        _new_up_fill = False
+        _new_down_fill = False
+
         if bid.order_id_up and not bid.up_filled:
             try:
                 status = get_order_status(bid.order_id_up)
                 if status["status"] in ("matched", "partial"):
                     bid.up_filled = True
                     bid.up_fill_size = status["size_matched"]
+                    _new_up_fill = True
                     fill_cost = bid.bid_price * bid.up_fill_size
                     engine.total_spent += fill_cost
                     engine.daily_spend += fill_cost
@@ -1041,9 +1048,6 @@ def check_fills():
                         f"FILL UP: {bid.up_fill_size:.0f} sh @ ${bid.bid_price} (${fill_cost:.2f})  {bid.question}",
                         "fill",
                     )
-                    # Record after-hours event (only for single UP fill — BOTH handled below)
-                    if not bid.down_filled:
-                        _record_afterhours_fill(bid, "UP", bid.up_fill_size, market)
             except Exception as e:
                 log_error(f"check_fill_up {mid}", e)
 
@@ -1053,6 +1057,7 @@ def check_fills():
                 if status["status"] in ("matched", "partial"):
                     bid.down_filled = True
                     bid.down_fill_size = status["size_matched"]
+                    _new_down_fill = True
                     fill_cost = bid.bid_price * bid.down_fill_size
                     engine.total_spent += fill_cost
                     engine.daily_spend += fill_cost
@@ -1061,13 +1066,13 @@ def check_fills():
                         f"FILL DOWN: {bid.down_fill_size:.0f} sh @ ${bid.bid_price} (${fill_cost:.2f})  {bid.question}",
                         "fill",
                     )
-                    # Record after-hours event (only for single DOWN fill — BOTH handled below)
-                    if not bid.up_filled:
-                        _record_afterhours_fill(bid, "DOWN", bid.down_fill_size, market)
             except Exception as e:
                 log_error(f"check_fill_down {mid}", e)
 
-        # Both sides filled = guaranteed payout (one side always resolves to $1)
+        # ── After-Hours Fill Tracking ──
+        # Record exactly ONE event per fill detection pass:
+        #  - BOTH if both sides are filled (whether same pass or prior+current)
+        #  - Single UP/DOWN only if the other side is NOT filled
         if bid.up_filled and bid.down_filled and not getattr(bid, '_both_logged', False):
             bid._both_logged = True
             payout = max(bid.up_fill_size, bid.down_fill_size) * 1.0
@@ -1078,8 +1083,18 @@ def check_fills():
                 f"BOTH FILLED! {bid.question}  Cost: ${total_cost:.2f}  Payout: ${payout:.2f}  Profit: ${profit:.2f}",
                 "profit",
             )
-            # Record BOTH fill event (overrides any prior single-side record for this market)
+            # Record BOTH fill event; if a prior single-side event exists for this
+            # market, remove it so the table stays clean (no double-count).
+            _prior_mid = bid.market_id
+            engine.afterhours_events = deque(
+                (e for e in engine.afterhours_events if e.get("market_id") != _prior_mid),
+                maxlen=500,
+            )
             _record_afterhours_fill(bid, "BOTH", max(bid.up_fill_size, bid.down_fill_size), market)
+        elif _new_up_fill and not bid.down_filled:
+            _record_afterhours_fill(bid, "UP", bid.up_fill_size, market)
+        elif _new_down_fill and not bid.up_filled:
+            _record_afterhours_fill(bid, "DOWN", bid.down_fill_size, market)
         # Single side filled — track estimated payout (resolves to $1 if wins, $0 if loses)
         elif (bid.up_filled or bid.down_filled) and bid.cancelled and not getattr(bid, '_single_logged', False):
             bid._single_logged = True
@@ -3376,6 +3391,7 @@ DASHBOARD_HTML = r"""
           <th>Market</th>
           <th>Side</th>
           <th>Shares</th>
+          <th title="Bid price used for this order">Bid $</th>
           <th title="Seconds from market close: + means before close, - means after close">Secs to Close</th>
           <th>UP Ask</th>
           <th>DOWN Ask</th>
@@ -3387,7 +3403,7 @@ DASHBOARD_HTML = r"""
         </tr>
       </thead>
       <tbody id="ah-events-body">
-        <tr><td colspan="13" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
+        <tr><td colspan="14" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
       </tbody>
     </table>
   </div>
@@ -4269,7 +4285,7 @@ function ahRenderTable(events) {
   const tbody = document.getElementById('ah-events-body');
   if (!tbody) return;
   if (events.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">No events match current filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">No events match current filters.</td></tr>';
     return;
   }
 
@@ -4299,6 +4315,7 @@ function ahRenderTable(events) {
       '<td title="' + (e.question || '').replace(/"/g, '&quot;') + '">' + mktName + '</td>' +
       '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
       '<td>' + (e.fill_size > 0 ? Math.round(e.fill_size) : '--') + '</td>' +
+      '<td style="color:var(--yellow)">$' + (e.bid_price || 0).toFixed(2) + '</td>' +
       '<td class="' + secsCls + '">' + secsStr + '</td>' +
       '<td>' + upAskStr + '</td>' +
       '<td>' + downAskStr + '</td>' +
