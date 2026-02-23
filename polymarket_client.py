@@ -295,6 +295,25 @@ def fetch_orderbook(token_id: str) -> OrderBookSnapshot:
     return snapshot
 
 
+def fetch_full_orderbook(token_id: str) -> dict:
+    """Fetch the FULL orderbook for a token — all bid and ask levels.
+    Returns dict with 'bids': [{price, size}, ...], 'asks': [{price, size}, ...],
+    'timestamp': float, 'valid': bool.
+    Used for post-close monitoring to detect fills at every price level."""
+    result = {"bids": [], "asks": [], "timestamp": time.time(), "valid": False}
+    try:
+        client = get_clob_client()
+        book = client.get_order_book(token_id)
+        if book.bids:
+            result["bids"] = [{"price": float(b.price), "size": float(b.size)} for b in book.bids]
+        if book.asks:
+            result["asks"] = [{"price": float(a.price), "size": float(a.size)} for a in book.asks]
+        result["valid"] = True
+    except Exception as e:
+        log_error(f"fetch_full_orderbook({token_id})", e)
+    return result
+
+
 def fetch_orderbooks_parallel(token_pairs: list[tuple[str, str]]) -> dict[str, tuple[OrderBookSnapshot, OrderBookSnapshot]]:
     """
     Fetch orderbooks for multiple markets in parallel.

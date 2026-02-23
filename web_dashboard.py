@@ -42,7 +42,7 @@ from logger import (
 from polymarket_client import (
     MarketWindow, OrderBookSnapshot, ScannedMarket,
     get_clob_client, fetch_active_btc_markets, fetch_active_markets,
-    fetch_orderbook, fetch_orderbooks_parallel,
+    fetch_orderbook, fetch_orderbooks_parallel, fetch_full_orderbook,
     place_limit_buy, cancel_order, get_order_status,
     seconds_until, get_adaptive_poll_interval,
     check_market_resolution, scan_active_markets,
@@ -350,6 +350,9 @@ class AfterHoursEvent:
         self.asset_price: float = 0.0              # Current asset price
         self.candle_open: float = 0.0              # 5-min candle open price
         self.on_the_line: bool = False             # True if price very close to open
+        self.winner: str = "pending"               # "Up", "Down", or "pending"
+        self.won: str = "pending"                  # "WIN", "LOSS", "BOTH" (guaranteed), or "pending"
+        self.fill_cost: float = 0.0                # bid_price * fill_size (total $ spent)
 
     def to_dict(self) -> dict:
         return {
@@ -361,6 +364,7 @@ class AfterHoursEvent:
             "side": self.side,
             "fill_size": self.fill_size,
             "bid_price": round(self.bid_price, 4),
+            "fill_cost": round(self.fill_cost, 4),
             "secs_to_close": round(self.secs_to_close, 1),
             "up_ask": round(self.up_ask, 4),
             "down_ask": round(self.down_ask, 4),
@@ -373,7 +377,261 @@ class AfterHoursEvent:
             "asset_price": round(self.asset_price, 2),
             "candle_open": round(self.candle_open, 2),
             "on_the_line": self.on_the_line,
+            "winner": self.winner,
+            "won": self.won,
+            "is_ours": True,
         }
+
+
+# ── Post-Close Orderbook Monitor ────────────────────────────────────────────
+# Watches ALL crypto 5m markets (not just ones we bid on) around close time.
+# Takes orderbook snapshots, detects fills by comparing bid levels,
+# then tags each fill with the resolution winner for pattern analysis.
+
+class ObservedFill:
+    """A fill detected on any market by comparing orderbook snapshots.
+    This tracks ALL market activity, not just our own bids."""
+
+    def __init__(self):
+        self.market_id: str = ""
+        self.question: str = ""
+        self.asset: str = ""
+        self.ts: float = time.time()
+        self.ts_str: str = ""
+        self.side: str = ""                  # "UP" or "DOWN"
+        self.fill_price: float = 0.0         # Price level where fill was detected
+        self.fill_amount: float = 0.0        # Shares filled (size decrease)
+        self.fill_cost: float = 0.0          # fill_price * fill_amount
+        self.secs_after_close: float = 0.0   # Seconds after market close (positive = after)
+        self.snap_label: str = ""            # Which snapshot pair detected it (e.g. "close→+30s")
+        self.up_ask: float = 0.0             # UP best ask at detection
+        self.down_ask: float = 0.0           # DOWN best ask at detection
+        self.combined_ask: float = 0.0
+        self.asset_price: float = 0.0
+        self.candle_open: float = 0.0
+        self.price_distance: float = 0.0
+        self.range_pct: float = 0.0
+        self.candle_range: float = 0.0
+        self.on_the_line: bool = False
+        self.winner: str = "pending"
+        self.won: str = "pending"            # "WIN", "LOSS", or "pending"
+        self.is_ours: bool = False           # True if we had a bid on this market
+
+    def to_dict(self) -> dict:
+        return {
+            "market_id": self.market_id,
+            "question": self.question,
+            "asset": self.asset,
+            "ts": self.ts,
+            "ts_str": self.ts_str,
+            "side": self.side,
+            "fill_price": round(self.fill_price, 4),
+            "fill_amount": round(self.fill_amount, 1),
+            "fill_cost": round(self.fill_cost, 4),
+            "secs_after_close": round(self.secs_after_close, 1),
+            "snap_label": self.snap_label,
+            "up_ask": round(self.up_ask, 4),
+            "down_ask": round(self.down_ask, 4),
+            "combined_ask": round(self.combined_ask, 4),
+            "asset_price": round(self.asset_price, 2),
+            "candle_open": round(self.candle_open, 2),
+            "price_distance": round(self.price_distance, 4),
+            "range_pct": round(self.range_pct * 100, 2),
+            "candle_range": round(self.candle_range, 4),
+            "on_the_line": self.on_the_line,
+            "winner": self.winner,
+            "won": self.won,
+            "is_ours": self.is_ours,
+        }
+
+
+class PostCloseMonitor:
+    """Monitors orderbooks on ALL crypto 5m markets around close time.
+    Takes snapshots at close and post-close, detects fills by comparing
+    bid levels, then checks resolution to find winning side.
+
+    Runs as background threads — one per closing market."""
+
+    def __init__(self):
+        self._monitored: set = set()   # market_ids currently being monitored
+        self._lock = threading.Lock()
+
+    def should_monitor(self, market_id: str, secs_to_close: float) -> bool:
+        """Return True if this market should start being monitored (close to closing)."""
+        if market_id in self._monitored:
+            return False
+        # Start monitoring when market is within 10 seconds of close
+        return -2 <= secs_to_close <= 10
+
+    def start_monitoring(self, market: MarketWindow):
+        """Spawn a background thread to monitor this market through close + post-close."""
+        with self._lock:
+            if market.market_id in self._monitored:
+                return
+            self._monitored.add(market.market_id)
+
+        t = threading.Thread(
+            target=self._monitor_market,
+            args=(market,),
+            daemon=True,
+            name=f"pcm-{market.asset}-{market.market_id[:8]}",
+        )
+        t.start()
+
+    def _monitor_market(self, market: MarketWindow):
+        """Main monitoring routine for a single market.
+        Takes orderbook snapshots at close and post-close intervals,
+        detects fills by comparing bid sizes, then checks resolution."""
+        try:
+            mid = market.market_id
+            asset = market.asset
+            secs = seconds_until(market.end_time)
+
+            # Wait until market closes (if we started a few seconds early)
+            if secs > 0:
+                time.sleep(secs + 0.5)
+
+            # ── Snapshot schedule: close, +15s, +30s, +60s, +90s ──
+            snapshot_times = [0, 15, 30, 60, 90]
+            snapshots = []  # list of (label, seconds_after_close, {up_bids, down_bids, up_ask, down_ask})
+
+            for i, delay in enumerate(snapshot_times):
+                if i > 0:
+                    time.sleep(snapshot_times[i] - snapshot_times[i - 1])
+
+                try:
+                    book_up = fetch_full_orderbook(market.token_id_up)
+                    book_down = fetch_full_orderbook(market.token_id_down)
+                except Exception as e:
+                    log.debug(f"[PCM] snapshot error {asset} +{delay}s: {e}")
+                    continue
+
+                # Also grab WS best prices for context
+                ws_up = engine.ws_feed.get_price(market.token_id_up)
+                ws_down = engine.ws_feed.get_price(market.token_id_down)
+
+                label = "close" if delay == 0 else f"+{delay}s"
+                snap = {
+                    "label": label,
+                    "secs": delay,
+                    "up_bids": {round(b["price"], 2): b["size"] for b in book_up.get("bids", [])},
+                    "down_bids": {round(b["price"], 2): b["size"] for b in book_down.get("bids", [])},
+                    "up_ask": ws_up.best_ask if ws_up and ws_up.valid else 0.0,
+                    "down_ask": ws_down.best_ask if ws_down and ws_down.valid else 0.0,
+                }
+                snapshots.append(snap)
+                log.debug(f"[PCM] {asset} {label}: UP bids={len(snap['up_bids'])} DOWN bids={len(snap['down_bids'])}")
+
+            # ── Detect fills by comparing consecutive snapshots ──
+            fills_detected = []
+            for i in range(1, len(snapshots)):
+                prev = snapshots[i - 1]
+                curr = snapshots[i]
+                snap_label = f"{prev['label']}→{curr['label']}"
+                secs_after = curr["secs"]
+
+                # Compare UP side bids
+                for price_level, prev_size in prev["up_bids"].items():
+                    curr_size = curr["up_bids"].get(price_level, 0.0)
+                    if curr_size < prev_size:
+                        filled = prev_size - curr_size
+                        fills_detected.append({
+                            "side": "UP",
+                            "price": price_level,
+                            "amount": filled,
+                            "secs": secs_after,
+                            "snap_label": snap_label,
+                            "up_ask": curr["up_ask"],
+                            "down_ask": curr["down_ask"],
+                        })
+
+                # Compare DOWN side bids
+                for price_level, prev_size in prev["down_bids"].items():
+                    curr_size = curr["down_bids"].get(price_level, 0.0)
+                    if curr_size < prev_size:
+                        filled = prev_size - curr_size
+                        fills_detected.append({
+                            "side": "DOWN",
+                            "price": price_level,
+                            "amount": filled,
+                            "secs": secs_after,
+                            "snap_label": snap_label,
+                            "up_ask": curr["up_ask"],
+                            "down_ask": curr["down_ask"],
+                        })
+
+            # ── Check resolution ──
+            winner = "pending"
+            for attempt in range(4):
+                if attempt > 0:
+                    time.sleep(30)
+                try:
+                    result = check_market_resolution(mid)
+                    if result["resolved"]:
+                        winner = result["winner"]
+                        break
+                except Exception:
+                    pass
+
+            # ── Build ObservedFill events ──
+            is_ours = mid in engine.bids_posted
+            ast = engine.btc_feed.get(asset)
+            now_ts = time.time()
+            ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+            for fd in fills_detected:
+                ev = ObservedFill()
+                ev.market_id = mid
+                ev.question = market.question
+                ev.asset = asset
+                ev.ts = now_ts
+                ev.ts_str = ts_str
+                ev.side = fd["side"]
+                ev.fill_price = fd["price"]
+                ev.fill_amount = fd["amount"]
+                ev.fill_cost = fd["price"] * fd["amount"]
+                ev.secs_after_close = fd["secs"]
+                ev.snap_label = fd["snap_label"]
+                ev.up_ask = fd["up_ask"]
+                ev.down_ask = fd["down_ask"]
+                ev.combined_ask = round(fd["up_ask"] + fd["down_ask"], 4)
+                ev.is_ours = is_ours
+
+                if ast and ast.price > 0:
+                    ev.asset_price = ast.price
+                    ev.candle_open = ast.candle_open
+                    ev.price_distance = ast.distance
+                    ev.candle_range = ast.candle_range
+                    ev.range_pct = (ast.distance / ast.candle_range) if ast.candle_range > 0 else 0.0
+                    ev.on_the_line = ev.range_pct < 0.25 if ast.candle_range > 0 else False
+
+                ev.winner = winner
+                if winner != "pending":
+                    if fd["side"] == "UP":
+                        ev.won = "WIN" if winner == "Up" else "LOSS"
+                    elif fd["side"] == "DOWN":
+                        ev.won = "WIN" if winner == "Down" else "LOSS"
+
+                engine.afterhours_events.appendleft(ev.to_dict())
+
+            if fills_detected:
+                win_count = sum(1 for fd in fills_detected
+                              if (fd["side"] == "UP" and winner == "Up") or
+                                 (fd["side"] == "DOWN" and winner == "Down"))
+                log.info(f"[PCM] {asset} {market.question[:40]}: {len(fills_detected)} fills detected, "
+                         f"winner={winner}, {win_count} on winning side")
+            else:
+                log.debug(f"[PCM] {asset} {market.question[:40]}: no fills detected post-close")
+
+            # ── Also update any existing AH events for this market with winner ──
+            if winner != "pending":
+                _update_afterhours_resolution(mid, winner)
+
+        except Exception as e:
+            log.error(f"[PCM] monitor error: {e}")
+        finally:
+            with self._lock:
+                self._monitored.discard(market.market_id)
 
 
 class Engine:
@@ -454,7 +712,11 @@ class Engine:
         # ── After-Hours Fill Tracker ──
         # Stores fill events that occurred close to market close (positive = pre-close,
         # negative = post-close). Cleared on bot restart; persists for the session.
-        self.afterhours_events: deque = deque(maxlen=500)
+        # Now also includes ObservedFill events from the PostCloseMonitor.
+        self.afterhours_events: deque = deque(maxlen=2000)
+
+        # ── Post-Close Monitor (watches ALL markets, not just ones we bid on) ──
+        self.pcm: PostCloseMonitor = PostCloseMonitor()
 
         # ── Market Scanner ──
         self.scanner_results: list[dict] = []      # List of dicts for dashboard
@@ -1021,9 +1283,35 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
             # "On the line" = price within 25% of the candle range from the open
             ev.on_the_line = ev.range_pct < 0.25 if ast.candle_range > 0 else ev.price_distance_pct < 0.0005
 
+        # Compute fill cost
+        ev.fill_cost = ev.bid_price * ev.fill_size
+
         engine.afterhours_events.appendleft(ev.to_dict())
     except Exception as _ah_err:
         log.debug(f"[afterhours] record error: {_ah_err}")
+
+
+def _update_afterhours_resolution(market_id: str, winner: str):
+    """After a market resolves, tag all AH events for that market with
+    the winner and whether the filled side won or lost."""
+    try:
+        for ev in engine.afterhours_events:
+            if ev.get("market_id") != market_id:
+                continue
+            if ev.get("won") == "BOTH":
+                continue  # already tagged as guaranteed win
+            ev["winner"] = winner
+            side = ev.get("side", "")
+            if side == "BOTH":
+                ev["won"] = "BOTH"
+            elif side == "UP":
+                ev["won"] = "WIN" if winner == "Up" else "LOSS"
+            elif side == "DOWN":
+                ev["won"] = "WIN" if winner == "Down" else "LOSS"
+            else:
+                ev["won"] = "pending"
+    except Exception as _e:
+        log.debug(f"[afterhours] resolution update error: {_e}")
 
 
 def check_fills():
@@ -1074,9 +1362,14 @@ def check_fills():
                 log_error(f"check_fill_down {mid}", e)
 
         # ── After-Hours Fill Tracking ──
-        # Record exactly ONE event per fill detection pass:
-        #  - BOTH if both sides are filled (whether same pass or prior+current)
-        #  - Single UP/DOWN only if the other side is NOT filled
+        # Record EVERY fill individually (UP/DOWN) as it happens.
+        # When both sides fill, also add a BOTH summary row and mark
+        # the individual rows with won="BOTH" (guaranteed profit).
+        if _new_up_fill:
+            _record_afterhours_fill(bid, "UP", bid.up_fill_size, market)
+        if _new_down_fill:
+            _record_afterhours_fill(bid, "DOWN", bid.down_fill_size, market)
+
         if bid.up_filled and bid.down_filled and not getattr(bid, '_both_logged', False):
             bid._both_logged = True
             payout = max(bid.up_fill_size, bid.down_fill_size) * 1.0
@@ -1087,25 +1380,18 @@ def check_fills():
                 f"BOTH FILLED! {bid.question}  Cost: ${total_cost:.2f}  Payout: ${payout:.2f}  Profit: ${profit:.2f}",
                 "profit",
             )
-            # Record BOTH fill event; if a prior single-side event exists for this
-            # market, remove it so the table stays clean (no double-count).
-            _prior_mid = bid.market_id
-            engine.afterhours_events = deque(
-                (e for e in engine.afterhours_events if e.get("market_id") != _prior_mid),
-                maxlen=500,
-            )
             _record_afterhours_fill(bid, "BOTH", max(bid.up_fill_size, bid.down_fill_size), market)
-        elif _new_up_fill and not bid.down_filled:
-            _record_afterhours_fill(bid, "UP", bid.up_fill_size, market)
-        elif _new_down_fill and not bid.up_filled:
-            _record_afterhours_fill(bid, "DOWN", bid.down_fill_size, market)
+            # Mark individual UP/DOWN events for this market as won="BOTH"
+            for _ev in engine.afterhours_events:
+                if _ev.get("market_id") == bid.market_id and _ev.get("side") in ("UP", "DOWN"):
+                    _ev["won"] = "BOTH"
+                    _ev["winner"] = "BOTH"
+
         # Single side filled — track estimated payout (resolves to $1 if wins, $0 if loses)
-        elif (bid.up_filled or bid.down_filled) and bid.cancelled and not getattr(bid, '_single_logged', False):
+        if (bid.up_filled or bid.down_filled) and not (bid.up_filled and bid.down_filled) and bid.cancelled and not getattr(bid, '_single_logged', False):
             bid._single_logged = True
             side = "UP" if bid.up_filled else "DOWN"
             fill_size = bid.up_fill_size if bid.up_filled else bid.down_fill_size
-            # Payout is uncertain — shares could resolve $1 or $0
-            # We show potential payout but mark as pending
             engine.add_log(
                 f"SINGLE FILL {side}: {fill_size:.0f} sh  {bid.question}  (payout pending resolution)",
                 "trade",
@@ -1278,6 +1564,9 @@ def _schedule_resolution_check(market_id: str, bid: BidRecord,
                     pnl=pnl,
                     winner_side=winner,
                 )
+
+                # ── Update After-Hours events with resolution outcome ──
+                _update_afterhours_resolution(market_id, winner)
             elif attempt < retries:
                 # Not resolved yet — retry with longer delay
                 t = threading.Timer(delay * attempt, lambda: do_check(attempt + 1))
@@ -1513,6 +1802,12 @@ def bot_loop():
             if now_ts - last_ob_monitor >= 2.0 and engine.bids_posted:
                 monitor_ob_imbalance()
                 last_ob_monitor = now_ts
+
+            # ── Post-Close Monitor: watch ALL markets approaching close ──
+            for _pcm_mid, _pcm_mkt in list(engine.watch_list.items()):
+                _pcm_secs = seconds_until(_pcm_mkt.end_time)
+                if engine.pcm.should_monitor(_pcm_mid, _pcm_secs):
+                    engine.pcm.start_monitoring(_pcm_mkt)
 
             # Update price cache
             update_prices()
@@ -3304,23 +3599,30 @@ DASHBOARD_HTML = r"""
       <option value="ALL">ALL</option>
       <option value="UP">UP only</option>
       <option value="DOWN">DOWN only</option>
-      <option value="BOTH">BOTH filled</option>
     </select>
   </div>
   <div class="control-group">
-    <label>Timing</label>
-    <select id="ah-filter-timing" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
-      <option value="ALL">All timing</option>
-      <option value="LAST60" selected>Last 60s (±60s)</option>
-      <option value="PRE">Pre-close only</option>
-      <option value="POST">Post-close only</option>
+    <label>Source</label>
+    <select id="ah-filter-source" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
+      <option value="ALL">All fills</option>
+      <option value="OBSERVED" selected>Observed (all markets)</option>
+      <option value="OURS">Our bids only</option>
     </select>
   </div>
   <div class="control-group">
-    <label title="Distance from candle open as % of candle range. Works the same for BTC, ETH, SOL, XRP. 0 = show all.">Max Range %</label>
-    <input type="number" id="ah-filter-range-pct" step="5" min="0" max="100" value="0"
-      title="Only show fills where price was within this % of the 5-min candle range from the open. 0 = show all. 25 = close to target."
+    <label title="Max fill price. 0 = all. E.g. 0.03 to see cheap fills only.">Max Price $</label>
+    <input type="number" id="ah-filter-max-price" step="0.01" min="0" max="1" value="0"
+      title="Only show fills at or below this price. 0 = show all. 0.03 = cheap fills."
       style="width:80px;">
+  </div>
+  <div class="control-group">
+    <label>Result</label>
+    <select id="ah-filter-result" style="background:var(--bg);border:1px solid var(--border);color:var(--cyan);padding:6px 10px;border-radius:4px;font-size:13px;font-family:monospace;">
+      <option value="ALL">ALL</option>
+      <option value="WIN">Wins only</option>
+      <option value="LOSS">Losses only</option>
+      <option value="PENDING">Pending</option>
+    </select>
   </div>
   <div class="control-group">
     <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
@@ -3332,49 +3634,47 @@ DASHBOARD_HTML = r"""
   <button class="btn" style="background:var(--border);color:var(--text);" onclick="ahClearEvents()">Clear</button>
   <div style="flex:1"></div>
   <div class="cost-preview" style="font-size:11px;">
-    Session fills: <span class="val" id="ah-total-count">0</span>
-    &nbsp;|&nbsp; Pre-close: <span class="val green" id="ah-pre-count">0</span>
-    &nbsp;|&nbsp; Post-close: <span class="val red" id="ah-post-count">0</span>
+    Total events: <span class="val" id="ah-total-count">0</span>
+    &nbsp;|&nbsp; Observed: <span class="val cyan" id="ah-obs-count">0</span>
+    &nbsp;|&nbsp; Our Fills: <span class="val green" id="ah-our-count">0</span>
   </div>
 </div>
 
 <!-- Stats Bar -->
 <div class="ah-stats-bar">
-  <div class="stat-card"><div class="stat-label">Total Fills</div><div class="stat-value cyan" id="ah-st-total">0</div></div>
+  <div class="stat-card"><div class="stat-label">Total Observed</div><div class="stat-value cyan" id="ah-st-total">0</div></div>
   <div class="stat-card"><div class="stat-label">UP Fills</div><div class="stat-value green" id="ah-st-up">0</div></div>
   <div class="stat-card"><div class="stat-label">DOWN Fills</div><div class="stat-value red" id="ah-st-down">0</div></div>
-  <div class="stat-card"><div class="stat-label">BOTH Filled</div><div class="stat-value cyan" id="ah-st-both">0</div></div>
-  <div class="stat-card"><div class="stat-label">Near Line (&lt;25%)</div><div class="stat-value yellow" id="ah-st-online">0</div></div>
-  <div class="stat-card"><div class="stat-label">Near Close (±60s)</div><div class="stat-value" id="ah-st-near-close">0</div></div>
-  <div class="stat-card"><div class="stat-label">Post-Close Fills</div><div class="stat-value red" id="ah-st-post-count">0</div></div>
-  <div class="stat-card"><div class="stat-label">Post + Near Line</div><div class="stat-value yellow" id="ah-st-post-online">0</div></div>
+  <div class="stat-card"><div class="stat-label">Wins</div><div class="stat-value green" id="ah-st-wins">0</div></div>
+  <div class="stat-card"><div class="stat-label">Losses</div><div class="stat-value red" id="ah-st-losses">0</div></div>
+  <div class="stat-card"><div class="stat-label">Cheap (&le;$0.02)</div><div class="stat-value yellow" id="ah-st-cheap">0</div></div>
+  <div class="stat-card"><div class="stat-label">Cheap Wins</div><div class="stat-value green" id="ah-st-cheap-wins">0</div></div>
+  <div class="stat-card"><div class="stat-label">Markets Monitored</div><div class="stat-value" id="ah-st-markets">0</div></div>
 </div>
 
 <!-- Breakdown Cards -->
 <div class="ah-breakdown">
-  <!-- By Side -->
+  <!-- Win/Loss Analysis -->
   <div class="ah-breakdown-card">
-    <h4>Fills by Side (near line, &lt;25% of range)</h4>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">UP</span><span class="ah-breakdown-val green" id="ah-bk-up-online">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">DOWN</span><span class="ah-breakdown-val red" id="ah-bk-down-online">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">BOTH</span><span class="ah-breakdown-val cyan" id="ah-bk-both-online">0</span></div>
+    <h4>Post-Close Fill Analysis</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Fills on winning side</span><span class="ah-breakdown-val green" id="ah-bk-wins">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Fills on losing side</span><span class="ah-breakdown-val red" id="ah-bk-losses">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Pending resolution</span><span class="ah-breakdown-val" id="ah-bk-pending">0</span></div>
     <div class="ah-breakdown-row" style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;">
-      <span class="ah-breakdown-label">UP rate</span>
-      <span class="ah-breakdown-val" id="ah-bk-up-rate">--</span>
-    </div>
-    <div class="ah-breakdown-row">
-      <span class="ah-breakdown-label">DOWN rate</span>
-      <span class="ah-breakdown-val" id="ah-bk-down-rate">--</span>
+      <span class="ah-breakdown-label">Win-side fill rate</span>
+      <span class="ah-breakdown-val green" id="ah-bk-win-rate">--</span>
     </div>
   </div>
-  <!-- By Timing -->
+  <!-- Cheap Fill Pattern -->
   <div class="ah-breakdown-card">
-    <h4>Fill Timing Distribution</h4>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">&gt; 10s pre-close</span><span class="ah-breakdown-val green" id="ah-bk-t-early">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">0-10s pre-close</span><span class="ah-breakdown-val green" id="ah-bk-t-pre10">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">At close (±1s)</span><span class="ah-breakdown-val yellow" id="ah-bk-t-atclose">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">0-10s post-close</span><span class="ah-breakdown-val red" id="ah-bk-t-post10">0</span></div>
-    <div class="ah-breakdown-row"><span class="ah-breakdown-label">&gt; 10s post-close</span><span class="ah-breakdown-val red" id="ah-bk-t-late">0</span></div>
+    <h4>Cheap Fill Pattern (&le; $0.02)</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Total cheap fills</span><span class="ah-breakdown-val yellow" id="ah-bk-cheap-total">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Cheap on winning side</span><span class="ah-breakdown-val green" id="ah-bk-cheap-wins">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">Cheap on losing side</span><span class="ah-breakdown-val red" id="ah-bk-cheap-losses">0</span></div>
+    <div class="ah-breakdown-row" style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px;">
+      <span class="ah-breakdown-label">Cheap win-side rate</span>
+      <span class="ah-breakdown-val green" id="ah-bk-cheap-rate">--</span>
+    </div>
   </div>
   <!-- By Asset -->
   <div class="ah-breakdown-card">
@@ -3383,6 +3683,14 @@ DASHBOARD_HTML = r"""
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">ETH</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-ETH">0</span></div>
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">SOL</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-SOL">0</span></div>
     <div class="ah-breakdown-row"><span class="ah-breakdown-label">XRP</span><span class="ah-breakdown-val cyan" id="ah-bk-asset-XRP">0</span></div>
+  </div>
+  <!-- Timing Pattern -->
+  <div class="ah-breakdown-card">
+    <h4>Timing Breakdown</h4>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">0-15s after close</span><span class="ah-breakdown-val" id="ah-bk-t15">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">15-30s after close</span><span class="ah-breakdown-val" id="ah-bk-t30">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">30-60s after close</span><span class="ah-breakdown-val" id="ah-bk-t60">0</span></div>
+    <div class="ah-breakdown-row"><span class="ah-breakdown-label">60-90s after close</span><span class="ah-breakdown-val" id="ah-bk-t90">0</span></div>
   </div>
 </div>
 
@@ -3396,21 +3704,21 @@ DASHBOARD_HTML = r"""
           <th>Asset</th>
           <th>Market</th>
           <th>Side</th>
-          <th>Shares</th>
-          <th title="Bid price used for this order">Bid $</th>
-          <th title="Seconds from market close: + means before close, - means after close">Secs to Close</th>
+          <th title="Shares filled">Shares</th>
+          <th title="Fill price (bid level where fill was detected)">Price $</th>
+          <th title="Total cost: price * shares">Cost $</th>
+          <th title="Seconds after market close">After Close</th>
+          <th title="Snapshot interval where fill was detected">Snapshot</th>
+          <th title="Which side won the market (Up/Down)">Winner</th>
+          <th title="WIN = filled on winning side, LOSS = filled on losing side">Result</th>
           <th>UP Ask</th>
           <th>DOWN Ask</th>
-          <th title="UP + DOWN combined ask">Combined</th>
-          <th title="Dollar distance of asset price from 5-min candle open">Dist $</th>
-          <th title="Distance as % of asset price">Dist %</th>
           <th title="Distance as % of 5-min candle range (universal metric)">Range %</th>
-          <th title="5-min candle high-low range">Candle $</th>
-          <th title="Price was within 25% of candle range from open">Line</th>
+          <th title="Observed from market orderbook or our own bid">Source</th>
         </tr>
       </thead>
       <tbody id="ah-events-body">
-        <tr><td colspan="15" class="empty">No after-hours fills recorded yet. Fills appear here as they are detected.</td></tr>
+        <tr><td colspan="15" class="empty">Monitoring all crypto 5m markets for post-close fills. Data appears after each market closes.</td></tr>
       </tbody>
     </table>
   </div>
@@ -4189,21 +4497,45 @@ socket.on('state', (d) => {
 });
 
 // ── After-Hours Fills: state & render ──
-let _ahAllEvents = [];   // full list from server
+let _ahAllEvents = [];   // full list from server (both ObservedFill and AfterHoursEvent)
+
+// Normalise event: handle both ObservedFill and legacy AfterHoursEvent field names
+function ahNorm(e) {
+  return {
+    ts_str:        e.ts_str || '--',
+    asset:         e.asset  || '--',
+    question:      e.question || '',
+    side:          e.side   || '--',
+    fill_price:    e.fill_price != null ? e.fill_price : (e.bid_price || 0),
+    fill_amount:   e.fill_amount != null ? e.fill_amount : (e.fill_size || 0),
+    fill_cost:     e.fill_cost != null ? e.fill_cost : ((e.bid_price || 0) * (e.fill_size || 0)),
+    secs_after:    e.secs_after_close != null ? e.secs_after_close : (e.secs_to_close != null ? -e.secs_to_close : 0),
+    snap_label:    e.snap_label || (e.secs_to_close != null ? 'legacy' : '--'),
+    winner:        e.winner || '--',
+    won:           e.won || 'pending',
+    up_ask:        e.up_ask || 0,
+    down_ask:      e.down_ask || 0,
+    range_pct:     e.range_pct != null ? e.range_pct : -1,
+    on_the_line:   e.on_the_line || false,
+    is_ours:       e.is_ours != null ? e.is_ours : true,   // legacy events are always our bids
+    market_id:     e.market_id || '',
+    _raw:          e
+  };
+}
 
 function ahRenderAll(events) {
-  _ahAllEvents = events || [];
+  _ahAllEvents = (events || []).map(ahNorm);
   // Update tab badge
   const badge = document.getElementById('ah-tab-badge');
   if (badge) badge.textContent = _ahAllEvents.length;
 
   // Top-bar counters
-  const preCount = _ahAllEvents.filter(e => e.secs_to_close > 0).length;
-  const postCount = _ahAllEvents.filter(e => e.secs_to_close <= 0).length;
+  const obsCount = _ahAllEvents.filter(e => !e.is_ours).length;
+  const ourCount = _ahAllEvents.filter(e => e.is_ours).length;
   const el = id => document.getElementById(id);
   if (el('ah-total-count')) el('ah-total-count').textContent = _ahAllEvents.length;
-  if (el('ah-pre-count'))   el('ah-pre-count').textContent  = preCount;
-  if (el('ah-post-count'))  el('ah-post-count').textContent = postCount;
+  if (el('ah-obs-count'))   el('ah-obs-count').textContent  = obsCount;
+  if (el('ah-our-count'))   el('ah-our-count').textContent  = ourCount;
 
   ahUpdateStats(_ahAllEvents);
   ahApplyFilter();   // renders filtered table
@@ -4211,48 +4543,43 @@ function ahRenderAll(events) {
 
 function ahUpdateStats(events) {
   const el = id => document.getElementById(id);
-  if (!el('ah-st-total')) return;   // tab not rendered
+  if (!el('ah-st-total')) return;
 
   const upEvs    = events.filter(e => e.side === 'UP');
   const downEvs  = events.filter(e => e.side === 'DOWN');
-  const bothEvs  = events.filter(e => e.side === 'BOTH');
-  const onlineEvs = events.filter(e => e.on_the_line);
+  const winEvs   = events.filter(e => e.won === 'WIN');
+  const lossEvs  = events.filter(e => e.won === 'LOSS');
+  const cheapEvs = events.filter(e => e.fill_price <= 0.02);
+  const cheapWins = cheapEvs.filter(e => e.won === 'WIN');
+
+  // Unique markets monitored
+  const uniqMarkets = new Set(events.map(e => e.market_id)).size;
 
   el('ah-st-total').textContent  = events.length;
   el('ah-st-up').textContent     = upEvs.length;
   el('ah-st-down').textContent   = downEvs.length;
-  el('ah-st-both').textContent   = bothEvs.length;
-  el('ah-st-online').textContent = onlineEvs.length;
+  el('ah-st-wins').textContent   = winEvs.length;
+  el('ah-st-losses').textContent = lossEvs.length;
+  el('ah-st-cheap').textContent  = cheapEvs.length;
+  el('ah-st-cheap-wins').textContent = cheapWins.length;
+  el('ah-st-markets').textContent = uniqMarkets;
 
-  // Near Close (±60s)
-  const nearCloseEvs = events.filter(e => Math.abs(e.secs_to_close) <= 60);
-  el('ah-st-near-close').textContent = nearCloseEvs.length;
+  // Breakdown: Post-Close Fill Analysis
+  const resolved = winEvs.length + lossEvs.length;
+  const pending = events.filter(e => e.won === 'pending').length;
+  el('ah-bk-wins').textContent    = winEvs.length;
+  el('ah-bk-losses').textContent  = lossEvs.length;
+  el('ah-bk-pending').textContent = pending;
+  el('ah-bk-win-rate').textContent = resolved > 0 ? Math.round(winEvs.length / resolved * 100) + '%' : '--';
 
-  // Post-close fills
-  const postEvs = events.filter(e => e.secs_to_close < 0);
-  el('ah-st-post-count').textContent = postEvs.length;
-
-  // Post-close + near line (the key stat you're tracking)
-  const postOnline = postEvs.filter(e => e.on_the_line).length;
-  el('ah-st-post-online').textContent = postOnline;
-
-  // Breakdown: on-line fills by side
-  const olUp   = onlineEvs.filter(e => e.side === 'UP').length;
-  const olDown = onlineEvs.filter(e => e.side === 'DOWN').length;
-  const olBoth = onlineEvs.filter(e => e.side === 'BOTH').length;
-  const olTotal = olUp + olDown + olBoth;
-  el('ah-bk-up-online').textContent   = olUp;
-  el('ah-bk-down-online').textContent = olDown;
-  el('ah-bk-both-online').textContent = olBoth;
-  el('ah-bk-up-rate').textContent   = olTotal > 0 ? Math.round(olUp   / olTotal * 100) + '%' : '--';
-  el('ah-bk-down-rate').textContent = olTotal > 0 ? Math.round(olDown / olTotal * 100) + '%' : '--';
-
-  // Timing buckets
-  el('ah-bk-t-early').textContent   = events.filter(e => e.secs_to_close > 10).length;
-  el('ah-bk-t-pre10').textContent   = events.filter(e => e.secs_to_close > 1 && e.secs_to_close <= 10).length;
-  el('ah-bk-t-atclose').textContent = events.filter(e => e.secs_to_close >= -1 && e.secs_to_close <= 1).length;
-  el('ah-bk-t-post10').textContent  = events.filter(e => e.secs_to_close < -1 && e.secs_to_close >= -10).length;
-  el('ah-bk-t-late').textContent    = events.filter(e => e.secs_to_close < -10).length;
+  // Cheap Fill Pattern
+  const cheapResolved = cheapEvs.filter(e => e.won === 'WIN' || e.won === 'LOSS');
+  const cheapLosses   = cheapEvs.filter(e => e.won === 'LOSS');
+  el('ah-bk-cheap-total').textContent  = cheapEvs.length;
+  el('ah-bk-cheap-wins').textContent   = cheapWins.length;
+  el('ah-bk-cheap-losses').textContent = cheapLosses.length;
+  el('ah-bk-cheap-rate').textContent   = cheapResolved.length > 0
+    ? Math.round(cheapWins.length / cheapResolved.length * 100) + '%' : '--';
 
   // By asset
   ['BTC','ETH','SOL','XRP'].forEach(a => {
@@ -4260,22 +4587,39 @@ function ahUpdateStats(events) {
     const aEl = el('ah-bk-asset-' + a);
     if (aEl) aEl.textContent = cnt;
   });
+
+  // Timing breakdown (secs_after is seconds after close)
+  const t15 = events.filter(e => e.secs_after >= 0  && e.secs_after < 15).length;
+  const t30 = events.filter(e => e.secs_after >= 15 && e.secs_after < 30).length;
+  const t60 = events.filter(e => e.secs_after >= 30 && e.secs_after < 60).length;
+  const t90 = events.filter(e => e.secs_after >= 60 && e.secs_after <= 90).length;
+  if (el('ah-bk-t15')) el('ah-bk-t15').textContent = t15;
+  if (el('ah-bk-t30')) el('ah-bk-t30').textContent = t30;
+  if (el('ah-bk-t60')) el('ah-bk-t60').textContent = t60;
+  if (el('ah-bk-t90')) el('ah-bk-t90').textContent = t90;
 }
 
 function ahApplyFilter() {
-  const filterAsset  = document.getElementById('ah-filter-asset')  ? document.getElementById('ah-filter-asset').value  : 'ALL';
-  const filterSide   = document.getElementById('ah-filter-side')   ? document.getElementById('ah-filter-side').value   : 'ALL';
-  const filterTiming = document.getElementById('ah-filter-timing') ? document.getElementById('ah-filter-timing').value : 'ALL';
-  const filterRangePct = document.getElementById('ah-filter-range-pct') ? parseFloat(document.getElementById('ah-filter-range-pct').value) || 0 : 0;
-  const filterOnline = document.getElementById('ah-filter-online') ? document.getElementById('ah-filter-online').checked : false;
+  const gv = (id, def) => { const x = document.getElementById(id); return x ? x.value : def; };
+  const gn = (id) => { const x = document.getElementById(id); return x ? (parseFloat(x.value) || 0) : 0; };
+  const gc = (id) => { const x = document.getElementById(id); return x ? x.checked : false; };
+
+  const filterAsset   = gv('ah-filter-asset', 'ALL');
+  const filterSide    = gv('ah-filter-side', 'ALL');
+  const filterSource  = gv('ah-filter-source', 'ALL');
+  const filterMaxPrice = gn('ah-filter-max-price');
+  const filterResult  = gv('ah-filter-result', 'ALL');
+  const filterOnline  = gc('ah-filter-online');
 
   let filtered = _ahAllEvents.filter(e => {
     if (filterAsset !== 'ALL' && e.asset !== filterAsset) return false;
     if (filterSide  !== 'ALL' && e.side  !== filterSide)  return false;
-    if (filterTiming === 'PRE'    && e.secs_to_close <= 0) return false;
-    if (filterTiming === 'POST'   && e.secs_to_close > 0)  return false;
-    if (filterTiming === 'LAST60' && Math.abs(e.secs_to_close) > 60) return false;
-    if (filterRangePct > 0 && e.range_pct > filterRangePct) return false;
+    if (filterSource === 'OBSERVED' && e.is_ours) return false;
+    if (filterSource === 'OURS'     && !e.is_ours) return false;
+    if (filterMaxPrice > 0 && e.fill_price > filterMaxPrice) return false;
+    if (filterResult === 'WIN'     && e.won !== 'WIN')     return false;
+    if (filterResult === 'LOSS'    && e.won !== 'LOSS')    return false;
+    if (filterResult === 'PENDING' && e.won !== 'pending') return false;
     if (filterOnline && !e.on_the_line) return false;
     return true;
   });
@@ -4293,42 +4637,50 @@ function ahRenderTable(events) {
 
   let html = '';
   events.forEach(e => {
-    const secsStr = (e.secs_to_close > 0 ? '+' : '') + e.secs_to_close.toFixed(1) + 's';
-    const secsCls = e.secs_to_close > 0 ? 'ah-pre' : 'ah-post';
     const sideCls = 'ah-side ' + e.side;
-    const lineMark = e.on_the_line ? '<span class="ah-at-line" title="Price within 25% of candle range from open">&#x25CF;</span>' : '';
-    const distPctStr = e.price_distance_pct > 0 ? e.price_distance_pct.toFixed(4) + '%' : '--';
-    const rangePctStr = (e.range_pct !== undefined && e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
-    const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
-    const distDolStr = e.price_distance > 0 ?
-      (e.price_distance > 1 ? '$' + e.price_distance.toFixed(2) : '$' + e.price_distance.toFixed(4)) : '--';
-    const candleStr  = e.candle_range > 0 ?
-      (e.candle_range > 1 ? '$' + e.candle_range.toFixed(2) : '$' + e.candle_range.toFixed(4)) : '--';
+    const secsStr = e.secs_after.toFixed(0) + 's';
+    const priceStr = '$' + e.fill_price.toFixed(2);
+    const costStr  = '$' + e.fill_cost.toFixed(2);
+    const sharesStr = e.fill_amount > 0 ? Math.round(e.fill_amount).toString() : '--';
     const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
     const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
-    const combStr    = e.combined_ask > 0 ? '$' + e.combined_ask.toFixed(3) : '--';
+    const rangePctStr = (e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
+    const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
 
-    // Compact market name: strip long question, show time range if present
-    let mktName = e.question || '';
+    // Winner / Result styling
+    const winnerStr = e.winner !== '--' ? e.winner : '<span style="color:#666">--</span>';
+    let resultStr = e.won;
+    let resultCls = '';
+    if (e.won === 'WIN')  resultCls = 'color:var(--green);font-weight:700';
+    else if (e.won === 'LOSS') resultCls = 'color:var(--red);font-weight:700';
+    else resultCls = 'color:#666';
+
+    // Source badge
+    const srcStr = e.is_ours
+      ? '<span style="background:var(--green);color:#000;padding:1px 6px;border-radius:3px;font-size:11px">OUR BID</span>'
+      : '<span style="background:var(--border);color:var(--cyan);padding:1px 6px;border-radius:3px;font-size:11px">OBSERVED</span>';
+
+    // Compact market name
+    let mktName = e.question;
     const tmMatch = mktName.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
     mktName = tmMatch ? tmMatch[1] : (mktName.length > 40 ? mktName.substring(0, 37) + '...' : mktName);
 
     html += '<tr>' +
-      '<td>' + (e.ts_str || '--') + '</td>' +
-      '<td style="font-weight:700;color:var(--cyan)">' + (e.asset || '--') + '</td>' +
-      '<td title="' + (e.question || '').replace(/"/g, '&quot;') + '">' + mktName + '</td>' +
+      '<td>' + e.ts_str + '</td>' +
+      '<td style="font-weight:700;color:var(--cyan)">' + e.asset + '</td>' +
+      '<td title="' + e.question.replace(/"/g, '&quot;') + '">' + mktName + '</td>' +
       '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
-      '<td>' + (e.fill_size > 0 ? Math.round(e.fill_size) : '--') + '</td>' +
-      '<td style="color:var(--yellow)">$' + (e.bid_price || 0).toFixed(2) + '</td>' +
-      '<td class="' + secsCls + '">' + secsStr + '</td>' +
+      '<td>' + sharesStr + '</td>' +
+      '<td style="color:var(--yellow)">' + priceStr + '</td>' +
+      '<td>' + costStr + '</td>' +
+      '<td>' + secsStr + '</td>' +
+      '<td style="font-size:11px">' + (e.snap_label || '--') + '</td>' +
+      '<td>' + winnerStr + '</td>' +
+      '<td style="' + resultCls + '">' + resultStr + '</td>' +
       '<td>' + upAskStr + '</td>' +
       '<td>' + downAskStr + '</td>' +
-      '<td>' + combStr + '</td>' +
-      '<td>' + distDolStr + '</td>' +
-      '<td>' + distPctStr + '</td>' +
       '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
-      '<td>' + candleStr + '</td>' +
-      '<td style="text-align:center">' + lineMark + '</td>' +
+      '<td>' + srcStr + '</td>' +
       '</tr>';
   });
   tbody.innerHTML = html;
