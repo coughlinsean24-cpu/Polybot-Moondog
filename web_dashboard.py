@@ -503,7 +503,7 @@ class PostCloseMonitor:
                     book_up = fetch_full_orderbook(market.token_id_up)
                     book_down = fetch_full_orderbook(market.token_id_down)
                 except Exception as e:
-                    log.debug(f"[PCM] snapshot error {asset} +{delay}s: {e}")
+                    log.info(f"[PCM] snapshot error {asset} +{delay}s: {e}")
                     continue
 
                 # Also grab WS best prices for context
@@ -520,7 +520,7 @@ class PostCloseMonitor:
                     "down_ask": ws_down.best_ask if ws_down and ws_down.valid else 0.0,
                 }
                 snapshots.append(snap)
-                log.debug(f"[PCM] {asset} {label}: UP bids={len(snap['up_bids'])} DOWN bids={len(snap['down_bids'])}")
+                log.info(f"[PCM] {asset} {label}: UP bids={len(snap['up_bids'])} DOWN bids={len(snap['down_bids'])}")
 
             # ── Detect fills by comparing consecutive snapshots ──
             fills_detected = []
@@ -621,7 +621,7 @@ class PostCloseMonitor:
                 log.info(f"[PCM] {asset} {market.question[:40]}: {len(fills_detected)} fills detected, "
                          f"winner={winner}, {win_count} on winning side")
             else:
-                log.debug(f"[PCM] {asset} {market.question[:40]}: no fills detected post-close")
+                log.info(f"[PCM] {asset} {market.question[:40]}: no fills detected post-close")
 
             # ── Also update any existing AH events for this market with winner ──
             if winner != "pending":
@@ -1803,12 +1803,6 @@ def bot_loop():
                 monitor_ob_imbalance()
                 last_ob_monitor = now_ts
 
-            # ── Post-Close Monitor: watch ALL markets approaching close ──
-            for _pcm_mid, _pcm_mkt in list(engine.watch_list.items()):
-                _pcm_secs = seconds_until(_pcm_mkt.end_time)
-                if engine.pcm.should_monitor(_pcm_mid, _pcm_secs):
-                    engine.pcm.start_monitoring(_pcm_mkt)
-
             # Update price cache
             update_prices()
 
@@ -1924,11 +1918,47 @@ def bot_loop():
                 if oid:
                     cancel_order(oid)
                     log_cancel(mid, oid, "shutdown")
-    engine.ws_feed.stop()
-    engine.btc_feed.stop()
+    # NOTE: ws_feed and btc_feed stay alive for PCM background monitoring
     data_rec.flush()
     engine.add_log("Bot stopped", "info")
     push_state()
+
+
+def pcm_background_loop():
+    """Always-on background loop that monitors ALL crypto 5m markets for
+    post-close fill activity.  Runs independently of the bot start/stop state
+    so we always collect data, even when the bot isn't trading."""
+    log.info("[PCM] Background monitor starting — will track ALL market fills")
+
+    # Start feeds if not already running (idempotent)
+    engine.ws_feed.start()
+    engine.btc_feed.start()
+    data_rec.start()
+    log.info("[PCM] Feeds started (WS + Binance + data recorder)")
+
+    last_refresh = 0
+    REFRESH_INTERVAL = 30  # seconds between market discovery polls
+
+    while True:
+        try:
+            now_ts = time.time()
+
+            # Refresh watch_list so we always know about all active markets
+            if now_ts - last_refresh >= REFRESH_INTERVAL:
+                refresh_watch_list()
+                last_refresh = now_ts
+
+            # Check all markets for approaching close → trigger PCM
+            for _pcm_mid, _pcm_mkt in list(engine.watch_list.items()):
+                _pcm_secs = seconds_until(_pcm_mkt.end_time)
+                if engine.pcm.should_monitor(_pcm_mid, _pcm_secs):
+                    engine.pcm.start_monitoring(_pcm_mkt)
+
+            time.sleep(1.0)
+
+        except Exception as e:
+            log.error(f"[PCM] background loop error: {e}")
+            time.sleep(5)
 
 
 def _price_tick_loop():
@@ -4808,6 +4838,11 @@ if __name__ == "__main__":
     # ── Restore saved settings (bid prices, filters, scalper config) ──
     _load_settings()
     engine.add_log("Settings loaded from disk", "info")
+
+    # ── Start always-on PCM background monitor (tracks ALL markets) ──
+    _pcm_thread = threading.Thread(target=pcm_background_loop, daemon=True, name="pcm-bg")
+    _pcm_thread.start()
+    engine.add_log("Post-Close Monitor started (always-on, all markets)", "info")
 
     # ── Bot & Scalper do NOT auto-start — user must click Start in dashboard ──
     engine.add_log("Waiting for manual start from dashboard...", "info")
