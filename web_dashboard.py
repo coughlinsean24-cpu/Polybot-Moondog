@@ -404,9 +404,21 @@ class ObservedFill:
         self.fill_cost: float = 0.0          # fill_price * fill_amount
         self.secs_after_close: float = 0.0   # Seconds after market close (positive = after)
         self.snap_label: str = ""            # Which snapshot pair detected it (e.g. "close→+30s")
-        self.up_ask: float = 0.0             # UP best ask at detection
-        self.down_ask: float = 0.0           # DOWN best ask at detection
+        self.up_ask: float = 0.0             # UP best ask at detection (from REST book)
+        self.down_ask: float = 0.0           # DOWN best ask at detection (from REST book)
         self.combined_ask: float = 0.0
+        self.up_best_bid: float = 0.0        # UP best bid at detection
+        self.down_best_bid: float = 0.0      # DOWN best bid at detection
+        self.up_spread: float = 0.0          # UP ask - bid spread
+        self.down_spread: float = 0.0        # DOWN ask - bid spread
+        self.up_ask_depth: float = 0.0       # Total $ on UP ask side
+        self.down_ask_depth: float = 0.0     # Total $ on DOWN ask side
+        self.up_bid_depth: float = 0.0       # Total $ on UP bid side
+        self.down_bid_depth: float = 0.0     # Total $ on DOWN bid side
+        self.up_ask_levels: int = 0          # # of distinct UP ask price levels
+        self.down_ask_levels: int = 0        # # of distinct DOWN ask price levels
+        self.up_bid_levels: int = 0          # # of distinct UP bid price levels
+        self.down_bid_levels: int = 0        # # of distinct DOWN bid price levels
         self.asset_price: float = 0.0
         self.candle_open: float = 0.0
         self.price_distance: float = 0.0
@@ -433,6 +445,18 @@ class ObservedFill:
             "up_ask": round(self.up_ask, 4),
             "down_ask": round(self.down_ask, 4),
             "combined_ask": round(self.combined_ask, 4),
+            "up_best_bid": round(self.up_best_bid, 4),
+            "down_best_bid": round(self.down_best_bid, 4),
+            "up_spread": round(self.up_spread, 4),
+            "down_spread": round(self.down_spread, 4),
+            "up_ask_depth": round(self.up_ask_depth, 2),
+            "down_ask_depth": round(self.down_ask_depth, 2),
+            "up_bid_depth": round(self.up_bid_depth, 2),
+            "down_bid_depth": round(self.down_bid_depth, 2),
+            "up_ask_levels": self.up_ask_levels,
+            "down_ask_levels": self.down_ask_levels,
+            "up_bid_levels": self.up_bid_levels,
+            "down_bid_levels": self.down_bid_levels,
             "asset_price": round(self.asset_price, 2),
             "candle_open": round(self.candle_open, 2),
             "price_distance": round(self.price_distance, 4),
@@ -506,9 +530,27 @@ class PostCloseMonitor:
                     log.info(f"[PCM] snapshot error {asset} +{delay}s: {e}")
                     continue
 
-                # Also grab WS best prices for context
-                ws_up = engine.ws_feed.get_price(market.token_id_up)
-                ws_down = engine.ws_feed.get_price(market.token_id_down)
+                # Extract best ask from REST orderbook (WS feed goes stale after close)
+                up_asks_raw = book_up.get("asks", [])
+                down_asks_raw = book_down.get("asks", [])
+                up_best_ask = min((float(a["price"]) for a in up_asks_raw), default=0.0)
+                down_best_ask = min((float(a["price"]) for a in down_asks_raw), default=0.0)
+
+                # Calculate total ask-side depth for context
+                up_ask_depth = sum(float(a["size"]) * float(a["price"]) for a in up_asks_raw)
+                down_ask_depth = sum(float(a["size"]) * float(a["price"]) for a in down_asks_raw)
+                up_bid_depth = sum(b["size"] * b["price"] for b in book_up.get("bids", []))
+                down_bid_depth = sum(b["size"] * b["price"] for b in book_down.get("bids", []))
+
+                # Count distinct price levels
+                up_ask_levels = len(up_asks_raw)
+                down_ask_levels = len(down_asks_raw)
+                up_bid_levels = len(book_up.get("bids", []))
+                down_bid_levels = len(book_down.get("bids", []))
+
+                # Best bid for spread calculation
+                up_best_bid = max((float(b["price"]) for b in book_up.get("bids", [])), default=0.0)
+                down_best_bid = max((float(b["price"]) for b in book_down.get("bids", [])), default=0.0)
 
                 label = "close" if delay == 0 else f"+{delay}s"
                 snap = {
@@ -516,8 +558,18 @@ class PostCloseMonitor:
                     "secs": delay,
                     "up_bids": {round(b["price"], 2): b["size"] for b in book_up.get("bids", [])},
                     "down_bids": {round(b["price"], 2): b["size"] for b in book_down.get("bids", [])},
-                    "up_ask": ws_up.best_ask if ws_up and ws_up.valid else 0.0,
-                    "down_ask": ws_down.best_ask if ws_down and ws_down.valid else 0.0,
+                    "up_ask": round(up_best_ask, 4),
+                    "down_ask": round(down_best_ask, 4),
+                    "up_best_bid": round(up_best_bid, 4),
+                    "down_best_bid": round(down_best_bid, 4),
+                    "up_ask_depth": round(up_ask_depth, 2),
+                    "down_ask_depth": round(down_ask_depth, 2),
+                    "up_bid_depth": round(up_bid_depth, 2),
+                    "down_bid_depth": round(down_bid_depth, 2),
+                    "up_ask_levels": up_ask_levels,
+                    "down_ask_levels": down_ask_levels,
+                    "up_bid_levels": up_bid_levels,
+                    "down_bid_levels": down_bid_levels,
                 }
                 snapshots.append(snap)
                 log.info(f"[PCM] {asset} {label}: UP bids={len(snap['up_bids'])} DOWN bids={len(snap['down_bids'])}")
@@ -543,6 +595,16 @@ class PostCloseMonitor:
                             "snap_label": snap_label,
                             "up_ask": curr["up_ask"],
                             "down_ask": curr["down_ask"],
+                            "up_best_bid": curr.get("up_best_bid", 0.0),
+                            "down_best_bid": curr.get("down_best_bid", 0.0),
+                            "up_ask_depth": curr.get("up_ask_depth", 0.0),
+                            "down_ask_depth": curr.get("down_ask_depth", 0.0),
+                            "up_bid_depth": curr.get("up_bid_depth", 0.0),
+                            "down_bid_depth": curr.get("down_bid_depth", 0.0),
+                            "up_ask_levels": curr.get("up_ask_levels", 0),
+                            "down_ask_levels": curr.get("down_ask_levels", 0),
+                            "up_bid_levels": curr.get("up_bid_levels", 0),
+                            "down_bid_levels": curr.get("down_bid_levels", 0),
                         })
 
                 # Compare DOWN side bids
@@ -558,6 +620,16 @@ class PostCloseMonitor:
                             "snap_label": snap_label,
                             "up_ask": curr["up_ask"],
                             "down_ask": curr["down_ask"],
+                            "up_best_bid": curr.get("up_best_bid", 0.0),
+                            "down_best_bid": curr.get("down_best_bid", 0.0),
+                            "up_ask_depth": curr.get("up_ask_depth", 0.0),
+                            "down_ask_depth": curr.get("down_ask_depth", 0.0),
+                            "up_bid_depth": curr.get("up_bid_depth", 0.0),
+                            "down_bid_depth": curr.get("down_bid_depth", 0.0),
+                            "up_ask_levels": curr.get("up_ask_levels", 0),
+                            "down_ask_levels": curr.get("down_ask_levels", 0),
+                            "up_bid_levels": curr.get("up_bid_levels", 0),
+                            "down_bid_levels": curr.get("down_bid_levels", 0),
                         })
 
             # ── Check resolution ──
@@ -595,6 +667,18 @@ class PostCloseMonitor:
                 ev.up_ask = fd["up_ask"]
                 ev.down_ask = fd["down_ask"]
                 ev.combined_ask = round(fd["up_ask"] + fd["down_ask"], 4)
+                ev.up_best_bid = fd.get("up_best_bid", 0.0)
+                ev.down_best_bid = fd.get("down_best_bid", 0.0)
+                ev.up_spread = round(fd["up_ask"] - fd.get("up_best_bid", 0.0), 4) if fd["up_ask"] > 0 and fd.get("up_best_bid", 0) > 0 else 0.0
+                ev.down_spread = round(fd["down_ask"] - fd.get("down_best_bid", 0.0), 4) if fd["down_ask"] > 0 and fd.get("down_best_bid", 0) > 0 else 0.0
+                ev.up_ask_depth = fd.get("up_ask_depth", 0.0)
+                ev.down_ask_depth = fd.get("down_ask_depth", 0.0)
+                ev.up_bid_depth = fd.get("up_bid_depth", 0.0)
+                ev.down_bid_depth = fd.get("down_bid_depth", 0.0)
+                ev.up_ask_levels = fd.get("up_ask_levels", 0)
+                ev.down_ask_levels = fd.get("down_ask_levels", 0)
+                ev.up_bid_levels = fd.get("up_bid_levels", 0)
+                ev.down_bid_levels = fd.get("down_bid_levels", 0)
                 ev.is_ours = is_ours
 
                 if ast and ast.price > 0:
@@ -1979,6 +2063,39 @@ def bot_loop():
     push_state()
 
 
+def _ah_resolve_pending():
+    """Background sweep: find AH events still 'pending' and retry resolution.
+    Called periodically from pcm_background_loop to catch markets that took
+    longer to resolve than the initial 4×30s window."""
+    try:
+        # Collect unique market_ids that still have pending events
+        pending_mids = set()
+        for ev in engine.afterhours_events:
+            if ev.get("won") == "pending" and ev.get("market_id"):
+                pending_mids.add(ev["market_id"])
+
+        if not pending_mids:
+            return
+
+        resolved_count = 0
+        for mid in pending_mids:
+            try:
+                result = check_market_resolution(mid)
+                if result["resolved"]:
+                    winner = result["winner"]
+                    _update_afterhours_resolution(mid, winner)
+                    resolved_count += 1
+                    log.info(f"[PCM-resolve] Resolved pending market {mid[:12]}… → {winner}")
+            except Exception:
+                pass
+            time.sleep(0.5)  # Rate limit API calls
+
+        if resolved_count > 0:
+            log.info(f"[PCM-resolve] Resolved {resolved_count}/{len(pending_mids)} pending markets")
+    except Exception as e:
+        log.error(f"[PCM-resolve] error: {e}")
+
+
 def pcm_background_loop():
     """Always-on background loop that monitors ALL crypto 5m markets for
     post-close fill activity.  Runs independently of the bot start/stop state
@@ -1992,7 +2109,9 @@ def pcm_background_loop():
     log.info("[PCM] Feeds started (WS + Binance + data recorder)")
 
     last_refresh = 0
+    last_resolve_sweep = 0
     REFRESH_INTERVAL = 30  # seconds between market discovery polls
+    RESOLVE_INTERVAL = 120  # seconds between pending-resolution sweeps
 
     while True:
         try:
@@ -2002,6 +2121,11 @@ def pcm_background_loop():
             if now_ts - last_refresh >= REFRESH_INTERVAL:
                 refresh_watch_list()
                 last_refresh = now_ts
+
+            # Periodically retry resolution for pending events
+            if now_ts - last_resolve_sweep >= RESOLVE_INTERVAL:
+                _ah_resolve_pending()
+                last_resolve_sweep = now_ts
 
             # Check all markets for approaching close → trigger PCM
             for _pcm_mid, _pcm_mkt in list(engine.watch_list.items()):
@@ -3209,39 +3333,77 @@ DASHBOARD_HTML = r"""
     background: var(--card); border: 1px solid var(--border);
     border-radius: 8px;
   }
-  /* ── Accordion Groups ── */
+  /* ── Two-Level Accordion: Asset → Market ── */
   .ah-groups-wrap {
-    padding: 12px 24px; display: flex; flex-direction: column; gap: 8px;
-    max-height: 600px; overflow-y: auto;
+    padding: 12px 24px; display: flex; flex-direction: column; gap: 10px;
+    max-height: 700px; overflow-y: auto;
   }
-  .ah-group {
+  /* Level 1: Asset accordion */
+  .ah-asset-group {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 8px; overflow: hidden;
   }
-  .ah-group.expanded { border-color: var(--cyan); }
+  .ah-asset-group.expanded { border-color: var(--cyan); }
+  .ah-asset-header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+    cursor: pointer; user-select: none; transition: background 0.15s;
+    background: linear-gradient(90deg, rgba(0,255,255,0.04), transparent);
+  }
+  .ah-asset-header:hover { background: #1c2333; }
+  .ah-asset-chevron {
+    font-size: 14px; color: var(--dim); transition: transform 0.2s;
+    width: 18px; text-align: center; flex-shrink: 0;
+  }
+  .ah-asset-group.expanded .ah-asset-chevron { transform: rotate(90deg); }
+  .ah-asset-name {
+    font-family: monospace; font-size: 15px; font-weight: 700;
+    color: var(--cyan); min-width: 60px;
+  }
+  .ah-asset-meta {
+    display: flex; gap: 14px; align-items: center; font-size: 12px;
+    font-family: monospace; color: var(--dim); flex: 1;
+  }
+  .ah-asset-meta .am-count { color: var(--text); font-weight: 700; }
+  .ah-asset-meta .am-up { color: var(--green); }
+  .ah-asset-meta .am-down { color: var(--red); }
+  .ah-asset-meta .am-wins { color: var(--green); font-weight: 700; }
+  .ah-asset-meta .am-losses { color: var(--red); font-weight: 700; }
+  .ah-asset-body {
+    display: none; padding: 4px 8px 8px 8px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .ah-asset-group:not(.expanded) .ah-asset-body { display: none; }
+  .ah-asset-group.expanded .ah-asset-body { display: flex; flex-direction: column; gap: 6px; }
+
+  /* Level 2: Market accordion (nested under asset) */
+  .ah-group {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; overflow: hidden; margin-left: 4px;
+  }
+  .ah-group.expanded { border-color: #445; }
   .ah-group-header {
-    display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
     cursor: pointer; user-select: none; transition: background 0.15s;
   }
   .ah-group-header:hover { background: #1c2333; }
   .ah-group-chevron {
-    font-size: 12px; color: var(--dim); transition: transform 0.2s;
-    width: 16px; text-align: center; flex-shrink: 0;
+    font-size: 11px; color: var(--dim); transition: transform 0.2s;
+    width: 14px; text-align: center; flex-shrink: 0;
   }
   .ah-group.expanded .ah-group-chevron { transform: rotate(90deg); }
   .ah-group-time {
-    font-family: monospace; font-size: 13px; font-weight: 700;
-    color: var(--cyan); min-width: 160px;
+    font-family: monospace; font-size: 12px; font-weight: 700;
+    color: var(--cyan); min-width: 140px;
   }
   .ah-group-assets {
     display: flex; gap: 4px; flex-shrink: 0;
   }
   .ah-group-asset-badge {
-    font-size: 10px; font-weight: 700; padding: 1px 6px;
+    font-size: 9px; font-weight: 700; padding: 1px 5px;
     border-radius: 3px; background: #0c2d4a; color: var(--cyan);
   }
   .ah-group-meta {
-    display: flex; gap: 12px; align-items: center; font-size: 11px;
+    display: flex; gap: 10px; align-items: center; font-size: 11px;
     font-family: monospace; color: var(--dim); flex: 1;
   }
   .ah-group-meta .gm-fills { color: var(--text); font-weight: 700; }
@@ -4712,6 +4874,18 @@ function ahNorm(e) {
     won:           e.won || 'pending',
     up_ask:        e.up_ask || 0,
     down_ask:      e.down_ask || 0,
+    up_spread:     e.up_spread || 0,
+    down_spread:   e.down_spread || 0,
+    up_best_bid:   e.up_best_bid || 0,
+    down_best_bid: e.down_best_bid || 0,
+    up_ask_depth:  e.up_ask_depth || 0,
+    down_ask_depth: e.down_ask_depth || 0,
+    up_bid_depth:  e.up_bid_depth || 0,
+    down_bid_depth: e.down_bid_depth || 0,
+    up_ask_levels: e.up_ask_levels || 0,
+    down_ask_levels: e.down_ask_levels || 0,
+    up_bid_levels: e.up_bid_levels || 0,
+    down_bid_levels: e.down_bid_levels || 0,
     range_pct:     e.range_pct != null ? e.range_pct : -1,
     on_the_line:   e.on_the_line || false,
     is_ours:       e.is_ours != null ? e.is_ours : true,   // legacy events are always our bids
@@ -4831,143 +5005,186 @@ function ahRenderGroups(events) {
 
   if (events.length === 0) {
     container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--dim);font-size:13px;">No events match current filters.</div>';
-    if (countEl) countEl.textContent = '0 timeframes';
+    if (countEl) countEl.textContent = '0 assets';
     return;
   }
 
-  // ── Group events by market_id ──
-  const groups = {};
+  // ── Level 1: Group by asset ──
+  const ASSET_ORDER = ['BTC', 'ETH', 'SOL', 'XRP'];
+  const byAsset = {};
   events.forEach(e => {
-    const key = e.market_id || 'unknown';
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(e);
+    const a = e.asset || 'OTHER';
+    if (!byAsset[a]) byAsset[a] = [];
+    byAsset[a].push(e);
   });
+  const assetKeys = ASSET_ORDER.filter(a => byAsset[a]);
+  // Add any non-standard assets
+  Object.keys(byAsset).forEach(a => { if (!assetKeys.includes(a)) assetKeys.push(a); });
 
-  // ── Sort groups by most recent fill timestamp (newest first) ──
-  const sortedKeys = Object.keys(groups).sort((a, b) => {
-    const aTs = Math.max(...groups[a].map(e => e._raw?.ts || 0));
-    const bTs = Math.max(...groups[b].map(e => e._raw?.ts || 0));
-    return bTs - aTs;
-  });
-
-  if (countEl) countEl.textContent = sortedKeys.length + ' timeframe' + (sortedKeys.length !== 1 ? 's' : '');
+  let totalMarkets = 0;
 
   let html = '';
-  sortedKeys.forEach((key, idx) => {
-    const evs = groups[key];
-    const first = evs[0];
+  assetKeys.forEach((asset, aIdx) => {
+    const assetEvents = byAsset[asset];
 
-    // Extract time window from question
-    let timeLabel = first.question;
-    const tmMatch = timeLabel.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
-    timeLabel = tmMatch ? tmMatch[1] : (timeLabel.length > 50 ? timeLabel.substring(0, 47) + '...' : timeLabel);
+    // ── Level 2: Group by market_id within this asset ──
+    const markets = {};
+    assetEvents.forEach(e => {
+      const key = e.market_id || 'unknown';
+      if (!markets[key]) markets[key] = [];
+      markets[key].push(e);
+    });
+    const marketKeys = Object.keys(markets).sort((a, b) => {
+      const aTs = Math.max(...markets[a].map(e => e._raw?.ts || 0));
+      const bTs = Math.max(...markets[b].map(e => e._raw?.ts || 0));
+      return bTs - aTs;
+    });
+    totalMarkets += marketKeys.length;
 
-    // Collect unique assets in this group
-    const assets = [...new Set(evs.map(e => e.asset))];
+    // Asset-level stats
+    const aUp = assetEvents.filter(e => e.side === 'UP').length;
+    const aDown = assetEvents.filter(e => e.side === 'DOWN').length;
+    const aWins = assetEvents.filter(e => e.won === 'WIN').length;
+    const aLosses = assetEvents.filter(e => e.won === 'LOSS').length;
+    const aCheap = assetEvents.filter(e => e.fill_price <= 0.02).length;
 
-    // Stats for header
-    const upCount = evs.filter(e => e.side === 'UP').length;
-    const downCount = evs.filter(e => e.side === 'DOWN').length;
-    const cheapCount = evs.filter(e => e.fill_price <= 0.02).length;
-    const wins = evs.filter(e => e.won === 'WIN').length;
-    const losses = evs.filter(e => e.won === 'LOSS').length;
-    const pending = evs.filter(e => e.won === 'pending').length;
-
-    // Winner status badge
-    let winnerCls = 'pending';
-    let winnerText = 'PENDING';
-    if (pending === 0 && wins > 0 && losses === 0) { winnerCls = 'win'; winnerText = wins + ' WIN' + (wins > 1 ? 'S' : ''); }
-    else if (pending === 0 && losses > 0 && wins === 0) { winnerCls = 'loss'; winnerText = losses + ' LOSS' + (losses > 1 ? 'ES' : ''); }
-    else if (wins > 0 && losses > 0) { winnerCls = 'mixed'; winnerText = wins + 'W / ' + losses + 'L'; }
-    else if (pending > 0 && (wins > 0 || losses > 0)) { winnerCls = 'mixed'; winnerText = (wins + losses) + ' resolved, ' + pending + ' pending'; }
-
-    // Determine actual winner side from events
-    const winnerSide = evs.find(e => e.winner !== '--' && e.winner !== 'pending');
-    const winnerSideStr = winnerSide ? winnerSide.winner : '';
-
-    // Asset badges
-    const assetBadges = assets.map(a => '<span class="ah-group-asset-badge">' + a + '</span>').join('');
-
-    html += '<div class="ah-group" data-group-idx="' + idx + '">' +
-      '<div class="ah-group-header" onclick="ahToggleGroup(this)">' +
-        '<span class="ah-group-chevron">&#x25B6;</span>' +
-        '<span class="ah-group-time">' + timeLabel + '</span>' +
-        '<span class="ah-group-assets">' + assetBadges + '</span>' +
-        '<span class="ah-group-meta">' +
-          '<span class="gm-fills">' + evs.length + ' fill' + (evs.length !== 1 ? 's' : '') + '</span>' +
-          '<span class="gm-up">&#x25B2; ' + upCount + '</span>' +
-          '<span class="gm-down">&#x25BC; ' + downCount + '</span>' +
-          (cheapCount > 0 ? '<span class="gm-cheap">' + cheapCount + ' cheap</span>' : '') +
-          (winnerSideStr ? '<span style="color:var(--dim)">Winner: <b style="color:' + (winnerSideStr === 'Up' ? 'var(--green)' : 'var(--red)') + '">' + winnerSideStr + '</b></span>' : '') +
+    html += '<div class="ah-asset-group expanded" data-asset="' + asset + '">' +
+      '<div class="ah-asset-header" onclick="ahToggleAsset(this)">' +
+        '<span class="ah-asset-chevron">&#x25B6;</span>' +
+        '<span class="ah-asset-name">' + asset + '</span>' +
+        '<span class="ah-asset-meta">' +
+          '<span class="am-count">' + marketKeys.length + ' market' + (marketKeys.length !== 1 ? 's' : '') + '</span>' +
+          '<span class="am-count">' + assetEvents.length + ' fill' + (assetEvents.length !== 1 ? 's' : '') + '</span>' +
+          '<span class="am-up">&#x25B2; ' + aUp + '</span>' +
+          '<span class="am-down">&#x25BC; ' + aDown + '</span>' +
+          (aCheap > 0 ? '<span style="color:var(--yellow)">' + aCheap + ' cheap</span>' : '') +
+          (aWins > 0 ? '<span class="am-wins">' + aWins + 'W</span>' : '') +
+          (aLosses > 0 ? '<span class="am-losses">' + aLosses + 'L</span>' : '') +
         '</span>' +
-        '<span class="ah-group-winner ' + winnerCls + '">' + winnerText + '</span>' +
       '</div>' +
-      '<div class="ah-group-body">' +
-        '<table><thead><tr>' +
-          '<th>Time</th><th>Side</th><th>Shares</th><th>Price $</th><th>Cost $</th>' +
-          '<th>After Close</th><th>Snapshot</th><th>Winner</th><th>Result</th>' +
-          '<th>UP Ask</th><th>DOWN Ask</th><th>Range %</th><th>Source</th>' +
-        '</tr></thead><tbody>';
+      '<div class="ah-asset-body">';
 
-    evs.forEach(e => {
-      const sideCls = 'ah-side ' + e.side;
-      const secsStr = e.secs_after.toFixed(0) + 's';
-      const priceStr = '$' + e.fill_price.toFixed(2);
-      const costStr  = '$' + e.fill_cost.toFixed(2);
-      const sharesStr = e.fill_amount > 0 ? Math.round(e.fill_amount).toString() : '--';
-      const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
-      const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
-      const rangePctStr = (e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
-      const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
-      const winnerStr = e.winner !== '--' ? e.winner : '<span style="color:#666">--</span>';
-      let resultStr = e.won;
-      let resultCls = '';
-      if (e.won === 'WIN')  resultCls = 'color:var(--green);font-weight:700';
-      else if (e.won === 'LOSS') resultCls = 'color:var(--red);font-weight:700';
-      else resultCls = 'color:#666';
-      const srcStr = e.is_ours
-        ? '<span style="background:var(--green);color:#000;padding:1px 6px;border-radius:3px;font-size:11px">OUR BID</span>'
-        : '<span style="background:var(--border);color:var(--cyan);padding:1px 6px;border-radius:3px;font-size:11px">OBSERVED</span>';
+    // Each market under this asset
+    marketKeys.forEach((mKey, mIdx) => {
+      const evs = markets[mKey];
+      const first = evs[0];
 
-      html += '<tr>' +
-        '<td>' + e.ts_str + '</td>' +
-        '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
-        '<td>' + sharesStr + '</td>' +
-        '<td style="color:var(--yellow)">' + priceStr + '</td>' +
-        '<td>' + costStr + '</td>' +
-        '<td>' + secsStr + '</td>' +
-        '<td style="font-size:11px">' + (e.snap_label || '--') + '</td>' +
-        '<td>' + winnerStr + '</td>' +
-        '<td style="' + resultCls + '">' + resultStr + '</td>' +
-        '<td>' + upAskStr + '</td>' +
-        '<td>' + downAskStr + '</td>' +
-        '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
-        '<td>' + srcStr + '</td>' +
-        '</tr>';
+      // Extract time window from question
+      let timeLabel = first.question;
+      const tmMatch = timeLabel.match(/(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)/);
+      timeLabel = tmMatch ? tmMatch[1] : (timeLabel.length > 45 ? timeLabel.substring(0, 42) + '...' : timeLabel);
+
+      // Stats for market header
+      const upCount = evs.filter(e => e.side === 'UP').length;
+      const downCount = evs.filter(e => e.side === 'DOWN').length;
+      const cheapCount = evs.filter(e => e.fill_price <= 0.02).length;
+      const wins = evs.filter(e => e.won === 'WIN').length;
+      const losses = evs.filter(e => e.won === 'LOSS').length;
+      const pending = evs.filter(e => e.won === 'pending').length;
+
+      let winnerCls = 'pending', winnerText = 'PENDING';
+      if (pending === 0 && wins > 0 && losses === 0) { winnerCls = 'win'; winnerText = wins + 'W'; }
+      else if (pending === 0 && losses > 0 && wins === 0) { winnerCls = 'loss'; winnerText = losses + 'L'; }
+      else if (wins > 0 && losses > 0) { winnerCls = 'mixed'; winnerText = wins + 'W/' + losses + 'L'; }
+      else if (pending > 0 && (wins > 0 || losses > 0)) { winnerCls = 'mixed'; winnerText = (wins+losses) + 'R/' + pending + 'P'; }
+
+      const winnerSide = evs.find(e => e.winner !== '--' && e.winner !== 'pending');
+      const winnerSideStr = winnerSide ? winnerSide.winner : '';
+
+      html += '<div class="ah-group" data-market="' + mKey + '">' +
+        '<div class="ah-group-header" onclick="ahToggleGroup(this)">' +
+          '<span class="ah-group-chevron">&#x25B6;</span>' +
+          '<span class="ah-group-time">' + timeLabel + '</span>' +
+          '<span class="ah-group-meta">' +
+            '<span class="gm-fills">' + evs.length + ' fill' + (evs.length !== 1 ? 's' : '') + '</span>' +
+            '<span class="gm-up">&#x25B2; ' + upCount + '</span>' +
+            '<span class="gm-down">&#x25BC; ' + downCount + '</span>' +
+            (cheapCount > 0 ? '<span class="gm-cheap">' + cheapCount + ' cheap</span>' : '') +
+            (winnerSideStr ? '<span style="color:var(--dim)">W: <b style="color:' + (winnerSideStr === 'Up' ? 'var(--green)' : 'var(--red)') + '">' + winnerSideStr + '</b></span>' : '') +
+          '</span>' +
+          '<span class="ah-group-winner ' + winnerCls + '">' + winnerText + '</span>' +
+        '</div>' +
+        '<div class="ah-group-body">' +
+          '<table><thead><tr>' +
+            '<th>Time</th><th>Side</th><th>Shares</th><th>Price $</th><th>Cost $</th>' +
+            '<th>After Close</th><th>Snap</th><th>Winner</th><th>Result</th>' +
+            '<th>UP Ask</th><th>DN Ask</th><th>Spread</th><th>Range %</th><th>Src</th>' +
+          '</tr></thead><tbody>';
+
+      evs.forEach(e => {
+        const sideCls = 'ah-side ' + e.side;
+        const secsStr = e.secs_after.toFixed(0) + 's';
+        const priceStr = '$' + e.fill_price.toFixed(2);
+        const costStr  = '$' + e.fill_cost.toFixed(2);
+        const sharesStr = e.fill_amount > 0 ? Math.round(e.fill_amount).toString() : '--';
+        const upAskStr   = e.up_ask   > 0 ? '$' + e.up_ask.toFixed(3)   : '--';
+        const downAskStr = e.down_ask > 0 ? '$' + e.down_ask.toFixed(3) : '--';
+        // Spread: show spread for the side of this fill
+        const spread = e.side === 'UP' ? (e._raw?.up_spread || 0) : (e._raw?.down_spread || 0);
+        const spreadStr = spread > 0 ? '$' + spread.toFixed(3) : '--';
+        const rangePctStr = (e.range_pct >= 0) ? e.range_pct.toFixed(1) + '%' : '--';
+        const rangePctColor = e.range_pct <= 25 ? 'var(--green)' : (e.range_pct <= 50 ? 'var(--yellow)' : 'var(--red)');
+        const winnerStr = e.winner !== '--' ? e.winner : '<span style="color:#666">--</span>';
+        let resultStr = e.won;
+        let resultCls = '';
+        if (e.won === 'WIN')  resultCls = 'color:var(--green);font-weight:700';
+        else if (e.won === 'LOSS') resultCls = 'color:var(--red);font-weight:700';
+        else resultCls = 'color:#666';
+        const srcStr = e.is_ours
+          ? '<span style="background:var(--green);color:#000;padding:1px 5px;border-radius:3px;font-size:10px">OURS</span>'
+          : '<span style="background:var(--border);color:var(--cyan);padding:1px 5px;border-radius:3px;font-size:10px">OBS</span>';
+
+        html += '<tr>' +
+          '<td>' + e.ts_str + '</td>' +
+          '<td><span class="' + sideCls + '">' + e.side + '</span></td>' +
+          '<td>' + sharesStr + '</td>' +
+          '<td style="color:var(--yellow)">' + priceStr + '</td>' +
+          '<td>' + costStr + '</td>' +
+          '<td>' + secsStr + '</td>' +
+          '<td style="font-size:10px">' + (e.snap_label || '--') + '</td>' +
+          '<td>' + winnerStr + '</td>' +
+          '<td style="' + resultCls + '">' + resultStr + '</td>' +
+          '<td>' + upAskStr + '</td>' +
+          '<td>' + downAskStr + '</td>' +
+          '<td>' + spreadStr + '</td>' +
+          '<td style="color:' + rangePctColor + ';font-weight:700">' + rangePctStr + '</td>' +
+          '<td>' + srcStr + '</td>' +
+          '</tr>';
+      });
+
+      html += '</tbody></table></div></div>';
     });
 
-    html += '</tbody></table></div></div>';
+    html += '</div></div>';  // close ah-asset-body, ah-asset-group
   });
 
+  if (countEl) countEl.textContent = assetKeys.length + ' asset' + (assetKeys.length !== 1 ? 's' : '') + ', ' + totalMarkets + ' market' + (totalMarkets !== 1 ? 's' : '');
   container.innerHTML = html;
 }
 
+function ahToggleAsset(headerEl) {
+  const group = headerEl.parentElement;
+  group.classList.toggle('expanded');
+}
 function ahToggleGroup(headerEl) {
   const group = headerEl.parentElement;
   group.classList.toggle('expanded');
 }
 function ahExpandAll() {
-  document.querySelectorAll('.ah-group').forEach(g => g.classList.add('expanded'));
+  document.querySelectorAll('.ah-asset-group, .ah-group').forEach(g => g.classList.add('expanded'));
 }
 function ahCollapseAll() {
-  document.querySelectorAll('.ah-group').forEach(g => g.classList.remove('expanded'));
+  document.querySelectorAll('.ah-asset-group, .ah-group').forEach(g => g.classList.remove('expanded'));
 }
 
 function ahExportCSV() {
   // Client-side CSV from currently filtered data — includes all columns for pattern analysis
   if (_ahAllEvents.length === 0) { alert('No after-hours data to export.'); return; }
   const cols = ['timestamp','asset','question','market_id','side','fill_price','fill_amount','fill_cost',
-    'secs_after_close','snap_label','up_ask','down_ask','combined_ask','winner','won','is_ours',
+    'secs_after_close','snap_label','up_ask','down_ask','up_spread','down_spread',
+    'up_best_bid','down_best_bid','up_ask_depth','down_ask_depth','up_bid_depth','down_bid_depth',
+    'up_ask_levels','down_ask_levels','up_bid_levels','down_bid_levels',
+    'combined_ask','winner','won','is_ours',
     'asset_price','candle_open','price_distance','candle_range','range_pct','on_the_line'];
   const header = cols.join(',');
   const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
