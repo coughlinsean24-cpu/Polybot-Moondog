@@ -668,6 +668,7 @@ class AdaptiveLearner:
             "confidence_threshold": self.confidence_threshold,
             "learning_rate": self.learning_rate,
             "l2_lambda": self.l2_lambda,
+            "enabled": self.enabled,
             "feature_names": FEATURE_NAMES,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -704,6 +705,8 @@ class AdaptiveLearner:
             self.confidence_threshold = state.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD)
             self.learning_rate = state.get("learning_rate", DEFAULT_LEARNING_RATE)
             self.l2_lambda = state.get("l2_lambda", DEFAULT_L2_LAMBDA)
+            if "enabled" in state:
+                self.enabled = bool(state["enabled"])
         except Exception:
             pass
 

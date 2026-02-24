@@ -52,7 +52,6 @@ from ws_feed import PriceFeed
 from binance_ws import BinanceFeed
 from data_recorder import recorder as data_rec
 from adaptive_learner import learner as ai_learner, extract_features
-from scalper import Scalper
 
 
 # ── Settings Persistence ────────────────────────────────────────────────────
@@ -70,15 +69,6 @@ def _save_settings():
             "ob_filter_enabled": engine.ob_filter_enabled,
             "ob_min_size": engine.ob_min_size,
             "ob_max_imbalance": engine.ob_max_imbalance,
-            "scalper": {
-                "trade_size_usd": engine.scalper.cfg.trade_size_usd,
-                "entry_ask_max": engine.scalper.cfg.entry_ask_max,
-                "profit_target": engine.scalper.cfg.profit_target,
-                "stop_loss": engine.scalper.cfg.stop_loss,
-                "cooldown_secs": engine.scalper.cfg.cooldown_secs,
-                "exit_before_close": engine.scalper.cfg.exit_before_close,
-                "max_open_positions": engine.scalper.cfg.max_open_positions,
-            },
             "scanner": dict(engine.scanner_cfg),
             "scanner_auto_bid": engine.scanner_auto_bid,
         }
@@ -117,16 +107,6 @@ def _load_settings():
                         else:
                             engine.asset_config[a][k] = float(v)
         engine.btc_dollar_range = engine.asset_config.get("BTC", {}).get("dollar_range", 2.0)
-        # Scalper config
-        sc = data.get("scalper", {})
-        if sc:
-            if "trade_size_usd" in sc: engine.scalper.cfg.trade_size_usd = float(sc["trade_size_usd"])
-            if "entry_ask_max" in sc: engine.scalper.cfg.entry_ask_max = float(sc["entry_ask_max"])
-            if "profit_target" in sc: engine.scalper.cfg.profit_target = float(sc["profit_target"])
-            if "stop_loss" in sc: engine.scalper.cfg.stop_loss = float(sc["stop_loss"])
-            if "cooldown_secs" in sc: engine.scalper.cfg.cooldown_secs = float(sc["cooldown_secs"])
-            if "exit_before_close" in sc: engine.scalper.cfg.exit_before_close = float(sc["exit_before_close"])
-            if "max_open_positions" in sc: engine.scalper.cfg.max_open_positions = int(sc["max_open_positions"])
         # Scanner config
         scanner = data.get("scanner", {})
         if scanner and isinstance(scanner, dict):
@@ -699,6 +679,10 @@ class PostCloseMonitor:
                 ev_d = ev.to_dict()
                 engine.afterhours_events.appendleft(ev_d)
                 _ah_save_event(ev_d)
+                try:
+                    socketio.emit("ah_new_event", ev_d)
+                except Exception:
+                    pass
 
             if fills_detected:
                 win_count = sum(1 for fd in fills_detected
@@ -712,6 +696,7 @@ class PostCloseMonitor:
             # ── Also update any existing AH events for this market with winner ──
             if winner != "pending":
                 _update_afterhours_resolution(mid, winner)
+                _ah_save_all()
 
         except Exception as e:
             log.error(f"[PCM] monitor error: {e}")
@@ -841,9 +826,6 @@ class Engine:
         # Markets where bids already failed — don't retry
         self.failed_markets: set[str] = set()
 
-        # ── Scalper (separate strategy) ──
-        self.scalper: Scalper = Scalper(self.btc_feed, self.ws_feed)
-
         # ── After-Hours Fill Tracker ──
         # Stores fill events that occurred close to market close (positive = pre-close,
         # negative = post-close). Cleared on bot restart; persists for the session.
@@ -890,16 +872,6 @@ class Engine:
 
 engine = Engine()
 _ah_load()   # Restore persisted after-hours events from disk
-engine.scalper._socketio = socketio  # Give scalper access to SocketIO for live log pushes
-
-# Apply config defaults to scalper
-engine.scalper.cfg.trade_size_usd = config.SCALP_TRADE_SIZE
-engine.scalper.cfg.entry_ask_max = config.SCALP_ENTRY_ASK_MAX
-engine.scalper.cfg.profit_target = config.SCALP_PROFIT_TARGET
-engine.scalper.cfg.stop_loss = config.SCALP_STOP_LOSS
-engine.scalper.cfg.cooldown_secs = config.SCALP_COOLDOWN
-engine.scalper.cfg.exit_before_close = config.SCALP_EXIT_BEFORE
-engine.scalper.cfg.max_open_positions = config.SCALP_MAX_POSITIONS
 
 
 # ── Price Sync from Binance ──────────────────────────────────────────────────
@@ -1425,6 +1397,10 @@ def _record_afterhours_fill(bid: "BidRecord", side: str, fill_size: float, marke
         ev_d = ev.to_dict()
         engine.afterhours_events.appendleft(ev_d)
         _ah_save_event(ev_d)
+        try:
+            socketio.emit("ah_new_event", ev_d)
+        except Exception:
+            pass
     except Exception as _ah_err:
         log.debug(f"[afterhours] record error: {_ah_err}")
 
@@ -1448,7 +1424,11 @@ def _update_afterhours_resolution(market_id: str, winner: str):
                 ev["won"] = "WIN" if winner == "Down" else "LOSS"
             else:
                 ev["won"] = "pending"
-        _ah_save_all()   # persist resolution updates
+        # Caller is responsible for calling _ah_save_all() after batch
+        try:
+            socketio.emit("ah_resolution", {"market_id": market_id, "winner": winner})
+        except Exception:
+            pass
     except Exception as _e:
         log.debug(f"[afterhours] resolution update error: {_e}")
 
@@ -1706,6 +1686,7 @@ def _schedule_resolution_check(market_id: str, bid: BidRecord,
 
                 # ── Update After-Hours events with resolution outcome ──
                 _update_afterhours_resolution(market_id, winner)
+                _ah_save_all()
             elif attempt < retries:
                 # Not resolved yet — retry with longer delay
                 t = threading.Timer(delay * attempt, lambda: do_check(attempt + 1))
@@ -1923,14 +1904,7 @@ def bot_loop():
                             log.error(f"BID-EVAL error [{market.asset}]: {eval_err}")
                         engine._last_bid_eval_log = now_ts
                     if in_bid:
-                        # Skip if scalper already has a position on this market
-                        if hasattr(engine, 'scalper') and market_id in engine.scalper.positions:
-                            continue
                         post_bids(market)
-
-                # Sync limit bid market IDs to scalper so it doesn't conflict
-                if hasattr(engine, 'scalper'):
-                    engine.scalper.limit_bid_markets = set(engine.bids_posted.keys())
 
             # Check fills
             if now_ts - last_fill_check >= 3.0:
@@ -1945,8 +1919,8 @@ def bot_loop():
             # Update price cache
             update_prices()
 
-            # Push full state to browser every 0.5s
-            if now_ts - last_push >= 0.5:
+            # Push full state to browser every 1.5s (prices covered by 200ms tick)
+            if now_ts - last_push >= 1.5:
                 push_state()
                 last_push = now_ts
 
@@ -2020,11 +1994,6 @@ def bot_loop():
                     engine.btc_feed._running = False
                     engine.btc_feed.start()
 
-            # Scalper thread (restart unless user explicitly stopped it)
-            if not engine.scalper.running and not engine.scalper._user_stopped:
-                engine.add_log("Watchdog: restarting scalper thread", "warn")
-                engine.scalper.start()
-
             # Heartbeat
             if now_ts - last_heartbeat >= 300:
                 log_heartbeat(
@@ -2091,6 +2060,7 @@ def _ah_resolve_pending():
             time.sleep(0.5)  # Rate limit API calls
 
         if resolved_count > 0:
+            _ah_save_all()   # single rewrite for all resolutions in this sweep
             log.info(f"[PCM-resolve] Resolved {resolved_count}/{len(pending_mids)} pending markets")
     except Exception as e:
         log.error(f"[PCM-resolve] error: {e}")
@@ -2236,13 +2206,12 @@ def push_state():
         "ob_max_imbalance": engine.ob_max_imbalance,
         "learner": ai_learner.stats(),
         "learner_predictions": ai_learner.get_recent_predictions(),
-        "scalper": engine.scalper.stats(),
         "scanner_results": engine.scanner_results,
         "scanner_running": engine.scanner_running,
         "scanner_auto_bid": engine.scanner_auto_bid,
         "scanner_cfg": dict(engine.scanner_cfg),
         "scanner_last_scan": engine.scanner_last_scan,
-        "afterhours_events": list(engine.afterhours_events),
+        "ah_count": len(engine.afterhours_events),
     }
     socketio.emit("state", data)
 
@@ -2265,7 +2234,6 @@ def index():
         sv_ob_min_size=engine.ob_min_size,
         sv_ob_max_imbalance=engine.ob_max_imbalance,
         sv_running=engine.running,
-        sv_scalper=engine.scalper.cfg,
         sv_scanner_cfg=dict(engine.scanner_cfg),
         sv_scanner_auto_bid=engine.scanner_auto_bid,
     )
@@ -2444,6 +2412,8 @@ def export_afterhours():
 @socketio.on("connect")
 def on_connect():
     push_state()
+    # Send full AH events list on connect (separate from state to keep state payload small)
+    socketio.emit("ah_events", list(engine.afterhours_events))
 
 
 @socketio.on("start_bot")
@@ -2622,6 +2592,7 @@ def on_update_learner_params(data):
             val = float(data["learning_rate"])
             if 0.001 <= val <= 10.0:
                 ai_learner.learning_rate = val
+        ai_learner._save_model()  # Persist threshold/learning_rate changes
         push_state()
     except (ValueError, TypeError) as e:
         engine.add_log(f"Bad learner param: {e}", "error")
@@ -2633,6 +2604,7 @@ def on_toggle_learner():
     ai_learner.enabled = not ai_learner.enabled
     state = "ON" if ai_learner.enabled else "OFF"
     engine.add_log(f"AI learner gate {state}", "info")
+    ai_learner._save_model()  # Persist enabled state
     push_state()
 
 
@@ -2642,37 +2614,6 @@ def on_reset_learner():
     ai_learner.reset_model()
     engine.add_log("AI learner model RESET", "warn")
     push_state()
-
-
-# ── Scalper SocketIO Events ─────────────────────────────────────────────────
-
-@socketio.on("start_scalper")
-def on_start_scalper():
-    if engine.scalper.running:
-        return
-    engine.scalper.start()
-    engine.add_log("Scalper started from dashboard", "info")
-    push_state()
-
-
-@socketio.on("stop_scalper")
-def on_stop_scalper():
-    engine.scalper.stop(user_requested=True)
-    engine.add_log("Scalper stopped from dashboard", "warn")
-    push_state()
-
-
-@socketio.on("update_scalper_params")
-def on_update_scalper_params(data):
-    """Live-update scalper parameters from dashboard."""
-    try:
-        changes = engine.scalper.update_config(data)
-        if changes:
-            engine.scalper.add_log(f"Params updated: {', '.join(changes)}", "info")
-        _save_settings()
-        push_state()
-    except (ValueError, TypeError) as e:
-        engine.scalper.add_log(f"Bad param update: {e}", "error")
 
 
 # ── Market Scanner SocketIO Events ──────────────────────────────────────────
@@ -3165,41 +3106,6 @@ DASHBOARD_HTML = r"""
   .tab-content { display: none; }
   .tab-content.active { display: block; }
 
-  /* ── Scalper-specific styles ── */
-  .scalper-controls {
-    background: var(--card); border-bottom: 1px solid var(--border);
-    padding: 10px 24px; display: flex; align-items: center; gap: 16px;
-    flex-wrap: wrap;
-  }
-  .scalper-stats-row {
-    display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px;
-    padding: 12px 24px 0 24px;
-  }
-  .scalper-positions {
-    padding: 12px 24px;
-  }
-  .pos-card {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 8px; padding: 12px 16px; margin-bottom: 8px;
-    display: flex; justify-content: space-between; align-items: center; gap: 20px;
-  }
-  .pos-side { font-weight: 700; font-size: 14px; min-width: 50px; }
-  .pos-side.UP { color: var(--green); }
-  .pos-side.DOWN { color: var(--red); }
-  .pos-detail { font-family: monospace; font-size: 12px; color: var(--dim); }
-  .pos-pnl { font-family: monospace; font-weight: 700; font-size: 16px; }
-  .pos-pnl.win { color: var(--green); }
-  .pos-pnl.lose { color: var(--red); }
-  .pos-state {
-    padding: 2px 8px; border-radius: 3px; font-size: 10px;
-    font-weight: 700; text-transform: uppercase;
-  }
-  .pos-state.watching { background: #1c2333; color: var(--dim); }
-  .pos-state.buying { background: #2d2000; color: var(--yellow); }
-  .pos-state.holding { background: #0c2d4a; color: var(--cyan); }
-  .pos-state.selling { background: #2d2000; color: var(--orange); }
-  .pos-state.exited { background: #1c2333; color: var(--dim); }
-
   /* ── Scanner-specific styles ── */
   .scanner-controls {
     background: var(--card); border-bottom: 1px solid var(--border);
@@ -3466,7 +3372,6 @@ DASHBOARD_HTML = r"""
 <!-- ── Strategy Tabs ── -->
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('limit-bid')" id="tab-btn-limit-bid">Limit Bid Strategy</button>
-  <button class="tab-btn" onclick="switchTab('scalper')" id="tab-btn-scalper">Scalper</button>
   <button class="tab-btn" onclick="switchTab('scanner')" id="tab-btn-scanner">Market Scanner</button>
   <button class="tab-btn" onclick="switchTab('afterhours')" id="tab-btn-afterhours">After-Hours Fills <span id="ah-tab-badge" style="background:#0c2d4a;color:var(--cyan);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
 </div>
@@ -3714,96 +3619,7 @@ DASHBOARD_HTML = r"""
 </div>
 </div><!-- /tab-limit-bid -->
 
-<!-- ══════ TAB 2: SCALPER ══════ -->
-<div class="tab-content" id="tab-scalper">
-
-<!-- Scalper Controls -->
-<div class="scalper-controls">
-  <div class="control-group">
-    <label>Trade Size $</label>
-    <input type="number" id="sc-trade-size" step="0.5" min="0.5" max="100" value="{{ sv_scalper.trade_size_usd }}">
-  </div>
-  <div class="control-group">
-    <label>Max Entry $</label>
-    <input type="number" id="sc-entry-max" step="0.01" min="0.10" max="0.90" value="{{ sv_scalper.entry_ask_max }}">
-  </div>
-  <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
-    <label>Profit Target $</label>
-    <input type="number" id="sc-profit" step="0.005" min="0.005" max="0.50" value="{{ sv_scalper.profit_target }}">
-  </div>
-  <div class="control-group">
-    <label>Stop Loss $</label>
-    <input type="number" id="sc-stop" step="0.005" min="0.005" max="0.50" value="{{ sv_scalper.stop_loss }}">
-  </div>
-  <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
-    <label>Cooldown (sec)</label>
-    <input type="number" id="sc-cooldown" step="1" min="0" max="300" value="{{ sv_scalper.cooldown_secs }}">
-  </div>
-  <div class="control-group">
-    <label>Exit Before (sec)</label>
-    <input type="number" id="sc-exit-before" step="5" min="5" max="120" value="{{ sv_scalper.exit_before_close }}">
-  </div>
-  <div class="control-group">
-    <label>Max Positions</label>
-    <input type="number" id="sc-max-pos" step="1" min="1" max="10" value="{{ sv_scalper.max_open_positions }}">
-  </div>
-  <button class="btn btn-apply" onclick="applyScalperParams()">Apply</button>
-  <div style="flex:1"></div>
-  <div class="cost-preview" id="sc-btc-info" style="text-align:right; min-width:320px;">
-    BTC: <span class="val" id="sc-btc-price">--</span>
-    &nbsp;|&nbsp; Open: <span class="val" id="sc-btc-open">--</span>
-    &nbsp;|&nbsp; Move: <span class="val" id="sc-btc-dist">--</span>
-  </div>
-  <button class="btn btn-start" id="btn-scalper" onclick="toggleScalper()">START SCALPER</button>
-</div>
-
-<!-- Scalper Stats -->
-<div class="scalper-stats-row">
-  <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value cyan" id="sc-st-trades">0</div></div>
-  <div class="stat-card"><div class="stat-label">Wins</div><div class="stat-value green" id="sc-st-wins">0</div></div>
-  <div class="stat-card"><div class="stat-label">Losses</div><div class="stat-value red" id="sc-st-losses">0</div></div>
-  <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value yellow" id="sc-st-winrate">0%</div></div>
-  <div class="stat-card"><div class="stat-label">Total P&L</div><div class="stat-value" id="sc-st-pnl">$0</div></div>
-  <div class="stat-card"><div class="stat-label">Markets</div><div class="stat-value cyan" id="sc-st-markets">0</div></div>
-</div>
-
-<!-- Active Positions -->
-<div class="scalper-positions">
-  <div class="card">
-    <div class="card-title">Active Positions</div>
-    <div class="card-body" id="sc-positions">
-      <div class="empty">No active positions</div>
-    </div>
-  </div>
-</div>
-
-<!-- Scalper Grid: History + Log -->
-<div class="grid">
-  <div class="card">
-    <div class="card-title">Recent Trades</div>
-    <div class="card-body" style="padding:0; max-height:300px; overflow-y:auto;">
-      <table>
-        <thead>
-          <tr><th>Side</th><th style="text-align:right">Entry</th><th style="text-align:right">Exit</th><th style="text-align:right">Size</th><th style="text-align:right">P&L</th><th>State</th></tr>
-        </thead>
-        <tbody id="sc-history-body">
-          <tr><td colspan="6" class="empty">No trades yet</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="card log-card">
-    <div class="card-title">Scalper Log</div>
-    <div class="card-body log-body" id="sc-log-body">
-      <div class="empty">Waiting for scalper activity...</div>
-    </div>
-  </div>
-</div>
-
-</div><!-- /tab-scalper -->
-
-<!-- ══════ TAB 3: MARKET SCANNER ══════ -->
+<!-- ══════ TAB 2: MARKET SCANNER ══════ -->
 <div class="tab-content" id="tab-scanner">
 
 <!-- Scanner Filter Controls -->
@@ -4088,7 +3904,6 @@ DASHBOARD_HTML = r"""
 <script>
 const socket = io();
 let botRunning = {{ 'true' if sv_running else 'false' }};
-let scalperRunning = false;
 let scannerRunning = false;
 let scannerAutoBid = {{ 'true' if sv_scanner_auto_bid else 'false' }};
 let socketConnected = false;
@@ -4129,7 +3944,6 @@ _acAssets.forEach(a => _acFields.forEach(f => _acInputIds.push('inp-ac-' + a + '
 
 ['inp-price','inp-tokens','inp-window-open','inp-window-close',
  'inp-ob-min-size','inp-ob-max-imbalance',
- 'sc-trade-size','sc-entry-max','sc-profit','sc-stop','sc-cooldown','sc-exit-before','sc-max-pos',
  'scan-max-hours','scan-min-liq','scan-max-liq','scan-interval',
  'scan-ab-price','scan-ab-size','scan-ab-max-ask','scan-ab-min-liq'].concat(_acInputIds).forEach(id => {
   const el = document.getElementById(id);
@@ -4334,28 +4148,6 @@ function toggleBot() {
     socket.emit('stop_bot');
   } else {
     socket.emit('start_bot');
-  }
-}
-
-// ── Scalper: Apply Params ──
-function applyScalperParams() {
-  socket.emit('update_scalper_params', {
-    trade_size_usd: parseFloat(document.getElementById('sc-trade-size').value),
-    entry_ask_max: parseFloat(document.getElementById('sc-entry-max').value),
-    profit_target: parseFloat(document.getElementById('sc-profit').value),
-    stop_loss: parseFloat(document.getElementById('sc-stop').value),
-    cooldown_secs: parseInt(document.getElementById('sc-cooldown').value),
-    exit_before_close: parseInt(document.getElementById('sc-exit-before').value),
-    max_open_positions: parseInt(document.getElementById('sc-max-pos').value)
-  });
-}
-
-// ── Scalper: Start / Stop ──
-function toggleScalper() {
-  if (scalperRunning) {
-    socket.emit('stop_scalper');
-  } else {
-    socket.emit('start_scalper');
   }
 }
 
@@ -4592,113 +4384,6 @@ socket.on('state', (d) => {
     }
   }
 
-  // ══════════ SCALPER TAB RENDERING ══════════
-  if (d.scalper) {
-    const sc = d.scalper;
-    scalperRunning = sc.running;
-
-    // Scalper button
-    const scBtn = document.getElementById('btn-scalper');
-    if (sc.running) {
-      scBtn.textContent = 'STOP SCALPER';
-      scBtn.className = 'btn btn-stop';
-    } else {
-      scBtn.textContent = 'START SCALPER';
-      scBtn.className = 'btn btn-start';
-    }
-
-    // Scalper params (dirty-flag protected)
-    if (!isDirty('sc-trade-size') && document.activeElement.id !== 'sc-trade-size')
-      document.getElementById('sc-trade-size').value = sc.trade_size_usd;
-    if (!isDirty('sc-entry-max') && document.activeElement.id !== 'sc-entry-max')
-      document.getElementById('sc-entry-max').value = sc.entry_ask_max;
-    if (!isDirty('sc-profit') && document.activeElement.id !== 'sc-profit')
-      document.getElementById('sc-profit').value = sc.profit_target;
-    if (!isDirty('sc-stop') && document.activeElement.id !== 'sc-stop')
-      document.getElementById('sc-stop').value = sc.stop_loss;
-    if (!isDirty('sc-cooldown') && document.activeElement.id !== 'sc-cooldown')
-      document.getElementById('sc-cooldown').value = sc.cooldown_secs;
-    if (!isDirty('sc-exit-before') && document.activeElement.id !== 'sc-exit-before')
-      document.getElementById('sc-exit-before').value = sc.exit_before_close;
-    if (!isDirty('sc-max-pos') && document.activeElement.id !== 'sc-max-pos')
-      document.getElementById('sc-max-pos').value = sc.max_open_positions;
-
-    // BTC info in scalper tab
-    if (d.btc_price > 0) {
-      document.getElementById('sc-btc-price').textContent = '$' + d.btc_price.toLocaleString();
-      document.getElementById('sc-btc-open').textContent = '$' + d.btc_candle_open.toLocaleString();
-      document.getElementById('sc-btc-dist').textContent = '$' + d.btc_distance.toFixed(0);
-    }
-
-    // Stats
-    document.getElementById('sc-st-trades').textContent = sc.total_trades;
-    document.getElementById('sc-st-wins').textContent = sc.winning_trades;
-    document.getElementById('sc-st-losses').textContent = sc.losing_trades;
-    document.getElementById('sc-st-winrate').textContent = sc.win_rate + '%';
-    document.getElementById('sc-st-markets').textContent = sc.markets_tracked;
-
-    const scPnl = document.getElementById('sc-st-pnl');
-    scPnl.textContent = (sc.total_pnl >= 0 ? '+$' : '-$') + Math.abs(sc.total_pnl).toFixed(2);
-    scPnl.className = 'stat-value ' + (sc.total_pnl > 0 ? 'green' : sc.total_pnl < 0 ? 'red' : '');
-
-    // Active positions
-    const posEl = document.getElementById('sc-positions');
-    if (!sc.positions || sc.positions.length === 0) {
-      posEl.innerHTML = '<div class="empty">No active positions</div>';
-    } else {
-      let posHtml = '';
-      sc.positions.forEach(p => {
-        const pnlCls = p.pnl > 0 ? 'green' : p.pnl < 0 ? 'red' : '';
-        const pnlStr = (p.pnl >= 0 ? '+' : '') + p.pnl.toFixed(4);
-        const sideColor = p.side === 'UP' ? 'var(--green)' : 'var(--red)';
-        posHtml += '<div class="pos-card">' +
-          '<div class="pos-side" style="color:' + sideColor + '">' + p.side + '</div>' +
-          '<div style="flex:1">' +
-            '<div style="font-weight:600">' + (p.question || p.market_id.substring(0,12) + '...') + '</div>' +
-            '<div style="font-size:0.85em;color:#aaa">' +
-              'Entry: $' + p.entry_price.toFixed(3) +
-              ' | Ask: $' + p.current_ask.toFixed(3) +
-              ' | Bid: $' + p.current_bid.toFixed(3) +
-              ' | ' + fmtTime(p.secs_left) + ' left' +
-            '</div>' +
-          '</div>' +
-          '<div class="pos-pnl ' + pnlCls + '">' + pnlStr + '</div>' +
-          '<div class="pos-state">' + p.state + '</div>' +
-          '</div>';
-      });
-      posEl.innerHTML = posHtml;
-    }
-
-    // Trade history table
-    const scHistBody = document.getElementById('sc-history-body');
-    if (sc.history && sc.history.length > 0) {
-      let hHtml = '';
-      sc.history.forEach(h => {
-        const pnlCls = h.pnl > 0 ? 'green' : h.pnl < 0 ? 'red' : '';
-        const pnlStr = (h.pnl >= 0 ? '+$' : '-$') + Math.abs(h.pnl).toFixed(4);
-        hHtml += '<tr>' +
-          '<td>' + (h.side || '--') + '</td>' +
-          '<td>$' + (h.entry_price || 0).toFixed(3) + '</td>' +
-          '<td>$' + (h.exit_price || 0).toFixed(3) + '</td>' +
-          '<td class="' + pnlCls + '">' + pnlStr + '</td>' +
-          '<td>' + (h.exit_reason || h.state || '--') + '</td>' +
-          '</tr>';
-      });
-      scHistBody.innerHTML = hHtml;
-    }
-
-    // Scalper activity log
-    const scLogEl = document.getElementById('sc-log-body');
-    if (sc.activity && sc.activity.length > 0) {
-      let logHtml = '';
-      sc.activity.forEach(e => {
-        logHtml += '<div class="log-line"><span class="log-ts">' + e.ts +
-          '</span><span class="log-msg ' + (e.level || 'info') + '">' + e.msg + '</span></div>';
-      });
-      scLogEl.innerHTML = logHtml;
-    }
-  }
-
   // ══════════ SCANNER TAB RENDERING ══════════
   scannerRunning = d.scanner_running || false;
   scannerAutoBid = d.scanner_auto_bid || false;
@@ -4851,8 +4536,37 @@ socket.on('state', (d) => {
   }
 
   // ══════════ AFTER-HOURS FILLS TAB ══════════
-  const ahEvents = d.afterhours_events || [];
-  ahRenderAll(ahEvents);
+  // AH events now delivered via separate socket events (ah_events / ah_new_event)
+  // Just update the badge count from the lightweight ah_count field
+  const ahBadge = document.getElementById('ah-tab-badge');
+  if (ahBadge && d.ah_count != null) ahBadge.textContent = d.ah_count;
+});
+
+// ── AH events: full list on connect, incremental on new fill ──
+socket.on('ah_events', function(events) {
+  ahRenderAll(events);
+});
+socket.on('ah_new_event', function(ev) {
+  _ahAllEvents.unshift(ahNorm(ev));
+  const badge = document.getElementById('ah-tab-badge');
+  if (badge) badge.textContent = _ahAllEvents.length;
+  ahUpdateStats(_ahAllEvents);
+  ahApplyFilter();
+});
+socket.on('ah_resolution', function(data) {
+  // Update local AH events with resolution outcome
+  const mid = data.market_id, winner = data.winner;
+  _ahAllEvents.forEach(function(e) {
+    if (e.market_id !== mid) return;
+    if (e.won === 'BOTH') return;
+    e.winner = winner;
+    if (e.side === 'BOTH') e.won = 'BOTH';
+    else if (e.side === 'UP') e.won = (winner === 'Up') ? 'WIN' : 'LOSS';
+    else if (e.side === 'DOWN') e.won = (winner === 'Down') ? 'WIN' : 'LOSS';
+    else e.won = 'pending';
+  });
+  ahUpdateStats(_ahAllEvents);
+  ahApplyFilter();
 });
 
 // ── After-Hours Fills: state & render ──
@@ -5252,17 +4966,6 @@ socket.on('log', (e) => {
   while (logEl.children.length > 50) logEl.removeChild(logEl.lastChild);
 });
 
-// ── Scalper log push ──
-socket.on('scalper_log', (e) => {
-  const logEl = document.getElementById('sc-log-body');
-  const div = document.createElement('div');
-  div.className = 'log-line';
-  div.innerHTML = '<span class="log-ts">' + e.ts +
-    '</span><span class="log-msg ' + (e.level || 'info') + '">' + e.msg + '</span>';
-  logEl.prepend(div);
-  while (logEl.children.length > 50) logEl.removeChild(logEl.lastChild);
-});
-
 // ── Scanner log push ──
 socket.on('scanner_log', (e) => {
   const logEl = document.getElementById('scan-log-body');
@@ -5329,7 +5032,7 @@ if __name__ == "__main__":
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
 
-    # ── Restore saved settings (bid prices, filters, scalper config) ──
+    # ── Restore saved settings (bid prices, filters, scanner config) ──
     _load_settings()
     engine.add_log("Settings loaded from disk", "info")
 
@@ -5338,7 +5041,7 @@ if __name__ == "__main__":
     _pcm_thread.start()
     engine.add_log("Post-Close Monitor started (always-on, all markets)", "info")
 
-    # ── Bot & Scalper do NOT auto-start — user must click Start in dashboard ──
+    # ── Bot does NOT auto-start — user must click Start in dashboard ──
     engine.add_log("Waiting for manual start from dashboard...", "info")
 
     socketio.run(app, host="0.0.0.0", port=5050, debug=False, allow_unsafe_werkzeug=True)
