@@ -29,9 +29,9 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RECONNECT_DELAY = 2.0     # seconds between reconnect attempts
 PING_INTERVAL = 20        # seconds between WebSocket pings
 MAX_RECONNECTS = 50        # give up after this many consecutive failures
-SUB_BATCH_SIZE = 20        # max tokens per subscription message (avoid overload)
-STALE_THRESHOLD = 120.0    # seconds before a token's data is considered stale
-RESUB_COOLDOWN = 120.0     # min seconds between re-sub attempts for the same token
+SUB_BATCH_SIZE = 50        # max tokens per subscription message
+STALE_THRESHOLD = 60.0     # seconds before a token's data is considered stale
+RESUB_COOLDOWN = 30.0      # min seconds between re-sub attempts for the same token
 
 
 @dataclass
@@ -269,9 +269,8 @@ class PriceFeed:
             p = self._prices.get(tid)
             if p is None or not p.valid or (now - p.timestamp > STALE_THRESHOLD):
                 if resub_eligible_only and p is not None:
-                    # Exponential backoff: cooldown doubles each attempt (120, 240, 480...)
-                    cooldown = RESUB_COOLDOWN * (2 ** min(p.resub_count, 5))
-                    if now - p.last_resub < cooldown:
+                    # Fixed cooldown — no exponential backoff (was causing stale tokens to become unrecoverable)
+                    if now - p.last_resub < RESUB_COOLDOWN:
                         continue
                 stale.append(tid)
         return stale
@@ -378,7 +377,7 @@ class PriceFeed:
 
             # Periodically check for stale tokens and re-subscribe them
             now = time.time()
-            if now - last_stale_check >= 30:
+            if now - last_stale_check >= 15:
                 stale = self.get_stale_tokens(resub_eligible_only=True)
                 if stale:
                     log.info(f"WS re-subscribing {len(stale)} stale tokens (of {len(self.get_stale_tokens())} total stale)")
@@ -471,6 +470,7 @@ class PriceFeed:
             price.timestamp = now
             price.update_count += 1
             price.valid = True
+            price.resub_count = 0      # Reset backoff on successful data
             price.record_tick(now)
 
         elif event_type == "price_change":
@@ -506,6 +506,7 @@ class PriceFeed:
                 price.timestamp = now
                 price.update_count += 1
                 price.valid = True
+                price.resub_count = 0      # Reset backoff on successful data
                 price.record_tick(now)
 
         elif event_type == "last_trade_price":

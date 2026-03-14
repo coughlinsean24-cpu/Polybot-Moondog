@@ -66,12 +66,12 @@ FEATURE_NAMES = [
 NUM_FEATURES = len(FEATURE_NAMES)
 
 # Learner defaults
-DEFAULT_CONFIDENCE_THRESHOLD = 0.05   # Min predicted both-fill prob to allow bid (low — we're still gathering data)
+DEFAULT_CONFIDENCE_THRESHOLD = 0.15   # Min predicted both-fill prob to allow bid (raised — we have enough data to gate)
 DEFAULT_LEARNING_RATE = 0.5           # SGD learning rate for online updates
 DEFAULT_L2_LAMBDA = 0.01              # L2 regularization strength
-MIN_SAMPLES_TO_GATE = 50              # Don't gate decisions until we have this many outcome samples
-WARM_UP_TRADES = 20                   # First N trades: always allow (exploration phase)
-EXPLORATION_RATE = 0.15               # Even after warm-up, randomly allow 15% of "skip" trades for data collection
+MIN_SAMPLES_TO_GATE = 15              # Gate after 15 outcomes (we already have 35)
+WARM_UP_TRADES = 10                   # First 10 trades: always allow (exploration phase)
+EXPLORATION_RATE = 0.05               # Reduced from 15% — only 5% exploration to limit bleeding
 
 
 # ── Feature Extraction ──────────────────────────────────────────────────────

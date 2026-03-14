@@ -33,17 +33,17 @@ TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
 # ── Limit Bid Strategy ─────────────────────────────────────────────────────
-BID_PRICE = float(os.getenv("BID_PRICE", "0.02"))       # Limit buy price per share
-TOKENS_PER_SIDE = int(os.getenv("TOKENS_PER_SIDE", "150"))  # Shares per side
-MAX_RISK_PER_MARKET = float(os.getenv("MAX_RISK_PER_MARKET", "50"))  # Max $ per market
+BID_PRICE = float(os.getenv("BID_PRICE", "0.01"))       # Limit buy price per share (lowered from $0.02 to $0.01)
+TOKENS_PER_SIDE = int(os.getenv("TOKENS_PER_SIDE", "100"))  # Shares per side (locked at 100 for consistency)
+MAX_RISK_PER_MARKET = float(os.getenv("MAX_RISK_PER_MARKET", "10"))  # Max $ per market (tightened from $50)
 
 # ── Hard Safety Caps (cannot be overridden by dashboard or learner) ─────────
 HARD_MAX_BID_PRICE = 0.50       # ABSOLUTE ceiling — no bid above $0.50/share ever
 HARD_MAX_TOKENS = 500           # ABSOLUTE ceiling — no more than 500 shares/side
-MAX_DAILY_SPEND = float(os.getenv("MAX_DAILY_SPEND", "200"))  # Max $ spent per day (0=unlimited)
+MAX_DAILY_SPEND = float(os.getenv("MAX_DAILY_SPEND", "40"))  # Max $ spent per day (tightened from $200)
 
 # ── Time Window (seconds before market close) ──────────────────────────────
-BID_WINDOW_OPEN = int(os.getenv("BID_WINDOW_OPEN", "7"))     # Post bids when <=7s left
+BID_WINDOW_OPEN = int(os.getenv("BID_WINDOW_OPEN", "60"))    # Cancel loser side at T-60s
 BID_WINDOW_CLOSE = int(os.getenv("BID_WINDOW_CLOSE", "0"))   # Stop posting when <=0s left
 
 # ── Polling ─────────────────────────────────────────────────────────────────
@@ -51,7 +51,18 @@ MARKET_POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL", "60"))
 
 # ── Risk Management ────────────────────────────────────────────────────────
 CANCEL_DELAY_AFTER_CLOSE = int(os.getenv("CANCEL_DELAY_AFTER_CLOSE", "30"))
-MAX_BIDS_PER_DAY = int(os.getenv("MAX_BIDS_PER_DAY", "0"))  # 0 = unlimited
+MAX_BIDS_PER_DAY = int(os.getenv("MAX_BIDS_PER_DAY", "20"))  # Hard cap: max 20 bids per day (was unlimited)
+
+# ── Combined-Ask Arbitrage ────────────────────────────────────────────────
+# Buy BOTH sides when up_ask + down_ask < $1.00.  One side always pays $1.
+# Guaranteed profit = $1.00 − combined_cost per share.
+ARB_ENABLED = os.getenv("ARB_ENABLED", "true").lower() == "true"
+ARB_MIN_EDGE = float(os.getenv("ARB_MIN_EDGE", "0.03"))       # Min profit per $1 payout (3¢)
+ARB_TRADE_SIZE = float(os.getenv("ARB_TRADE_SIZE", "5.00"))   # Max $ per arb trade
+ARB_MAX_POSITIONS = int(os.getenv("ARB_MAX_POSITIONS", "3"))   # Max concurrent arb positions
+ARB_COOLDOWN = float(os.getenv("ARB_COOLDOWN", "30"))         # Seconds between arbs on same market
+ARB_FILL_TIMEOUT = float(os.getenv("ARB_FILL_TIMEOUT", "45")) # Cancel unfilled arb orders after Ns
+ARB_MAX_DAILY_SPEND = float(os.getenv("ARB_MAX_DAILY_SPEND", "25.00"))  # Daily spend cap for arb
 
 # ── Scalper Defaults ───────────────────────────────────────────────────────
 SCALP_TRADE_SIZE = float(os.getenv("SCALP_TRADE_SIZE", "2.50"))      # $ per scalp trade

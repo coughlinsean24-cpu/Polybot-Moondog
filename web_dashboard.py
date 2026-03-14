@@ -52,6 +52,7 @@ from ws_feed import PriceFeed
 from binance_ws import BinanceFeed
 from data_recorder import recorder as data_rec
 from adaptive_learner import learner as ai_learner, extract_features
+from arb import ArbEngine
 
 
 # ── Settings Persistence ────────────────────────────────────────────────────
@@ -71,6 +72,16 @@ def _save_settings():
             "ob_max_imbalance": engine.ob_max_imbalance,
             "scanner": dict(engine.scanner_cfg),
             "scanner_auto_bid": engine.scanner_auto_bid,
+            "auto_trade_enabled": engine.auto_trade_enabled,
+            "arb": {
+                "enabled": engine.arb.enabled if engine.arb else config.ARB_ENABLED,
+                "min_edge": engine.arb.min_edge if engine.arb else config.ARB_MIN_EDGE,
+                "trade_size": engine.arb.trade_size if engine.arb else config.ARB_TRADE_SIZE,
+                "max_positions": engine.arb.max_positions if engine.arb else config.ARB_MAX_POSITIONS,
+                "cooldown": engine.arb.cooldown if engine.arb else config.ARB_COOLDOWN,
+                "fill_timeout": engine.arb.fill_timeout if engine.arb else config.ARB_FILL_TIMEOUT,
+                "max_daily_spend": engine.arb.max_daily_spend if engine.arb else config.ARB_MAX_DAILY_SPEND,
+            },
         }
         with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -87,13 +98,14 @@ def _load_settings():
     try:
         with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        engine.bid_price = float(data.get("bid_price", engine.bid_price))
+        engine.bid_price = 0.01  # Always fixed at $0.01
         engine.tokens_per_side = int(data.get("tokens_per_side", engine.tokens_per_side))
         engine.bid_window_open = int(data.get("bid_window_open", engine.bid_window_open))
         engine.bid_window_close = int(data.get("bid_window_close", engine.bid_window_close))
         engine.ob_filter_enabled = bool(data.get("ob_filter_enabled", engine.ob_filter_enabled))
-        engine.ob_min_size = float(data.get("ob_min_size", engine.ob_min_size))
-        engine.ob_max_imbalance = float(data.get("ob_max_imbalance", engine.ob_max_imbalance))
+        # Enforce minimum OB filter thresholds — never allow zero (log-only)
+        engine.ob_min_size = max(50.0, float(data.get("ob_min_size", engine.ob_min_size)))
+        engine.ob_max_imbalance = max(3.0, float(data.get("ob_max_imbalance", engine.ob_max_imbalance)))
         # Per-asset config
         saved_ac = data.get("asset_config", {})
         for a, cfg in saved_ac.items():
@@ -104,6 +116,8 @@ def _load_settings():
                             engine.asset_config[a][k] = bool(v)
                         elif k in ("tokens_per_side", "bid_window_open"):
                             engine.asset_config[a][k] = int(v)
+                        elif k == "bid_price":
+                            engine.asset_config[a][k] = 0.01  # Always force $0.01
                         else:
                             engine.asset_config[a][k] = float(v)
         engine.btc_dollar_range = engine.asset_config.get("BTC", {}).get("dollar_range", 2.0)
@@ -120,6 +134,11 @@ def _load_settings():
                     else:
                         engine.scanner_cfg[k] = float(v)
         engine.scanner_auto_bid = bool(data.get("scanner_auto_bid", False))
+        engine.auto_trade_enabled = bool(data.get("auto_trade_enabled", False))
+        # Arb settings — applied to engine.arb once it's initialized
+        arb_cfg = data.get("arb", {})
+        if arb_cfg and isinstance(arb_cfg, dict):
+            engine._arb_saved_cfg = arb_cfg  # Stash for init_arb() to apply later
         log.info(f"[SETTINGS] Restored from {_SETTINGS_FILE}")
         enabled = [a for a, c in engine.asset_config.items() if c.get('enabled')]
         log.info(f"[SETTINGS] Assets enabled: {enabled}, bid_price={engine.bid_price}, tokens={engine.tokens_per_side}")
@@ -140,9 +159,9 @@ def _load_settings():
 
 ASSET_FILTERS = {
     "BTC": {
-        "bid_price": 0.02,              # $0.02 per share
+        "bid_price": 0.01,              # $0.01 per share — 97% win rate at this level
         "tokens_per_side": 100,         # shares per side (per-asset)
-        "bid_window_open": 120,         # seconds before close to start posting
+        "bid_window_open": 60,          # seconds before close to cancel loser side
         "distance_pct_max": 0.0008,     # 0.080%  (~$78 at $97k)
         "candle_range_max": 50.0,       # $50 max 5-min candle
         "dollar_range": 2.0,            # $2 default UI-editable range
@@ -150,19 +169,19 @@ ASSET_FILTERS = {
         "expansion_floor": 30.0,        # only if range > $30
     },
     "ETH": {
-        "bid_price": 0.02,              # $0.02 per share
+        "bid_price": 0.01,              # $0.01 per share — 97% win rate at this level
         "tokens_per_side": 100,         # shares per side (per-asset)
-        "bid_window_open": 120,         # seconds before close to start posting
-        "distance_pct_max": 0.0010,     # 0.10%  (~$2.70 at $2700)
-        "candle_range_max": 8.0,        # $8 max 5-min candle
-        "dollar_range": 1.0,            # $1 default
-        "expansion_max": 1.5,
-        "expansion_floor": 4.0,
+        "bid_window_open": 60,          # seconds before close to cancel loser side
+        "distance_pct_max": 0.0008,     # 0.08% (tightened from 0.10% — ETH has worse signal-to-noise)
+        "candle_range_max": 5.0,        # $5 max (tightened from $8 — reduce momentum traps)
+        "dollar_range": 0.80,           # $0.80 (tightened from $1)
+        "expansion_max": 1.3,           # 1.3x (tightened from 1.5x)
+        "expansion_floor": 3.0,         # $3 (tightened from $4)
     },
     "SOL": {
-        "bid_price": 0.02,              # $0.02 per share
+        "bid_price": 0.01,              # $0.01 per share — 97% win rate at this level
         "tokens_per_side": 100,         # shares per side (per-asset)
-        "bid_window_open": 120,         # seconds before close to start posting
+        "bid_window_open": 60,          # seconds before close to cancel loser side
         "distance_pct_max": 0.0015,     # 0.15%  (~$0.25 at $170)
         "candle_range_max": 0.80,       # $0.80 max
         "dollar_range": 0.15,           # $0.15 default
@@ -170,9 +189,9 @@ ASSET_FILTERS = {
         "expansion_floor": 0.40,
     },
     "XRP": {
-        "bid_price": 0.02,              # $0.02 per share
+        "bid_price": 0.01,              # $0.01 per share — 97% win rate at this level
         "tokens_per_side": 100,         # shares per side (per-asset)
-        "bid_window_open": 120,         # seconds before close to start posting
+        "bid_window_open": 60,          # seconds before close to cancel loser side
         "distance_pct_max": 0.0020,     # 0.20%  (~$0.005 at $2.50)
         "candle_range_max": 0.010,      # $0.01 max
         "dollar_range": 0.003,          # $0.003 default
@@ -275,6 +294,7 @@ class BidRecord:
         self.up_fill_size: float = 0.0
         self.down_fill_size: float = 0.0
         self.cancelled: bool = False
+        self.cancel_phase_done: bool = False  # True once smart-cancel has run at T-20s
 
         # Post-place OB imbalance tracking
         self.ob_imbalance: float = 0.0      # Current ask-size ratio (higher = more imbalanced)
@@ -754,6 +774,446 @@ def _ah_load():
         log.debug(f"[AH-persist] load error: {e}")
 
 
+# ── Trade Journal Persistence ────────────────────────────────────────────────
+_TJ_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "trade_journal.jsonl")
+
+
+def _tj_save_entry(entry: dict):
+    """Append a single trade journal entry to the persistent JSONL file."""
+    try:
+        os.makedirs(os.path.dirname(_TJ_FILE), exist_ok=True)
+        with open(_TJ_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        log.debug(f"[TJ-persist] save error: {e}")
+
+
+def _tj_save_all():
+    """Rewrite the entire JSONL file from the current deque."""
+    try:
+        os.makedirs(os.path.dirname(_TJ_FILE), exist_ok=True)
+        with open(_TJ_FILE, "w", encoding="utf-8") as f:
+            for entry in engine.trade_journal:
+                f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as e:
+        log.debug(f"[TJ-persist] save-all error: {e}")
+
+
+def _tj_load():
+    """Load persisted trade journal entries on startup."""
+    if not os.path.exists(_TJ_FILE):
+        return
+    count = 0
+    try:
+        with open(_TJ_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    engine.trade_journal.append(entry)
+                    count += 1
+                except json.JSONDecodeError:
+                    continue
+        if count:
+            log.info(f"[TJ-persist] Loaded {count} trade journal entries from disk")
+    except Exception as e:
+        log.debug(f"[TJ-persist] load error: {e}")
+
+
+def tj_record_trade(trade_data: dict) -> dict:
+    """Record a manual trade with comprehensive market context snapshot.
+    
+    trade_data should contain at minimum:
+        market_id, question, asset, side, price, size, order_id (if placed),
+        and optionally: notes, strategy, confidence
+    
+    Automatically enriches with: asset price, candle data, OB snapshot,
+    timing, WS state. Returns the full enriched entry.
+    """
+    now = datetime.now(timezone.utc)
+    entry = {
+        "id": f"tj_{int(time.time())}_{trade_data.get('market_id', '')[:8]}",
+        "ts": time.time(),
+        "ts_str": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+
+        # ── Trade Details ──
+        "market_id": trade_data.get("market_id", ""),
+        "question": trade_data.get("question", ""),
+        "asset": trade_data.get("asset", ""),
+        "side": trade_data.get("side", ""),               # "UP", "DOWN", "BOTH"
+        "action": trade_data.get("action", "BUY"),         # "BUY" or "SELL"
+        "price": float(trade_data.get("price", 0)),
+        "size": int(trade_data.get("size", 0)),
+        "cost": float(trade_data.get("price", 0)) * int(trade_data.get("size", 0)),
+        "order_id": trade_data.get("order_id", ""),
+        "order_id_up": trade_data.get("order_id_up", ""),
+        "order_id_down": trade_data.get("order_id_down", ""),
+        "token_id": trade_data.get("token_id", ""),
+        "token_id_up": trade_data.get("token_id_up", ""),
+        "token_id_down": trade_data.get("token_id_down", ""),
+        "end_time": trade_data.get("end_time", ""),
+
+        # ── Manual Annotations ──
+        "notes": trade_data.get("notes", ""),
+        "strategy": trade_data.get("strategy", ""),        # "line_ride", "momentum", "ob_read", etc.
+        "confidence": trade_data.get("confidence", ""),     # "high", "medium", "low"
+        "reason": trade_data.get("reason", ""),             # Why you took this trade
+
+        # ── Market Context (auto-captured) ──
+        "secs_to_close": 0.0,
+        "asset_price": 0.0,
+        "candle_open": 0.0,
+        "candle_high": 0.0,
+        "candle_low": 0.0,
+        "candle_range": 0.0,
+        "price_distance": 0.0,
+        "price_distance_pct": 0.0,
+        "range_pct": 0.0,
+        "price_vs_open": "",             # "ABOVE" or "BELOW"
+        "prior_candle_range": 0.0,
+        "expansion_ratio": 0.0,          # candle_range / prior_candle_range
+
+        # ── Orderbook Snapshot (auto-captured) ──
+        "up_ask": 0.0,
+        "up_bid": 0.0,
+        "up_ask_size": 0.0,
+        "up_bid_size": 0.0,
+        "down_ask": 0.0,
+        "down_bid": 0.0,
+        "down_ask_size": 0.0,
+        "down_bid_size": 0.0,
+        "combined_ask": 0.0,
+        "ask_diff": 0.0,
+        "ob_imbalance": 0.0,
+        "ob_heavy_side": "",
+
+        # ── Outcome (filled in later) ──
+        "status": "open",               # "open", "filled", "partial", "cancelled", "resolved"
+        "filled": False,
+        "fill_size": 0.0,
+        "fill_time": "",
+        "up_filled": False,
+        "down_filled": False,
+        "up_fill_size": 0.0,
+        "down_fill_size": 0.0,
+        "winner": "pending",             # "Up", "Down", or "pending"
+        "won": "pending",                # "WIN", "LOSS", "BOTH", or "pending"
+        "pnl": 0.0,
+        "payout": 0.0,
+        "resolved_at": "",
+    }
+
+    # ── Auto-Enrich with live market data ──
+    mid = trade_data.get("market_id", "")
+    market = engine.watch_list.get(mid)
+
+    if market:
+        entry["secs_to_close"] = round(seconds_until(market.end_time), 1)
+        entry["end_time"] = market.end_time.isoformat()
+
+        # WS orderbook
+        ws_up = engine.ws_feed.get_price(market.token_id_up)
+        ws_down = engine.ws_feed.get_price(market.token_id_down)
+        if ws_up and ws_up.valid:
+            entry["up_ask"] = round(ws_up.best_ask, 4)
+            entry["up_bid"] = round(ws_up.best_bid, 4)
+            entry["up_ask_size"] = round(ws_up.best_ask_size, 1)
+            entry["up_bid_size"] = round(ws_up.best_bid_size, 1)
+        if ws_down and ws_down.valid:
+            entry["down_ask"] = round(ws_down.best_ask, 4)
+            entry["down_bid"] = round(ws_down.best_bid, 4)
+            entry["down_ask_size"] = round(ws_down.best_ask_size, 1)
+            entry["down_bid_size"] = round(ws_down.best_bid_size, 1)
+        entry["combined_ask"] = round(entry["up_ask"] + entry["down_ask"], 4)
+        entry["ask_diff"] = round(abs(entry["up_ask"] - entry["down_ask"]), 4)
+        min_sz = min(entry["up_ask_size"], entry["down_ask_size"])
+        max_sz = max(entry["up_ask_size"], entry["down_ask_size"])
+        entry["ob_imbalance"] = round(max_sz / min_sz, 2) if min_sz > 0 else 0.0
+        entry["ob_heavy_side"] = "UP" if entry["up_ask_size"] > entry["down_ask_size"] else "DOWN"
+
+        # Token IDs (so we can check fill status later)
+        entry["token_id_up"] = entry["token_id_up"] or market.token_id_up
+        entry["token_id_down"] = entry["token_id_down"] or market.token_id_down
+
+    # Asset price from Binance feed
+    asset = trade_data.get("asset", "BTC")
+    ast = engine.btc_feed.get(asset)
+    if ast and ast.price > 0:
+        entry["asset_price"] = round(ast.price, 6)
+        entry["candle_open"] = round(ast.candle_open, 6)
+        entry["candle_high"] = round(ast.candle_high, 6)
+        entry["candle_low"] = round(ast.candle_low, 6)
+        entry["candle_range"] = round(ast.candle_range, 6)
+        entry["price_distance"] = round(ast.distance, 6)
+        entry["price_distance_pct"] = round(ast.distance / ast.price, 8) if ast.price > 0 else 0.0
+        entry["range_pct"] = round(ast.distance / ast.candle_range, 4) if ast.candle_range > 0 else 0.0
+        entry["price_vs_open"] = "ABOVE" if ast.price >= ast.candle_open else "BELOW"
+        if ast.prior_candle_range > 0:
+            entry["prior_candle_range"] = round(ast.prior_candle_range, 6)
+            entry["expansion_ratio"] = round(ast.candle_range / ast.prior_candle_range, 4) if ast.prior_candle_range > 0 else 0.0
+
+    # Save & emit
+    engine.trade_journal.appendleft(entry)
+    _tj_save_entry(entry)
+    try:
+        socketio.emit("tj_new_entry", entry)
+    except Exception:
+        pass
+
+    engine.add_log(f"JOURNAL: {entry['side']} {asset} ${entry['price']} x {entry['size']}  {entry['question'][:50]}", "trade")
+    return entry
+
+
+def tj_update_trade(trade_id: str, updates: dict):
+    """Update an existing trade journal entry (fill status, resolution, notes)."""
+    for entry in engine.trade_journal:
+        if entry.get("id") == trade_id:
+            entry.update(updates)
+            _tj_save_all()
+            try:
+                socketio.emit("tj_updated", entry)
+            except Exception:
+                pass
+            return entry
+    return None
+
+
+def tj_check_fills():
+    """Check fill status for all open trade journal entries with order IDs."""
+    for entry in engine.trade_journal:
+        if entry.get("status") not in ("open",):
+            continue
+
+        changed = False
+
+        # Check single-side orders
+        if entry.get("order_id") and not entry.get("filled"):
+            try:
+                status = get_order_status(entry["order_id"])
+                if status["status"] in ("matched", "partial"):
+                    entry["filled"] = True
+                    entry["fill_size"] = status["size_matched"]
+                    entry["fill_time"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    entry["status"] = "filled"
+                    changed = True
+                elif status["status"] == "cancelled":
+                    entry["status"] = "cancelled"
+                    changed = True
+            except Exception:
+                pass
+
+        # Check UP/DOWN pair orders
+        if entry.get("order_id_up") and not entry.get("up_filled"):
+            try:
+                status = get_order_status(entry["order_id_up"])
+                if status["status"] in ("matched", "partial"):
+                    entry["up_filled"] = True
+                    entry["up_fill_size"] = status["size_matched"]
+                    entry["fill_time"] = entry.get("fill_time") or datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    changed = True
+            except Exception:
+                pass
+
+        if entry.get("order_id_down") and not entry.get("down_filled"):
+            try:
+                status = get_order_status(entry["order_id_down"])
+                if status["status"] in ("matched", "partial"):
+                    entry["down_filled"] = True
+                    entry["down_fill_size"] = status["size_matched"]
+                    entry["fill_time"] = entry.get("fill_time") or datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    changed = True
+            except Exception:
+                pass
+
+        # Update status for pair orders
+        if entry.get("up_filled") or entry.get("down_filled"):
+            if entry.get("up_filled") and entry.get("down_filled"):
+                entry["status"] = "both_filled"
+            else:
+                entry["status"] = "filled"
+            entry["filled"] = True
+
+        if changed:
+            _tj_save_all()
+            try:
+                socketio.emit("tj_updated", entry)
+            except Exception:
+                pass
+
+
+def tj_resolve_trade(trade_id: str, winner: str):
+    """Resolve a trade journal entry with the market outcome."""
+    for entry in engine.trade_journal:
+        if entry.get("id") != trade_id:
+            continue
+
+        entry["winner"] = winner
+        entry["resolved_at"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+        side = entry.get("side", "")
+        price = entry.get("price", 0)
+
+        if side == "BOTH":
+            # Both-side strategy
+            if entry.get("up_filled") and entry.get("down_filled"):
+                entry["won"] = "BOTH"
+                payout = max(entry.get("up_fill_size", 0), entry.get("down_fill_size", 0)) * 1.0
+                cost = price * (entry.get("up_fill_size", 0) + entry.get("down_fill_size", 0))
+                entry["payout"] = round(payout, 4)
+                entry["pnl"] = round(payout - cost, 4)
+            elif entry.get("up_filled"):
+                entry["won"] = "WIN" if winner == "Up" else "LOSS"
+                fill = entry.get("up_fill_size", 0)
+                entry["payout"] = round(fill * 1.0, 4) if winner == "Up" else 0.0
+                entry["pnl"] = round(entry["payout"] - price * fill, 4)
+            elif entry.get("down_filled"):
+                entry["won"] = "WIN" if winner == "Down" else "LOSS"
+                fill = entry.get("down_fill_size", 0)
+                entry["payout"] = round(fill * 1.0, 4) if winner == "Down" else 0.0
+                entry["pnl"] = round(entry["payout"] - price * fill, 4)
+            else:
+                entry["won"] = "NONE"
+                entry["pnl"] = 0.0
+        elif side == "UP":
+            fill = entry.get("fill_size", 0) or entry.get("up_fill_size", 0)
+            if fill > 0:
+                entry["won"] = "WIN" if winner == "Up" else "LOSS"
+                entry["payout"] = round(fill * 1.0, 4) if winner == "Up" else 0.0
+                entry["pnl"] = round(entry["payout"] - price * fill, 4)
+            else:
+                entry["won"] = "NONE"
+                entry["pnl"] = 0.0
+        elif side == "DOWN":
+            fill = entry.get("fill_size", 0) or entry.get("down_fill_size", 0)
+            if fill > 0:
+                entry["won"] = "WIN" if winner == "Down" else "LOSS"
+                entry["payout"] = round(fill * 1.0, 4) if winner == "Down" else 0.0
+                entry["pnl"] = round(entry["payout"] - price * fill, 4)
+            else:
+                entry["won"] = "NONE"
+                entry["pnl"] = 0.0
+
+        entry["status"] = "resolved"
+        _tj_save_all()
+
+        try:
+            socketio.emit("tj_updated", entry)
+        except Exception:
+            pass
+
+        engine.add_log(
+            f"JOURNAL RESOLVED: {entry['won']} PnL=${entry['pnl']:.2f}  {entry['question'][:50]}",
+            "profit" if entry["pnl"] > 0 else "error" if entry["pnl"] < 0 else "info",
+        )
+        return entry
+    return None
+
+
+def tj_get_stats() -> dict:
+    """Compute comprehensive stats from the trade journal for pattern analysis."""
+    trades = list(engine.trade_journal)
+    total = len(trades)
+    resolved = [t for t in trades if t.get("status") == "resolved"]
+    wins = [t for t in resolved if t.get("won") == "WIN"]
+    losses = [t for t in resolved if t.get("won") == "LOSS"]
+    both = [t for t in resolved if t.get("won") == "BOTH"]
+    open_trades = [t for t in trades if t.get("status") in ("open", "filled", "both_filled")]
+
+    total_pnl = sum(t.get("pnl", 0) for t in resolved)
+    total_cost = sum(t.get("cost", 0) for t in trades)
+    win_pnl = sum(t.get("pnl", 0) for t in wins)
+    loss_pnl = sum(t.get("pnl", 0) for t in losses)
+    both_pnl = sum(t.get("pnl", 0) for t in both)
+
+    # Per-asset breakdown
+    assets = {}
+    for t in resolved:
+        a = t.get("asset", "?")
+        if a not in assets:
+            assets[a] = {"wins": 0, "losses": 0, "both": 0, "pnl": 0.0}
+        if t.get("won") == "WIN":
+            assets[a]["wins"] += 1
+        elif t.get("won") == "LOSS":
+            assets[a]["losses"] += 1
+        elif t.get("won") == "BOTH":
+            assets[a]["both"] += 1
+        assets[a]["pnl"] += t.get("pnl", 0)
+
+    # Per-strategy breakdown
+    strategies = {}
+    for t in resolved:
+        s = t.get("strategy", "none") or "none"
+        if s not in strategies:
+            strategies[s] = {"wins": 0, "losses": 0, "pnl": 0.0}
+        if t.get("won") in ("WIN", "BOTH"):
+            strategies[s]["wins"] += 1
+        elif t.get("won") == "LOSS":
+            strategies[s]["losses"] += 1
+        strategies[s]["pnl"] += t.get("pnl", 0)
+
+    # Win patterns (what do winners have in common?)
+    win_patterns = {}
+    if wins or both:
+        all_wins = wins + both
+        win_patterns = {
+            "avg_secs_to_close": round(sum(t.get("secs_to_close", 0) for t in all_wins) / len(all_wins), 1) if all_wins else 0,
+            "avg_range_pct": round(sum(t.get("range_pct", 0) for t in all_wins) / len(all_wins), 4) if all_wins else 0,
+            "avg_ob_imbalance": round(sum(t.get("ob_imbalance", 0) for t in all_wins) / len(all_wins), 2) if all_wins else 0,
+            "avg_candle_range": round(sum(t.get("candle_range", 0) for t in all_wins) / len(all_wins), 4) if all_wins else 0,
+            "avg_ask_diff": round(sum(t.get("ask_diff", 0) for t in all_wins) / len(all_wins), 4) if all_wins else 0,
+            "avg_combined_ask": round(sum(t.get("combined_ask", 0) for t in all_wins) / len(all_wins), 4) if all_wins else 0,
+            "price_above_pct": round(sum(1 for t in all_wins if t.get("price_vs_open") == "ABOVE") / len(all_wins) * 100, 1) if all_wins else 0,
+            "price_below_pct": round(sum(1 for t in all_wins if t.get("price_vs_open") == "BELOW") / len(all_wins) * 100, 1) if all_wins else 0,
+            "confidence_dist": {},
+            "strategy_dist": {},
+        }
+        for t in all_wins:
+            c = t.get("confidence", "none") or "none"
+            win_patterns["confidence_dist"][c] = win_patterns["confidence_dist"].get(c, 0) + 1
+            s = t.get("strategy", "none") or "none"
+            win_patterns["strategy_dist"][s] = win_patterns["strategy_dist"].get(s, 0) + 1
+
+    # Loss patterns
+    loss_patterns = {}
+    if losses:
+        loss_patterns = {
+            "avg_secs_to_close": round(sum(t.get("secs_to_close", 0) for t in losses) / len(losses), 1),
+            "avg_range_pct": round(sum(t.get("range_pct", 0) for t in losses) / len(losses), 4),
+            "avg_ob_imbalance": round(sum(t.get("ob_imbalance", 0) for t in losses) / len(losses), 2),
+            "avg_candle_range": round(sum(t.get("candle_range", 0) for t in losses) / len(losses), 4),
+            "avg_ask_diff": round(sum(t.get("ask_diff", 0) for t in losses) / len(losses), 4),
+            "avg_combined_ask": round(sum(t.get("combined_ask", 0) for t in losses) / len(losses), 4),
+            "price_above_pct": round(sum(1 for t in losses if t.get("price_vs_open") == "ABOVE") / len(losses) * 100, 1),
+            "price_below_pct": round(sum(1 for t in losses if t.get("price_vs_open") == "BELOW") / len(losses) * 100, 1),
+        }
+
+    return {
+        "total": total,
+        "open": len(open_trades),
+        "resolved": len(resolved),
+        "wins": len(wins),
+        "losses": len(losses),
+        "both": len(both),
+        "win_rate": round(len(wins + both) / len(resolved) * 100, 1) if resolved else 0,
+        "total_pnl": round(total_pnl, 2),
+        "total_cost": round(total_cost, 2),
+        "win_pnl": round(win_pnl, 2),
+        "loss_pnl": round(loss_pnl, 2),
+        "both_pnl": round(both_pnl, 2),
+        "avg_pnl": round(total_pnl / len(resolved), 2) if resolved else 0,
+        "best_trade": round(max((t.get("pnl", 0) for t in resolved), default=0), 2),
+        "worst_trade": round(min((t.get("pnl", 0) for t in resolved), default=0), 2),
+        "assets": assets,
+        "strategies": strategies,
+        "win_patterns": win_patterns,
+        "loss_patterns": loss_patterns,
+    }
+
+
 class Engine:
     """Bot engine state & control."""
 
@@ -771,7 +1231,7 @@ class Engine:
         # Live-editable params (start from config, user can change via UI)
         self.bid_price: float = config.BID_PRICE
         self.tokens_per_side: int = config.TOKENS_PER_SIDE
-        self.bid_window_open: int = config.BID_WINDOW_OPEN    # seconds before close to start posting
+        self.bid_window_open: int = 60    # seconds before close to cancel loser side
         self.bid_window_close: int = config.BID_WINDOW_CLOSE  # seconds before close to stop posting
 
         # Per-asset full config (UI-editable).  Initialised from ASSET_FILTERS defaults.
@@ -790,22 +1250,30 @@ class Engine:
                 "expansion_max": f["expansion_max"],
                 "expansion_floor": f["expansion_floor"],
             }
-        # BTC enabled by default
+        # BTC + ETH + SOL + XRP enabled by default (SOL=95.7% WR, XRP=100% WR)
         self.asset_config["BTC"]["enabled"] = True
+        self.asset_config["ETH"]["enabled"] = True
+        self.asset_config["SOL"]["enabled"] = True
+        self.asset_config["XRP"]["enabled"] = True
 
         # Legacy accessor — btc_dollar_range still used by some log/push paths
         self.btc_dollar_range: float = self.asset_config["BTC"]["dollar_range"]
 
-        # Orderbook depth filter (log-only mode: enabled but thresholds at 0 = no blocking)
+        # Orderbook depth filter — NOW ACTIVE with real thresholds
         self.ob_filter_enabled: bool = True    # Master toggle for orderbook balance filter
-        self.ob_min_size: float = 0.0          # Min tokens at best ask on EACH side to allow bid (0=log only)
-        self.ob_max_imbalance: float = 0.0     # Max ratio between sides' ask sizes (0=log only)
+        self.ob_min_size: float = 50.0         # Min tokens at best ask on EACH side to allow bid (blocks thin books)
+        self.ob_max_imbalance: float = 5.0     # Max ratio between sides' ask sizes (blocks lopsided books)
 
         # BTC price tracking (legacy — read from btc_feed directly where possible)
         self.btc_price: float = 0.0           # Current BTC price from Binance
         self.btc_candle_open: float = 0.0     # 5-min candle open price
         self.btc_distance: float = 0.0        # |current - open|
         self.btc_last_fetch: float = 0.0      # timestamp of last fetch
+
+        # ── Trade Frequency Controls ──────────────────────────────────────
+        self.min_cooldown_secs: float = 120.0     # Min 2 minutes between bids (any asset)
+        self.max_bids_per_hour: int = 6           # Max 6 bids per rolling hour
+        self._recent_bid_times: deque = deque(maxlen=100)  # Timestamps of recent bids
 
         # Activity log
         self.activity_log: deque = deque(maxlen=50)
@@ -826,6 +1294,11 @@ class Engine:
         # Markets where bids already failed — don't retry
         self.failed_markets: set[str] = set()
 
+        # ── Auto-Trade Toggle ──────────────────────────────────────────
+        # When False, bot loop still runs (monitoring, feeds, fills, cancels)
+        # but will NOT auto-place new orders via post_bids().
+        self.auto_trade_enabled: bool = False   # OFF by default — user trades manually
+
         # ── After-Hours Fill Tracker ──
         # Stores fill events that occurred close to market close (positive = pre-close,
         # negative = post-close). Cleared on bot restart; persists for the session.
@@ -834,6 +1307,11 @@ class Engine:
 
         # ── Post-Close Monitor (watches ALL markets, not just ones we bid on) ──
         self.pcm: PostCloseMonitor = PostCloseMonitor()
+
+        # ── Manual Trade Journal ─────────────────────────────────────────
+        # Comprehensive tracker for manual trades — captures every data point
+        # for pattern analysis of winners vs losers.
+        self.trade_journal: deque = deque(maxlen=5000)
 
         # ── Market Scanner ──
         self.scanner_results: list[dict] = []      # List of dicts for dashboard
@@ -855,6 +1333,25 @@ class Engine:
             "auto_bid_categories": [],  # Categories eligible for auto-bid (empty = none)
         }
 
+        # ── Combined-Ask Arbitrage Engine ──
+        self.arb: ArbEngine | None = None  # Initialized after ws_feed.start()
+
+    def init_arb(self):
+        """Initialize the arb engine (call after ws_feed is ready)."""
+        self.arb = ArbEngine(self.ws_feed)
+        self.arb.log_callback = self.add_log
+        # Apply any saved settings from settings.json
+        cfg = getattr(self, '_arb_saved_cfg', None)
+        if cfg and isinstance(cfg, dict):
+            self.arb.enabled = bool(cfg.get("enabled", self.arb.enabled))
+            self.arb.min_edge = float(cfg.get("min_edge", self.arb.min_edge))
+            self.arb.trade_size = float(cfg.get("trade_size", self.arb.trade_size))
+            self.arb.max_positions = int(cfg.get("max_positions", self.arb.max_positions))
+            self.arb.cooldown = float(cfg.get("cooldown", self.arb.cooldown))
+            self.arb.fill_timeout = float(cfg.get("fill_timeout", self.arb.fill_timeout))
+            self.arb.max_daily_spend = float(cfg.get("max_daily_spend", self.arb.max_daily_spend))
+            log.info(f"[ARB] Restored settings: enabled={self.arb.enabled}, edge={self.arb.min_edge}, size=${self.arb.trade_size}")
+
     def reset_daily_counter(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.bid_date:
@@ -872,6 +1369,7 @@ class Engine:
 
 engine = Engine()
 _ah_load()   # Restore persisted after-hours events from disk
+_tj_load()   # Restore persisted trade journal entries from disk
 
 
 # ── Price Sync from Binance ──────────────────────────────────────────────────
@@ -988,10 +1486,15 @@ def _log_bid_eval(market: MarketWindow, secs: float):
 
 
 def post_bids(market: MarketWindow) -> bool:
-    """Post limit BUY on both Up and Down sides."""
+    """PHASE 1 — Queue Early: Place BOTH sides immediately to get front-of-queue.
+    Only queues the NEXT upcoming market per asset (one at a time).
+    The smart cancel (Phase 2) runs later at T-20s to drop the loser."""
     if market.market_id in engine.bids_posted:
         return False
     if market.market_id in engine.failed_markets:
+        return False
+    # Skip if arb engine already has a position on this market
+    if engine.arb and market.market_id in engine.arb.positions:
         return False
 
     secs = seconds_until(market.end_time)
@@ -999,138 +1502,45 @@ def post_bids(market: MarketWindow) -> bool:
     # ── Per-Asset Enabled Check ────────────────────────────────────────────
     asset = market.asset
     ac = engine.asset_config.get(asset, {})
-
-    # Per-asset bid window (fall back to global)
-    asset_window_open = ac.get("bid_window_open", engine.bid_window_open)
-    if secs > asset_window_open or secs < engine.bid_window_close:
-        return False
     if not ac.get("enabled", False):
         return False   # asset disabled by user — silently skip
 
-    # ── Per-Asset Compression / Indecision Filters ──────────────────────────
-    # Every asset with Binance candle data gets its own riding-the-line
-    # thresholds (distance%, candle range, dollar range, expansion).
-    # All thresholds are now read from engine.asset_config (UI-editable).
-    af_defaults = get_asset_filter(asset)   # static fallbacks
-    af = {k: ac.get(k, af_defaults.get(k, 0)) for k in af_defaults}
-    ast = engine.btc_feed.get(asset)  # AssetState from multi-asset feed
+    # ── ONE market per asset at a time ─────────────────────────────────────
+    # Only queue the next upcoming market. If this asset already has a bid
+    # whose cancel phase hasn't completed yet, skip. Once the cancel phase
+    # is done (at T-20s), we immediately release the slot so the NEXT market
+    # can be queued ~4+ minutes early → maximum queue priority.
+    for _mid, _bid in engine.bids_posted.items():
+        _mkt = engine.watch_list.get(_mid)
+        if _mkt and getattr(_mkt, 'asset', '') == asset:
+            if not _bid.cancel_phase_done:
+                return False  # cancel phase not yet done — hold the slot
 
-    if ast and ast.price > 0 and ast.candle_open > 0:
-        # Dollar range filter (per-asset, UI-editable)
-        dollar_limit = af["dollar_range"]
-        if dollar_limit > 0:
-            if ast.distance > dollar_limit:
-                engine.add_log(
-                    f"SKIP ({asset} moved ${ast.distance:.4f} > ${dollar_limit:.4f} limit)  {market.question}",
-                    "warn",
-                )
-                return False
-
-        dist_pct = ast.distance / ast.price
-
-        # Filter 1: Too directional (% from open)
-        if dist_pct > af["distance_pct_max"]:
-            engine.add_log(
-                f"BID-SKIP ({asset} directional {dist_pct*100:.3f}% > {af['distance_pct_max']*100:.3f}%)  "
-                f"{market.question}  [{secs:.0f}s]",
-                "warn",
-            )
-            return False
-
-        # Filter 2: Large candle range = momentum, not compression
-        if ast.candle_range > af["candle_range_max"]:
-            engine.add_log(
-                f"BID-SKIP ({asset} candle_range ${ast.candle_range:.4f} > ${af['candle_range_max']:.4f})  "
-                f"{market.question}  [{secs:.0f}s]",
-                "warn",
-            )
-            return False
-
-        # Filter 3: Range expanding vs prior candle
-        if ast.prior_candle_range > 0 and ast.candle_range > 0:
-            expansion = ast.candle_range / ast.prior_candle_range
-            if expansion > af["expansion_max"] and ast.candle_range > af["expansion_floor"]:
-                engine.add_log(
-                    f"BID-SKIP ({asset} range expanding {expansion:.1f}x, "
-                    f"${ast.candle_range:.4f} vs prior ${ast.prior_candle_range:.4f})  "
-                    f"{market.question}  [{secs:.0f}s]",
-                    "warn",
-                )
-                return False
-
-    # ── Price symmetry filter — both sides must be cheap & balanced ─────
-    ws_up = engine.ws_feed.get_price(market.token_id_up)
-    ws_down = engine.ws_feed.get_price(market.token_id_down)
-
-    if ws_up and ws_up.valid and ws_down and ws_down.valid:
-        up_ask = ws_up.best_ask
-        dn_ask = ws_down.best_ask
-
-        # Filter 4: One side already expensive (market decided, single-fill trap)
-        if up_ask > 0.70 or dn_ask > 0.70:
-            engine.add_log(
-                f"BID-SKIP (side decided: UP=${up_ask:.2f} DN=${dn_ask:.2f})  {market.question}  [{secs:.0f}s]",
-                "warn",
-            )
-            return False
-
-        # Filter 5: Price symmetry — both sides should be similarly priced
-        # When prices are balanced (e.g., 0.50/0.50 or 0.45/0.55), market is
-        # indecisive and both-fill more likely. Asymmetric = adverse selection.
-        ask_diff = abs(up_ask - dn_ask)
-        if ask_diff > 0.25:
-            engine.add_log(
-                f"BID-SKIP (asymmetric: UP=${up_ask:.2f} DN=${dn_ask:.2f} diff={ask_diff:.2f})  "
-                f"{market.question}  [{secs:.0f}s]",
-                "warn",
-            )
-            return False
-
-    # ── Orderbook depth filter ──────────────────────────────────────────
-    ob_detail = _build_ob_detail(ws_up, ws_down, market)
-
-    if engine.ob_filter_enabled and ws_up.valid and ws_down.valid:
-        up_ask_size = ws_up.best_ask_size
-        down_ask_size = ws_down.best_ask_size
-
-        # Check minimum size on each side
-        if engine.ob_min_size > 0:
-            if up_ask_size < engine.ob_min_size or down_ask_size < engine.ob_min_size:
-                thin_side = "UP" if up_ask_size < down_ask_size else "DOWN"
-                engine.add_log(
-                    f"SKIP (thin book: {thin_side} ask_size={min(up_ask_size, down_ask_size):.0f} < {engine.ob_min_size:.0f})  "
-                    f"UP={up_ask_size:.0f} DOWN={down_ask_size:.0f}  {market.question}",
-                    "warn",
-                )
-                _log_ob_filter(market, ob_detail, "thin_book", secs)
-                return False
-
-        # Check imbalance between sides
-        if engine.ob_max_imbalance > 0 and up_ask_size > 0 and down_ask_size > 0:
-            ratio = max(up_ask_size, down_ask_size) / min(up_ask_size, down_ask_size)
-            if ratio > engine.ob_max_imbalance:
-                heavy_side = "UP" if up_ask_size > down_ask_size else "DOWN"
-                engine.add_log(
-                    f"SKIP (imbalanced: {heavy_side} heavy {ratio:.1f}x > {engine.ob_max_imbalance:.1f}x)  "
-                    f"UP={up_ask_size:.0f} DOWN={down_ask_size:.0f}  {market.question}",
-                    "warn",
-                )
-                _log_ob_filter(market, ob_detail, "imbalanced", secs)
-                return False
-
-        # Passed filter — log it for data collection
-        _log_ob_filter(market, ob_detail, "PASSED", secs)
-    elif engine.ob_filter_enabled:
-        # WS data not valid — log but don't block (allow bid)
-        _log_ob_filter(market, ob_detail, "no_ws_data", secs)
+    # Don't post if market already closed
+    if secs < engine.bid_window_close:
+        return False
 
     if config.MAX_BIDS_PER_DAY > 0 and engine.bids_today >= config.MAX_BIDS_PER_DAY:
         return False
 
+    # ── Cooldown between trades ────────────────────────────────────────
+    if engine._recent_bid_times:
+        last_bid_time = engine._recent_bid_times[-1]
+        elapsed = time.time() - last_bid_time
+        if elapsed < engine.min_cooldown_secs:
+            return False  # Too soon after last bid — silently skip
+
+    # ── Hourly rate limit ──────────────────────────────────────────────
+    now_check = time.time()
+    hour_ago = now_check - 3600.0
+    bids_last_hour = sum(1 for t in engine._recent_bid_times if t > hour_ago)
+    if bids_last_hour >= engine.max_bids_per_hour:
+        return False  # Hourly cap hit — silently skip
+
     # ── Adaptive Learner Gate ───────────────────────────────────────────
-    # Extract features from the market's asset feed (BTC, ETH, SOL, XRP).
-    # The learner's feature names still say "btc_" for backward compat with
-    # stored model weights; the values come from the correct asset though.
+    ws_up = engine.ws_feed.get_price(market.token_id_up)
+    ws_down = engine.ws_feed.get_price(market.token_id_down)
+
     _ast = engine.btc_feed.get(market.asset)
     if _ast and _ast.price > 0 and _ast.candle_high > 0:
         candle_range = _ast.candle_range
@@ -1169,13 +1579,43 @@ def post_bids(market: MarketWindow) -> bool:
         )
         return False
 
-    engine.add_log(
-        f"AI {reason}  {market.question}",
-        "info",
-    )
-    # ────────────────────────────────────────────────────────────────────
+    # ── Orderbook Depth Filter (blocks thin/lopsided books) ────────────
+    if engine.ob_filter_enabled and (engine.ob_min_size > 0 or engine.ob_max_imbalance > 0):
+        _ws_up_f = engine.ws_feed.get_price(market.token_id_up)
+        _ws_dn_f = engine.ws_feed.get_price(market.token_id_down)
+        ob_blocked = False
+        ob_reason = ""
 
-    # Use live-editable values — per-asset bid price & tokens, clamped by hard safety caps
+        if _ws_up_f.valid and _ws_dn_f.valid:
+            _up_sz = _ws_up_f.best_ask_size
+            _dn_sz = _ws_dn_f.best_ask_size
+            _min_sz = min(_up_sz, _dn_sz)
+            _imbal = (max(_up_sz, _dn_sz) / min(_up_sz, _dn_sz)) if _min_sz > 0 else 999.0
+
+            if engine.ob_min_size > 0 and _min_sz < engine.ob_min_size:
+                ob_blocked = True
+                ob_reason = f"thin_book (min_ask_size={_min_sz:.0f} < {engine.ob_min_size:.0f})"
+            elif engine.ob_max_imbalance > 0 and _imbal > engine.ob_max_imbalance:
+                ob_blocked = True
+                ob_reason = f"lopsided (imbalance={_imbal:.1f}x > {engine.ob_max_imbalance:.1f}x)"
+        else:
+            # No WS data available — block by default (don't bid blind)
+            ob_blocked = True
+            ob_reason = "no_ws_data (refusing to bid blind)"
+
+        if ob_blocked:
+            engine.add_log(
+                f"OB BLOCK: {ob_reason}  {market.question}  [{secs:.0f}s left]",
+                "warn",
+            )
+            # Log the OB filter decision
+            _log_ob_filter(market,
+                {"reason": ob_reason, "up_ask_size": _ws_up_f.best_ask_size if _ws_up_f.valid else 0,
+                 "down_ask_size": _ws_dn_f.best_ask_size if _ws_dn_f.valid else 0},
+                f"BLOCKED_{ob_reason.split('(')[0].strip()}", secs)
+            return False
+
+    # ── Calculate price & tokens ──────────────────────────────────────
     ac = engine.asset_config.get(asset, {})
     asset_tokens = ac.get("tokens_per_side", engine.tokens_per_side)
     tokens = min(asset_tokens, config.HARD_MAX_TOKENS)
@@ -1186,7 +1626,7 @@ def post_bids(market: MarketWindow) -> bool:
         f"global_bid={engine.bid_price} resolved={asset_bid_price} "
         f"cap={config.HARD_MAX_BID_PRICE} final={price}"
     )
-    total_cost = price * tokens * 2
+    total_cost = price * tokens * 2  # always 2 sides at queue time
 
     if total_cost > config.MAX_RISK_PER_MARKET:
         tokens = int(config.MAX_RISK_PER_MARKET / (price * 2))
@@ -1204,8 +1644,8 @@ def post_bids(market: MarketWindow) -> bool:
         return False
 
     engine.add_log(
-        f"POSTING BIDS [{market.asset}]: {market.question}  ${price} x {tokens}/side  "
-        f"(${total_cost:.2f} if both fill)  [{secs:.0f}s left]",
+        f"QUEUE-EARLY [{market.asset}] UP+DOWN: {market.question}  ${price} x {tokens}  "
+        f"(${total_cost:.2f} max cost)  [{secs:.0f}s left]  — cancel loser at T-{engine.bid_window_open}s",
         "trade",
     )
 
@@ -1214,6 +1654,7 @@ def post_bids(market: MarketWindow) -> bool:
     bid.tokens = tokens
     bid.posted_at = time.time()
 
+    # Place BOTH sides for queue priority
     bid.order_id_up = place_limit_buy(
         token_id=market.token_id_up, price=price,
         size=tokens, market_id=market.market_id,
@@ -1225,7 +1666,7 @@ def post_bids(market: MarketWindow) -> bool:
 
     if not bid.order_id_up and not bid.order_id_down:
         err_detail = _pm.last_order_error or "unknown"
-        engine.add_log(f"BOTH bids FAILED: {err_detail}", "error")
+        engine.add_log(f"BID(s) FAILED: {err_detail}", "error")
         engine.errors += 1
         engine.failed_markets.add(market.market_id)
         return False
@@ -1234,13 +1675,12 @@ def post_bids(market: MarketWindow) -> bool:
     market.fired = True
     engine.bids_today += 1
     engine.markets_fired += 1
-    # NOTE: total_spent is now tracked in check_fills() when orders are actually matched
+    engine._recent_bid_times.append(time.time())  # Track for cooldown/rate-limit
 
     # Record features with learner for later outcome matching
     ai_learner.record_bid(market.market_id, ai_features)
 
     # ── Capture enrichment context at bid time ──────────────────────────
-    # Orderbook snapshot from WS feed
     ws_up = engine.ws_feed.get_price(market.token_id_up)
     ws_down = engine.ws_feed.get_price(market.token_id_down)
     ob_ctx = {}
@@ -1253,8 +1693,6 @@ def post_bids(market: MarketWindow) -> bool:
             "combined_ask": round(ws_up.best_ask + ws_down.best_ask, 4),
         }
 
-    # Asset price context (include candle_range for learner bootstrap)
-    # Keyed as "btc_*" for backward compat with log parsers / learner
     _bid_ast = engine.btc_feed.get(market.asset)
     _cr = _bid_ast.candle_range if (_bid_ast and _bid_ast.candle_high > 0) else 0.0
     btc_ctx = {
@@ -1269,16 +1707,13 @@ def post_bids(market: MarketWindow) -> bool:
         "btc_prior_candle_range": round(_bid_ast.prior_candle_range, 6) if (_bid_ast and _bid_ast.prior_candle_range > 0) else _fetch_prior_candle_range(),
     }
 
-    # Question / market metadata
     meta_ctx = {
         "question": market.question,
         "end_time": market.end_time.isoformat(),
     }
 
-    # Merge all enrichment into one dict
     enrichment = {**ob_ctx, **btc_ctx, **meta_ctx}
 
-    # Log
     if bid.order_id_up:
         log_trade(market.market_id, "UP", market.token_id_up,
                   price, tokens, bid.order_id_up, secs, paper=config.PAPER_TRADING,
@@ -1289,6 +1724,165 @@ def post_bids(market: MarketWindow) -> bool:
                   **enrichment)
 
     schedule_cancel(market)
+    return True
+
+
+# ── CANCEL_WINDOW: controlled by engine.bid_window_open (dashboard "Cancel At" setting) ──
+
+
+def cancel_loser_side(market: MarketWindow) -> bool:
+    """PHASE 2 — Cancel Late: At T-Ns (N = dashboard 'Cancel At'), read the
+    PRICE FEED to determine which side is winning and cancel the loser.
+
+    Primary signal: asset price vs candle open (above open → UP wins, below → DOWN).
+    Secondary signal: WS orderbook asks (UP_ask > DN_ask → UP leaning).
+    Fallback: if no price data AND no WS data → cancel BOTH (refuse blind)."""
+    bid = engine.bids_posted.get(market.market_id)
+    if not bid or bid.cancel_phase_done or bid.cancelled:
+        return False
+
+    secs = seconds_until(market.end_time)
+
+    # Only run once, at T-Ns or less (N = engine.bid_window_open, dashboard "Cancel At")
+    cancel_at = engine.bid_window_open
+    if secs > cancel_at:
+        return False
+
+    bid.cancel_phase_done = True  # Mark done so we don't run again
+
+    asset = market.asset
+
+    # ── Signal 1: Price Feed (primary — most reliable) ─────────────────
+    price_signal = None  # "UP", "DOWN", or None
+    _ast = engine.btc_feed.get(asset)
+    if _ast and _ast.price > 0 and _ast.candle_open > 0:
+        dist = _ast.price - _ast.candle_open
+        # If price is ABOVE candle open → market trending UP → cancel DOWN
+        # If price is BELOW candle open → market trending DOWN → cancel UP
+        # Dead-zone: if distance is tiny (within 0.001% of price) → uncertain
+        pct = abs(dist) / _ast.price if _ast.price > 0 else 0
+        if pct > 0.00001:  # any meaningful distance
+            price_signal = "UP" if dist > 0 else "DOWN"
+        engine.add_log(
+            f"CANCEL-SIGNAL [{asset}] price={_ast.price:.2f} open={_ast.candle_open:.2f} "
+            f"dist={dist:+.4f} ({pct*100:.4f}%) → signal={price_signal or 'FLAT'}  [{secs:.0f}s]",
+            "info",
+        )
+
+    # ── Signal 2: WS Orderbook asks (secondary) ────────────────────────
+    ws_up = engine.ws_feed.get_price(market.token_id_up)
+    ws_down = engine.ws_feed.get_price(market.token_id_down)
+    ob_signal = None  # "UP", "DOWN", or None
+    up_ask = 0.0
+    dn_ask = 0.0
+
+    if ws_up and ws_up.valid and ws_down and ws_down.valid:
+        up_ask = ws_up.best_ask
+        dn_ask = ws_down.best_ask
+        # Lower thresholds: even a slight lean (0.52/0.48) is meaningful
+        if up_ask > dn_ask + 0.02:   # UP ask higher → market says UP wins
+            ob_signal = "UP"
+        elif dn_ask > up_ask + 0.02:  # DN ask higher → market says DOWN wins
+            ob_signal = "DOWN"
+
+    # ── Combine signals ────────────────────────────────────────────────
+    cancel_up = False
+    cancel_down = False
+    decision = "KEEP_BOTH"
+
+    if price_signal == "UP":
+        # Price says UP wins → cancel DOWN
+        cancel_down = True
+        decision = "CANCEL_DOWN"
+        src = "PRICE"
+        if ob_signal == "UP":
+            src = "PRICE+OB"
+    elif price_signal == "DOWN":
+        # Price says DOWN wins → cancel UP
+        cancel_up = True
+        decision = "CANCEL_UP"
+        src = "PRICE"
+        if ob_signal == "DOWN":
+            src = "PRICE+OB"
+    elif ob_signal == "UP":
+        # No price signal but OB says UP
+        cancel_down = True
+        decision = "CANCEL_DOWN"
+        src = "OB-ONLY"
+    elif ob_signal == "DOWN":
+        # No price signal but OB says DOWN
+        cancel_up = True
+        decision = "CANCEL_UP"
+        src = "OB-ONLY"
+    elif not _ast or _ast.price <= 0:
+        # No price feed AND no WS data → truly blind, cancel both
+        if not (ws_up and ws_up.valid and ws_down and ws_down.valid):
+            decision = "CANCEL_BOTH_BLIND"
+        else:
+            # WS data exists but no lean either way → price is flat on the line
+            decision = "KEEP_BOTH"
+    else:
+        # Price is exactly on the open line, OB is neutral → keep both
+        decision = "KEEP_BOTH"
+
+    # ── Log decision ───────────────────────────────────────────────────
+    if cancel_down or cancel_up:
+        engine.add_log(
+            f"SMART-CANCEL [{asset}] {decision}({src}) KEEP-{'UP' if cancel_down else 'DOWN'}  "
+            f"UP${up_ask:.2f} DN${dn_ask:.2f}  {market.question}  [{secs:.0f}s]",
+            "trade",
+        )
+    elif decision == "CANCEL_BOTH_BLIND":
+        engine.add_log(
+            f"SMART-CANCEL [{asset}] CANCEL-BOTH (no price feed, no WS data)  "
+            f"{market.question}  [{secs:.0f}s]",
+            "warn",
+        )
+    else:
+        engine.add_log(
+            f"SMART-CANCEL [{asset}] KEEP-BOTH (flat/uncertain)  "
+            f"UP${up_ask:.2f} DN${dn_ask:.2f}  {market.question}  [{secs:.0f}s]",
+            "info",
+        )
+
+    # ── Execute cancellation ───────────────────────────────────────────
+    if cancel_down and bid.order_id_down and not bid.down_filled:
+        ok = cancel_order(bid.order_id_down)
+        if ok:
+            engine.add_log(f"  ↳ Cancelled DOWN order {bid.order_id_down[:12]}...", "cancel")
+            bid.order_id_down = None
+        else:
+            engine.add_log(f"  ↳ Failed to cancel DOWN order", "error")
+
+    if cancel_up and bid.order_id_up and not bid.up_filled:
+        ok = cancel_order(bid.order_id_up)
+        if ok:
+            engine.add_log(f"  ↳ Cancelled UP order {bid.order_id_up[:12]}...", "cancel")
+            bid.order_id_up = None
+        else:
+            engine.add_log(f"  ↳ Failed to cancel UP order", "error")
+
+    if decision == "CANCEL_BOTH_BLIND":
+        if bid.order_id_up and not bid.up_filled:
+            cancel_order(bid.order_id_up)
+            bid.order_id_up = None
+        if bid.order_id_down and not bid.down_filled:
+            cancel_order(bid.order_id_down)
+            bid.order_id_down = None
+
+    # Log OB data for analysis
+    ob_detail = {}
+    if ws_up and ws_up.valid and ws_down and ws_down.valid:
+        ob_detail = _build_ob_detail(ws_up, ws_down, market)
+    if _ast and _ast.price > 0:
+        ob_detail["asset_price"] = round(_ast.price, 6)
+        ob_detail["candle_open"] = round(_ast.candle_open, 6)
+        ob_detail["price_distance"] = round(_ast.price - _ast.candle_open, 6)
+    ob_detail["price_signal"] = price_signal
+    ob_detail["ob_signal"] = ob_signal
+    ob_detail["source"] = src if (cancel_down or cancel_up) else "none"
+    _log_ob_filter(market, ob_detail, decision, secs)
+
     return True
 
 
@@ -1479,6 +2073,47 @@ def check_fills():
                     )
             except Exception as e:
                 log_error(f"check_fill_down {mid}", e)
+
+        # ── IMMEDIATE CANCEL: When one side fills, cancel the other ──
+        # This prevents adverse selection: if the loser side fills,
+        # the winner side order was never going to fill anyway ($0.01
+        # for a $1 token). Cancel immediately to avoid the opposite
+        # side ALSO getting adversely filled.
+        if _new_up_fill and not bid.down_filled and bid.order_id_down:
+            try:
+                ok = cancel_order(bid.order_id_down)
+                if ok:
+                    engine.add_log(
+                        f"REACTIVE-CANCEL: UP filled → cancelled DOWN order {bid.order_id_down[:12]}…  {bid.question}",
+                        "cancel",
+                    )
+                    bid.order_id_down = None
+                    bid.cancel_phase_done = True
+                else:
+                    engine.add_log(
+                        f"REACTIVE-CANCEL: UP filled → FAILED to cancel DOWN  {bid.question}",
+                        "error",
+                    )
+            except Exception as e:
+                log_error(f"reactive_cancel_down {mid}", e)
+
+        if _new_down_fill and not bid.up_filled and bid.order_id_up:
+            try:
+                ok = cancel_order(bid.order_id_up)
+                if ok:
+                    engine.add_log(
+                        f"REACTIVE-CANCEL: DOWN filled → cancelled UP order {bid.order_id_up[:12]}…  {bid.question}",
+                        "cancel",
+                    )
+                    bid.order_id_up = None
+                    bid.cancel_phase_done = True
+                else:
+                    engine.add_log(
+                        f"REACTIVE-CANCEL: DOWN filled → FAILED to cancel UP  {bid.question}",
+                        "error",
+                    )
+            except Exception as e:
+                log_error(f"reactive_cancel_up {mid}", e)
 
         # ── After-Hours Fill Tracking ──
         # Record EVERY fill individually (UP/DOWN) as it happens.
@@ -1780,6 +2415,8 @@ def update_prices():
                 "combined": ws_up.best_ask + ws_down.best_ask,
                 "up_bid": ws_up.best_bid,
                 "down_bid": ws_down.best_bid,
+                "up_ask_size": ws_up.best_ask_size,
+                "down_ask_size": ws_down.best_ask_size,
                 "status": status,
                 "bid_price": bid.bid_price if bid else 0,
                 "up_filled": bid.up_filled if bid else False,
@@ -1825,7 +2462,8 @@ def bot_loop():
     data_rec.start()
     engine.ws_feed.start()
     engine.btc_feed.start()
-    engine.add_log("WebSocket feed + Binance WS + data recorder started", "info")
+    engine.init_arb()
+    engine.add_log("WebSocket feed + Binance WS + data recorder + ARB engine started", "info")
 
     # Bootstrap adaptive learner from historical trade logs
     try:
@@ -1886,30 +2524,57 @@ def bot_loop():
                     if near:
                         log.debug(f"BID-ITER near-window: {near}")
                     engine._last_bid_iter_debug = now_ts
-                for market_id, market in list(engine.watch_list.items()):
+                # Sort by soonest-ending first so each asset queues
+                # the next upcoming market (not a far-future one)
+                _sorted_markets = sorted(
+                    engine.watch_list.items(),
+                    key=lambda kv: kv[1].end_time,
+                )
+                for market_id, market in _sorted_markets:
                     if not engine.running:
                         break
-                    if market_id in engine.bids_posted:
-                        continue
                     secs = seconds_until(market.end_time)
+
+                    # ── PHASE 2: Cancel Late — cancel loser at T-Ns ──
+                    # Check FIRST so posted markets get their cancel phase
+                    if market_id in engine.bids_posted:
+                        bid_rec = engine.bids_posted[market_id]
+                        if not bid_rec.cancel_phase_done and secs <= engine.bid_window_open:
+                            cancel_loser_side(market)
+                        continue  # already posted — skip bid placement
+
                     # Activity log: show evaluation countdown during bid window
                     _ac = engine.asset_config.get(market.asset, {})
                     _asset_wo = _ac.get("bid_window_open", engine.bid_window_open)
                     in_eval = engine.bid_window_close <= secs <= _asset_wo + 5
-                    in_bid  = engine.bid_window_close <= secs <= _asset_wo
                     if in_eval and _bid_log_due:
                         try:
                             _log_bid_eval(market, secs)
                         except Exception as eval_err:
                             log.error(f"BID-EVAL error [{market.asset}]: {eval_err}")
                         engine._last_bid_eval_log = now_ts
-                    if in_bid:
+
+                    # ── PHASE 1: Queue Early — place BOTH sides ASAP ──
+                    if secs > engine.bid_window_close and engine.auto_trade_enabled:
                         post_bids(market)
 
             # Check fills
             if now_ts - last_fill_check >= 3.0:
                 check_fills()
                 last_fill_check = now_ts
+
+            # ── Combined-Ask Arbitrage scan ─────────────────────────────
+            if engine.arb and engine.arb.enabled:
+                for _arb_mid, _arb_mkt in engine.watch_list.items():
+                    if not engine.running:
+                        break
+                    # Skip markets we already have low-ball bids on
+                    if _arb_mid in engine.bids_posted:
+                        continue
+                    engine.arb.scan_opportunity(_arb_mkt)
+                # Check arb fills & cancel stale
+                engine.arb.check_fills()
+                engine.arb.cancel_stale()
 
             # Monitor OB imbalance for active bids (log-only, every 2s)
             if now_ts - last_ob_monitor >= 2.0 and engine.bids_posted:
@@ -2018,6 +2683,8 @@ def bot_loop():
 
     # Cleanup
     engine.add_log("Bot stopping...", "info")
+    if engine.arb:
+        engine.arb.shutdown()
     for timer in engine.cancel_timers.values():
         timer.cancel()
     for mid, bid in engine.bids_posted.items():
@@ -2157,6 +2824,20 @@ def push_state():
     # Sort markets by time remaining
     markets = sorted(engine.market_prices.values(), key=lambda m: m.get("secs", 9999))
 
+    # ALL watch_list markets for dropdown (even without WS data)
+    all_markets = []
+    for mid, mkt in engine.watch_list.items():
+        secs = seconds_until(mkt.end_time)
+        _tm = re.search(r'(\d{1,2}:\d{2}[AP]M\s*-\s*\d{1,2}:\d{2}[AP]M\s*ET)', mkt.question)
+        time_part = _tm.group(1) if _tm else (mkt.question[-24:] if len(mkt.question) > 24 else mkt.question)
+        all_markets.append({
+            "market_id": mid,
+            "name": f"[{mkt.asset}] {time_part}",
+            "asset": mkt.asset,
+            "secs": secs,
+        })
+    all_markets.sort(key=lambda m: m["secs"])
+
     # Bids summary
     bids_list = []
     for bid in engine.bids_posted.values():
@@ -2212,6 +2893,12 @@ def push_state():
         "scanner_cfg": dict(engine.scanner_cfg),
         "scanner_last_scan": engine.scanner_last_scan,
         "ah_count": len(engine.afterhours_events),
+        "auto_trade_enabled": engine.auto_trade_enabled,
+        "tj_count": len(engine.trade_journal),
+        "tj_entries": list(engine.trade_journal)[:200],
+        "all_markets": all_markets,
+        "arb": engine.arb.stats() if engine.arb else {},
+        "arb_positions": engine.arb.get_positions_list() if engine.arb else [],
     }
     socketio.emit("state", data)
 
@@ -2436,11 +3123,10 @@ def on_stop_bot():
 def on_update_params(data):
     """Live-update bid price, tokens, window open/close from the dashboard."""
     try:
-        new_price = float(data.get("bid_price", engine.bid_price))
+        new_price = 0.01  # Always fixed at $0.01
         new_tokens = int(data.get("tokens_per_side", engine.tokens_per_side))
 
         # Hard safety clamp — dashboard can NEVER exceed these
-        new_price = min(new_price, config.HARD_MAX_BID_PRICE)
         new_tokens = min(new_tokens, config.HARD_MAX_TOKENS)
         new_window_open = int(data.get("bid_window_open", engine.bid_window_open))
         new_window_close = int(data.get("bid_window_close", engine.bid_window_close))
@@ -2469,18 +3155,19 @@ def on_update_params(data):
                                     new_asset_config[ak][pk] = float(av[pk])
                                 except (ValueError, TypeError):
                                     pass
+        # Force all per-asset bid_price to $0.01 regardless of incoming data
+        for ak in new_asset_config:
+            new_asset_config[ak]["bid_price"] = 0.01
         new_ob_enabled = bool(data.get("ob_filter_enabled", engine.ob_filter_enabled))
         new_ob_min_size = float(data.get("ob_min_size", engine.ob_min_size))
         new_ob_max_imbalance = float(data.get("ob_max_imbalance", engine.ob_max_imbalance))
 
-        if new_price <= 0 or new_price > config.HARD_MAX_BID_PRICE:
-            engine.add_log(f"Invalid bid price: ${new_price} (must be $0.01-${config.HARD_MAX_BID_PRICE})", "error")
-            return
+        # new_price is always 0.01, no validation needed
         if new_tokens < 1 or new_tokens > config.HARD_MAX_TOKENS:
             engine.add_log(f"Invalid tokens: {new_tokens} (must be 1-{config.HARD_MAX_TOKENS})", "error")
             return
-        if new_window_open < 5 or new_window_open > 600:
-            engine.add_log(f"Invalid window open: {new_window_open}s (must be 5-600)", "error")
+        if new_window_open < 5 or new_window_open > 120:
+            engine.add_log(f"Invalid cancel-at: {new_window_open}s (must be 5-120)", "error")
             return
         if new_window_close < 0 or new_window_close > 300:
             engine.add_log(f"Invalid window close: {new_window_close}s (must be 0-300)", "error")
@@ -2497,12 +3184,12 @@ def on_update_params(data):
             if _at < 1 or _at > config.HARD_MAX_TOKENS:
                 engine.add_log(f"Invalid {_ak} shares/side: {_at} (must be 1-{config.HARD_MAX_TOKENS})", "error")
                 return
-            _aw = _acfg.get("bid_window_open", 120)
-            if _aw < 5 or _aw > 600:
-                engine.add_log(f"Invalid {_ak} bid start: {_aw}s (must be 5-600)", "error")
+            _aw = _acfg.get("bid_window_open", 30)
+            if _aw < 5 or _aw > 120:
+                engine.add_log(f"Invalid {_ak} cancel-at: {_aw}s (must be 5-120)", "error")
                 return
             if _aw <= new_window_close:
-                engine.add_log(f"{_ak} bid start ({_aw}s) must be > bid stop ({new_window_close}s)", "error")
+                engine.add_log(f"{_ak} cancel-at ({_aw}s) must be > bid stop ({new_window_close}s)", "error")
                 return
             dr = _acfg.get("dollar_range", 0)
             if dr < 0 or dr > 5000:
@@ -2525,7 +3212,7 @@ def on_update_params(data):
         if new_tokens != engine.tokens_per_side:
             changes.append(f"Shares {engine.tokens_per_side}->{new_tokens}")
         if new_window_open != engine.bid_window_open:
-            changes.append(f"Window Open {engine.bid_window_open}s->{new_window_open}s")
+            changes.append(f"Cancel At {engine.bid_window_open}s->{new_window_open}s")
         if new_window_close != engine.bid_window_close:
             changes.append(f"Window Close {engine.bid_window_close}s->{new_window_close}s")
         for _ak in sorted(new_asset_config):
@@ -2858,6 +3545,325 @@ def on_clear_afterhours():
     engine.afterhours_events.clear()
     _ah_save_all()   # clear the disk file too
     push_state()
+
+
+# ── Trade Journal Socket Events ──────────────────────────────────────────────
+
+@socketio.on("toggle_auto_trade")
+def on_toggle_auto_trade(data):
+    """Toggle auto-trade on/off from dashboard."""
+    val = data.get("enabled", False) if isinstance(data, dict) else False
+    engine.auto_trade_enabled = bool(val)
+    _save_settings()
+    engine.add_log(f"Auto-trade {'ENABLED' if engine.auto_trade_enabled else 'DISABLED'}", "trade")
+    push_state()
+
+
+# ── Arbitrage Socket Events ──────────────────────────────────────────────────
+
+@socketio.on("arb_toggle")
+def on_arb_toggle(data):
+    """Toggle arb engine on/off."""
+    if not engine.arb:
+        return
+    val = data.get("enabled", False) if isinstance(data, dict) else False
+    engine.arb.enabled = bool(val)
+    _save_settings()
+    engine.add_log(f"[ARB] {'ENABLED' if engine.arb.enabled else 'DISABLED'}", "trade")
+    push_state()
+
+
+@socketio.on("arb_update_params")
+def on_arb_update_params(data):
+    """Update arb engine parameters from dashboard."""
+    if not engine.arb or not isinstance(data, dict):
+        return
+    if "min_edge" in data:
+        engine.arb.min_edge = max(0.005, min(0.20, float(data["min_edge"])))
+    if "trade_size" in data:
+        engine.arb.trade_size = max(0.50, min(100.0, float(data["trade_size"])))
+    if "max_positions" in data:
+        engine.arb.max_positions = max(1, min(10, int(data["max_positions"])))
+    if "cooldown" in data:
+        engine.arb.cooldown = max(5, min(300, float(data["cooldown"])))
+    if "fill_timeout" in data:
+        engine.arb.fill_timeout = max(10, min(120, float(data["fill_timeout"])))
+    if "max_daily_spend" in data:
+        engine.arb.max_daily_spend = max(1.0, min(500.0, float(data["max_daily_spend"])))
+    _save_settings()
+    engine.add_log(
+        f"[ARB] Params updated: edge={engine.arb.min_edge:.3f} size=${engine.arb.trade_size:.2f} "
+        f"max_pos={engine.arb.max_positions} cooldown={engine.arb.cooldown:.0f}s "
+        f"timeout={engine.arb.fill_timeout:.0f}s daily_cap=${engine.arb.max_daily_spend:.0f}",
+        "info",
+    )
+    push_state()
+
+
+@socketio.on("arb_manual")
+def on_arb_manual(data):
+    """Manually trigger an arb on a specific market from the dashboard."""
+    if not engine.arb:
+        engine.add_log("[ARB] Engine not initialized", "error")
+        return
+    mid = data.get("market_id", "") if isinstance(data, dict) else ""
+    if not mid or mid not in engine.watch_list:
+        engine.add_log(f"[ARB] Market {mid[:12]} not in watch list", "error")
+        return
+    market = engine.watch_list[mid]
+    # Temporarily bypass cooldown for manual trigger
+    old_cd = engine.arb.cooldowns.pop(mid, None)
+    pos = engine.arb.scan_opportunity(market)
+    if not pos:
+        # Restore cooldown if scan failed
+        if old_cd is not None:
+            engine.arb.cooldowns[mid] = old_cd
+        engine.add_log(f"[ARB] No opportunity on {market.asset} (combined ask >= threshold)", "warn")
+    push_state()
+
+
+@socketio.on("tj_quick_snipe")
+def on_tj_quick_snipe(data):
+    """Quick snipe: rapidly place limit buys on both sides (or one side) and log to journal.
+    
+    data: { market_id, side ("UP"|"DOWN"|"BOTH"), price_cents (int 1-99), size (int) }
+    """
+    try:
+        mid = data.get("market_id", "")
+        side = data.get("side", "BOTH").upper()
+        price_cents = int(data.get("price_cents", 1))
+        price = round(price_cents / 100.0, 2)
+        size = int(data.get("size", 100))
+
+        market = engine.watch_list.get(mid)
+        if not market:
+            socketio.emit("qs_result", {"ok": False, "msg": f"Market not found"})
+            engine.add_log(f"[QS] Market {mid[:12]} not found", "error")
+            return
+
+        question = market.question
+        asset = market.asset
+
+        order_id_up = None
+        order_id_down = None
+
+        if side in ("UP", "BOTH"):
+            order_id_up = place_limit_buy(
+                token_id=market.token_id_up, price=price, size=size, market_id=mid
+            )
+        if side in ("DOWN", "BOTH"):
+            order_id_down = place_limit_buy(
+                token_id=market.token_id_down, price=price, size=size, market_id=mid
+            )
+
+        placed = []
+        if order_id_up: placed.append("UP")
+        if order_id_down: placed.append("DOWN")
+
+        if not placed:
+            socketio.emit("qs_result", {"ok": False, "msg": "Order placement failed"})
+            engine.add_log(f"[QS] FAILED snipe on {question[:50]}", "error")
+            return
+
+        # Log to trade journal
+        entry = tj_record_trade({
+            "market_id": mid,
+            "question": question,
+            "asset": asset,
+            "side": side,
+            "price": price,
+            "size": size,
+            "order_id": order_id_up or order_id_down or "",
+            "order_id_up": order_id_up or "",
+            "order_id_down": order_id_down or "",
+            "token_id_up": market.token_id_up,
+            "token_id_down": market.token_id_down,
+            "strategy": "quick_snipe",
+            "notes": f"Quick snipe {side} @ {price_cents}¢ x{size}",
+        })
+
+        sides_str = " + ".join(placed)
+        cost = price * size * len(placed)
+        msg = f"✅ {sides_str} placed @ {price_cents}¢ x{size} (${cost:.2f})"
+        socketio.emit("qs_result", {"ok": True, "msg": msg})
+        engine.add_log(f"[QS] {asset} {msg}", "success")
+        push_state()
+
+    except Exception as e:
+        socketio.emit("qs_result", {"ok": False, "msg": str(e)})
+        engine.add_log(f"[QS] Quick snipe error: {e}", "error")
+        log.exception("[QS] Quick snipe error")
+
+
+@socketio.on("tj_place_trade")
+def on_tj_place_trade(data):
+    """Place a manual trade and log it to the trade journal.
+    
+    data: { market_id, side ("UP"|"DOWN"|"BOTH"), price, size, notes, strategy, confidence, reason }
+    """
+    try:
+        mid = data.get("market_id", "")
+        side = data.get("side", "BOTH").upper()
+        price = float(data.get("price", 0.01))
+        size = int(data.get("size", 100))
+
+        market = engine.watch_list.get(mid)
+        if not market:
+            engine.add_log(f"[TJ] Market {mid[:12]} not found in watch_list", "error")
+            return
+
+        question = market.question
+        asset = market.asset
+
+        order_id_up = None
+        order_id_down = None
+        order_id = None
+
+        if side in ("UP", "BOTH"):
+            order_id_up = place_limit_buy(
+                token_id=market.token_id_up, price=price, size=size, market_id=mid
+            )
+
+        if side in ("DOWN", "BOTH"):
+            order_id_down = place_limit_buy(
+                token_id=market.token_id_down, price=price, size=size, market_id=mid
+            )
+
+        if side == "UP":
+            order_id = order_id_up
+        elif side == "DOWN":
+            order_id = order_id_down
+
+        if not order_id_up and not order_id_down and not order_id:
+            engine.add_log(f"[TJ] Order placement FAILED for {question[:50]}", "error")
+            return
+
+        entry = tj_record_trade({
+            "market_id": mid,
+            "question": question,
+            "asset": asset,
+            "side": side,
+            "price": price,
+            "size": size,
+            "order_id": order_id or "",
+            "order_id_up": order_id_up or "",
+            "order_id_down": order_id_down or "",
+            "token_id_up": market.token_id_up,
+            "token_id_down": market.token_id_down,
+            "notes": data.get("notes", ""),
+            "strategy": data.get("strategy", ""),
+            "confidence": data.get("confidence", ""),
+            "reason": data.get("reason", ""),
+        })
+
+        push_state()
+    except Exception as e:
+        engine.add_log(f"[TJ] Place trade error: {e}", "error")
+        log.exception("[TJ] Place trade error")
+
+
+@socketio.on("tj_log_only")
+def on_tj_log_only(data):
+    """Log a trade to the journal WITHOUT placing orders (already placed externally)."""
+    try:
+        entry = tj_record_trade(data)
+        push_state()
+    except Exception as e:
+        engine.add_log(f"[TJ] Log-only error: {e}", "error")
+
+
+@socketio.on("tj_update_entry")
+def on_tj_update_entry(data):
+    """Update a trade journal entry (notes, outcome, etc.)."""
+    try:
+        trade_id = data.pop("id", "")
+        if trade_id:
+            tj_update_trade(trade_id, data)
+            push_state()
+    except Exception as e:
+        engine.add_log(f"[TJ] Update error: {e}", "error")
+
+
+@socketio.on("tj_resolve")
+def on_tj_resolve(data):
+    """Resolve a trade journal entry: { id, winner: "Up"|"Down" }"""
+    try:
+        trade_id = data.get("id", "")
+        winner = data.get("winner", "")
+        if trade_id and winner:
+            tj_resolve_trade(trade_id, winner)
+            push_state()
+    except Exception as e:
+        engine.add_log(f"[TJ] Resolve error: {e}", "error")
+
+
+@socketio.on("tj_check_fills")
+def on_tj_check_fills_event():
+    """Manually trigger a fill check for all open journal trades."""
+    try:
+        tj_check_fills()
+        push_state()
+    except Exception as e:
+        engine.add_log(f"[TJ] Fill check error: {e}", "error")
+
+
+@socketio.on("tj_cancel_trade")
+def on_tj_cancel_trade(data):
+    """Cancel an open trade's orders and mark it cancelled in journal."""
+    try:
+        trade_id = data.get("id", "")
+        for entry in engine.trade_journal:
+            if entry.get("id") != trade_id:
+                continue
+            cancelled = 0
+            for oid_key in ("order_id", "order_id_up", "order_id_down"):
+                oid = entry.get(oid_key, "")
+                if oid:
+                    try:
+                        if cancel_order(oid):
+                            cancelled += 1
+                    except Exception:
+                        pass
+            entry["status"] = "cancelled"
+            entry["notes"] = (entry.get("notes", "") + " [CANCELLED]").strip()
+            _tj_save_all()
+            engine.add_log(f"[TJ] Cancelled trade {trade_id[:16]} ({cancelled} orders)", "info")
+            try:
+                socketio.emit("tj_updated", entry)
+            except Exception:
+                pass
+            push_state()
+            return
+    except Exception as e:
+        engine.add_log(f"[TJ] Cancel error: {e}", "error")
+
+
+@socketio.on("tj_get_stats")
+def on_tj_get_stats():
+    """Send computed trade journal stats to the requesting client."""
+    try:
+        stats = tj_get_stats()
+        socketio.emit("tj_stats", stats)
+    except Exception as e:
+        engine.add_log(f"[TJ] Stats error: {e}", "error")
+
+
+@socketio.on("tj_clear")
+def on_tj_clear():
+    """Clear all trade journal entries."""
+    engine.trade_journal.clear()
+    _tj_save_all()
+    push_state()
+    engine.add_log("Trade journal CLEARED", "info")
+
+
+@socketio.on("tj_export")
+def on_tj_export():
+    """Send full trade journal data for CSV export."""
+    try:
+        socketio.emit("tj_export_data", list(engine.trade_journal))
+    except Exception as e:
+        engine.add_log(f"[TJ] Export error: {e}", "error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3374,6 +4380,8 @@ DASHBOARD_HTML = r"""
   <button class="tab-btn active" onclick="switchTab('limit-bid')" id="tab-btn-limit-bid">Limit Bid Strategy</button>
   <button class="tab-btn" onclick="switchTab('scanner')" id="tab-btn-scanner">Market Scanner</button>
   <button class="tab-btn" onclick="switchTab('afterhours')" id="tab-btn-afterhours">After-Hours Fills <span id="ah-tab-badge" style="background:#0c2d4a;color:var(--cyan);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
+  <button class="tab-btn" onclick="switchTab('journal')" id="tab-btn-journal" style="background:linear-gradient(135deg,#0a1628,#0d2137);border:1px solid var(--green);">Trade Journal <span id="tj-tab-badge" style="background:#0c2d4a;color:var(--green);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
+  <button class="tab-btn" onclick="switchTab('arb')" id="tab-btn-arb" style="background:linear-gradient(135deg,#0a1628,#1a0a28);border:1px solid var(--purple);">Arb Engine <span id="arb-tab-badge" style="background:#1a0c2d;color:var(--purple);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
 </div>
 
 <!-- ══════ TAB 1: LIMIT BID STRATEGY ══════ -->
@@ -3381,50 +4389,44 @@ DASHBOARD_HTML = r"""
 
 <!-- ── Controls ── -->
 <div class="controls">
+  <!-- Bid price is ALWAYS $0.01 — shown as label, not editable -->
+  <input type="hidden" id="inp-price" value="0.01">
   <div class="control-group">
-    <label>Bid $ (all)</label>
-    <input type="number" id="inp-price" step="0.01" min="0.01" max="0.50" value="{{ sv_bid_price }}">
+    <label style="color:var(--green); font-weight:700;">Bid: $0.01</label>
   </div>
   <div class="control-group">
-    <label>Shares/Side (all)</label>
-    <input type="number" id="inp-tokens" step="10" min="1" max="10000" value="{{ sv_tokens }}" title="Set all assets' shares/side at once">
+    <label>Shares/Side</label>
+    <input type="number" id="inp-tokens" step="10" min="1" max="10000" value="{{ sv_tokens }}" title="Shares to bid on each side per market">
   </div>
   <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
-    <label>Bid Start (all)</label>
-    <input type="number" id="inp-window-open" step="5" min="5" max="600" value="{{ sv_window_open }}" title="Set all assets' bid start time at once (seconds before close)">
+    <label>Cancel At (sec)</label>
+    <input type="number" id="inp-window-open" step="5" min="5" max="120" value="{{ sv_window_open }}" title="Cancel losing side this many seconds before close">
   </div>
-  <div class="control-group">
-    <label>Bid Stop (sec)</label>
-    <input type="number" id="inp-window-close" step="1" min="0" max="300" value="{{ sv_window_close }}" title="Seconds before close to STOP posting bids">
+  <input type="hidden" id="inp-window-close" value="{{ sv_window_close }}">
+
+  <!-- Market toggles — prominent checkboxes -->
+  <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
+    <label style="font-weight:700; color:var(--cyan); margin-bottom:2px;">Markets:</label>
   </div>
-  <!-- Per-asset enable toggles — full config in collapsible panel below -->
   {% for _a in ['BTC','ETH','SOL','XRP'] %}
-  <div class="control-group"{% if loop.first %} style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;"{% endif %}>
-    <label style="display:flex; align-items:center; gap:4px; cursor:pointer;">
-      <input type="checkbox" id="inp-enabled-{{ _a }}" {{ 'checked' if sv_asset_config.get(_a, {}).get('enabled') else '' }} title="Enable/disable {{ _a }} bidding">
+  <div class="control-group">
+    <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px; font-weight:600; padding:4px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg);" id="market-label-{{ _a }}">
+      <input type="checkbox" id="inp-enabled-{{ _a }}" {{ 'checked' if sv_asset_config.get(_a, {}).get('enabled') else '' }} title="Enable/disable {{ _a }}" onchange="updateMarketLabel('{{ _a }}')" style="width:16px; height:16px; cursor:pointer;">
       {{ _a }}
     </label>
   </div>
   {% endfor %}
-  <div class="control-group" style="border-left: 1px solid var(--border); padding-left: 16px; margin-left: 4px;">
-    <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
-      <input type="checkbox" id="inp-ob-filter" {{ 'checked' if sv_ob_enabled else '' }} title="Enable orderbook depth filter">
-      OB Filter
-    </label>
-  </div>
-  <div class="control-group">
-    <label>Min Size</label>
-    <input type="number" id="inp-ob-min-size" step="10" min="0" max="10000" value="{{ sv_ob_min_size }}" title="Minimum ask size on EACH side to allow bid. 0 = log only, no blocking">
-  </div>
-  <div class="control-group">
-    <label>Max Imbal</label>
-    <input type="number" id="inp-ob-max-imbalance" step="0.5" min="0" max="100" value="{{ sv_ob_max_imbalance }}" title="Max ratio between sides ask sizes (larger/smaller). 0 = log only, no blocking">
-  </div>
+
+  <!-- OB Filter (hidden inputs — keep functionality but remove from main bar) -->
+  <input type="hidden" id="inp-ob-filter" {{ 'checked' if sv_ob_enabled else '' }}>
+  <input type="hidden" id="inp-ob-min-size" value="{{ sv_ob_min_size }}">
+  <input type="hidden" id="inp-ob-max-imbalance" value="{{ sv_ob_max_imbalance }}">
+
   <button class="btn btn-apply" id="btn-apply" onclick="applyParams()">Apply</button>
   <div class="cost-preview">
-    Cost/mkt: <span class="val" id="cost-preview">--</span>
-    &nbsp;|&nbsp; Payout/mkt: <span class="val" id="payout-preview">--</span>
-    &nbsp;|&nbsp; Profit/mkt: <span class="val" id="profit-preview">--</span>
+    Max Cost/mkt: <span class="val" id="cost-preview">--</span>
+    &nbsp;|&nbsp; Payout: <span class="val" id="payout-preview">--</span>
+    &nbsp;|&nbsp; Profit: <span class="val" id="profit-preview">--</span>
     <span id="cost-per-asset" style="font-size:0.85em; opacity:0.7; margin-left:6px;"></span>
   </div>
   <div style="flex:1"></div>
@@ -3438,79 +4440,18 @@ DASHBOARD_HTML = r"""
   <button class="btn {{ 'btn-stop' if sv_running else 'btn-start' }}" id="btn-run" onclick="toggleBot()">{{ 'STOP BOT' if sv_running else 'START BOT' }}</button>
 </div>
 
-<!-- ── Per-Asset Filter Config (collapsible) ── -->
-<div id="asset-config-panel" style="background:var(--card); border-bottom:1px solid var(--border); padding:0 24px; max-height:0; overflow:hidden; transition:max-height 0.3s ease;">
-  <div style="padding:10px 0;">
-    <table style="width:100%; border-collapse:collapse; font-size:12px; font-family:monospace;">
-      <thead>
-        <tr style="color:var(--dim); text-transform:uppercase; font-weight:600;">
-          <th style="text-align:left; padding:4px 8px;">Asset</th>
-          <th style="text-align:center; padding:4px 8px;">Bid $ <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">The price you pay per share on each side (Up &amp; Down). Lower = cheaper but less likely to fill. Cost per market = bid $ &times; tokens &times; 2 sides.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Shares/Side <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Number of shares to bid on each side (Up &amp; Down) for this asset. Total cost = bid $ &times; shares &times; 2.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Bid Start <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Seconds before market close to START posting bids for this asset. Higher = earlier entry.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Dollar Range <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max dollar distance the asset price can be from the 5-min candle open before bids are skipped. Filters out markets where price has already moved too far. 0 = disabled.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Dist % Max <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max percentage distance from candle open as a decimal (e.g. 0.0008 = 0.08%). Skips markets where price has moved too far relative to the asset&rsquo;s value. 0 = disabled.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Candle Range Max <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max allowed high-low range (in $) of the current 5-min candle. Skips volatile candles where outcome is more unpredictable. 0 = disabled.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Expansion Max <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Max ratio of current candle range to prior candle range. Filters markets where volatility is expanding too fast (breakout candles). 0 = disabled.</span></span></th>
-          <th style="text-align:center; padding:4px 8px;">Expansion Floor <span class="info-tip"><span class="info-icon">i</span><span class="info-bubble">Minimum prior candle range (in $) required before the expansion filter activates. Prevents false expansion signals on tiny prior candles. 0 = disabled.</span></span></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for _a in ['BTC','ETH','SOL','XRP'] %}
-        {% set _c = sv_asset_config.get(_a, {}) %}
-        <tr style="border-top:1px solid var(--border);">
-          <td style="padding:6px 8px; font-weight:700; color:var(--cyan);">{{ _a }}</td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-bid_price" step="0.01" min="0.01" max="0.50"
-              value="{{ _c.get('bid_price', 0.02) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--green); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
-              title="{{ _a }}: Bid price per share">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-tokens_per_side" step="10" min="1" max="10000"
-              value="{{ _c.get('tokens_per_side', 100) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--yellow); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
-              title="{{ _a }}: Shares per side">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-bid_window_open" step="5" min="5" max="600"
-              value="{{ _c.get('bid_window_open', 120) }}" style="width:70px; background:var(--bg); border:1px solid var(--border); color:var(--yellow); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px; font-weight:700;"
-              title="{{ _a }}: Seconds before close to start bidding">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-dollar_range" step="any" min="0" max="5000"
-              value="{{ _c.get('dollar_range', 0) }}" style="width:80px; background:var(--bg); border:1px solid var(--border); color:var(--cyan); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px;"
-              title="{{ _a }}: max $ distance from candle open. 0=no filter">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-distance_pct_max" step="any" min="0" max="1"
-              value="{{ _c.get('distance_pct_max', 0) }}" style="width:80px; background:var(--bg); border:1px solid var(--border); color:var(--cyan); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px;"
-              title="{{ _a }}: max |price-open|/price as decimal (e.g. 0.0008 = 0.08%)">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-candle_range_max" step="any" min="0" max="99999"
-              value="{{ _c.get('candle_range_max', 0) }}" style="width:80px; background:var(--bg); border:1px solid var(--border); color:var(--cyan); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px;"
-              title="{{ _a }}: max 5-min candle high-low in $">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-expansion_max" step="any" min="0" max="100"
-              value="{{ _c.get('expansion_max', 0) }}" style="width:80px; background:var(--bg); border:1px solid var(--border); color:var(--cyan); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px;"
-              title="{{ _a }}: max candle_range / prior_candle_range multiplier">
-          </td>
-          <td style="text-align:center; padding:4px 4px;">
-            <input type="number" id="inp-ac-{{ _a }}-expansion_floor" step="any" min="0" max="99999"
-              value="{{ _c.get('expansion_floor', 0) }}" style="width:80px; background:var(--bg); border:1px solid var(--border); color:var(--cyan); padding:4px 6px; border-radius:3px; text-align:center; font-family:monospace; font-size:12px;"
-              title="{{ _a }}: min candle range $ for expansion rule to engage">
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-<div style="background:var(--card); border-bottom:1px solid var(--border); padding:0; text-align:center;">
-  <button onclick="toggleAssetPanel()" id="btn-asset-panel" style="background:none; border:none; color:var(--dim); cursor:pointer; font-size:11px; padding:3px 12px; font-family:monospace;">
-    &#9660; Asset Filters &#9660;
-  </button>
-</div>
+<!-- Per-asset hidden inputs (all synced from global controls) -->
+{% for _a in ['BTC','ETH','SOL','XRP'] %}
+{% set _c = sv_asset_config.get(_a, {}) %}
+<input type="hidden" id="inp-ac-{{ _a }}-bid_price" value="0.01">
+<input type="hidden" id="inp-ac-{{ _a }}-tokens_per_side" value="{{ _c.get('tokens_per_side', 100) }}">
+<input type="hidden" id="inp-ac-{{ _a }}-bid_window_open" value="{{ _c.get('bid_window_open', 30) }}">
+<input type="hidden" id="inp-ac-{{ _a }}-dollar_range" value="0">
+<input type="hidden" id="inp-ac-{{ _a }}-distance_pct_max" value="0">
+<input type="hidden" id="inp-ac-{{ _a }}-candle_range_max" value="0">
+<input type="hidden" id="inp-ac-{{ _a }}-expansion_max" value="0">
+<input type="hidden" id="inp-ac-{{ _a }}-expansion_floor" value="0">
+{% endfor %}
 
 <!-- ── Stats ── -->
 <div style="padding: 12px 24px 0 24px">
@@ -3901,6 +4842,329 @@ DASHBOARD_HTML = r"""
 
 </div><!-- /tab-afterhours -->
 
+<!-- ══════ TAB 4: TRADE JOURNAL ══════ -->
+<div class="tab-content" id="tab-journal">
+
+<!-- ── Auto-Trade Toggle + Actions Bar ── -->
+<div style="display:flex;align-items:center;gap:16px;padding:10px 16px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:12px;flex-wrap:wrap;">
+  <div style="display:flex;align-items:center;gap:8px;">
+    <span style="font-weight:700;color:var(--text);">Auto-Trade:</span>
+    <label style="position:relative;display:inline-block;width:48px;height:24px;cursor:pointer;">
+      <input type="checkbox" id="tj-auto-toggle" onchange="tjToggleAutoTrade()" style="opacity:0;width:0;height:0;">
+      <span style="position:absolute;top:0;left:0;right:0;bottom:0;background:#333;border-radius:12px;transition:.3s;" id="tj-auto-slider"></span>
+    </label>
+    <span id="tj-auto-label" style="font-size:12px;color:var(--dim);">OFF</span>
+  </div>
+  <div style="border-left:1px solid var(--border);height:20px;"></div>
+  <button class="btn btn-start" onclick="tjCheckFills()" style="padding:4px 12px;font-size:12px;">Check Fills</button>
+  <button class="btn" onclick="tjRequestStats()" style="padding:4px 12px;font-size:12px;background:var(--cyan);color:#000;">Refresh Stats</button>
+  <button class="btn" onclick="tjExport()" style="padding:4px 12px;font-size:12px;background:#444;color:var(--text);">Export CSV</button>
+  <button class="btn btn-stop" onclick="if(confirm('Clear ALL journal entries?')) tjClear()" style="padding:4px 12px;font-size:12px;">Clear All</button>
+  <div style="flex:1;"></div>
+  <span style="font-size:12px;color:var(--dim);" id="tj-summary">0 trades</span>
+</div>
+
+<!-- ── Manual Trade Entry Form ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px;">
+  <div style="font-weight:700;color:var(--green);margin-bottom:8px;font-size:14px;">📝 Log Manual Trade</div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+    <div style="flex:2;min-width:200px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Market (select from active)</label>
+      <select id="tj-market" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+        <option value="">-- Select Market --</option>
+      </select>
+    </div>
+    <div style="min-width:80px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Side</label>
+      <select id="tj-side" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+        <option value="BOTH">BOTH</option>
+        <option value="UP">UP only</option>
+        <option value="DOWN">DOWN only</option>
+      </select>
+    </div>
+    <div style="min-width:70px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Price</label>
+      <input type="number" id="tj-price" value="0.01" step="0.01" min="0.01" max="0.99" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+    </div>
+    <div style="min-width:70px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Size</label>
+      <input type="number" id="tj-size" value="100" step="10" min="1" max="10000" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+    </div>
+    <div style="min-width:100px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Strategy</label>
+      <select id="tj-strategy" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+        <option value="">None</option>
+        <option value="line_ride">Line Ride</option>
+        <option value="momentum">Momentum</option>
+        <option value="ob_read">OB Read</option>
+        <option value="scalp">Scalp</option>
+        <option value="fade">Fade</option>
+        <option value="reversal">Reversal</option>
+        <option value="breakout">Breakout</option>
+        <option value="quick_snipe">Quick Snipe</option>
+      </select>
+    </div>
+    <div style="min-width:80px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Confidence</label>
+      <select id="tj-confidence" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+        <option value="">-</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
+      </select>
+    </div>
+    <div style="flex:2;min-width:150px;">
+      <label style="font-size:11px;color:var(--dim);display:block;">Notes / Reason</label>
+      <input type="text" id="tj-notes" placeholder="Why this trade?" style="width:100%;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:12px;">
+    </div>
+    <button class="btn btn-start" onclick="tjPlaceTrade()" style="padding:6px 16px;font-size:13px;font-weight:700;">🎯 Place & Log</button>
+    <button class="btn" onclick="tjLogOnly()" style="padding:6px 12px;font-size:12px;background:#444;color:var(--text);" title="Log without placing order">Log Only</button>
+  </div>
+</div>
+
+<!-- ── Quick Snipe Bar ── -->
+<div style="background:linear-gradient(135deg,#0a1628,#102040);border:2px solid var(--green);border-radius:10px;padding:12px 16px;margin-bottom:12px;box-shadow:0 0 15px rgba(0,255,136,0.15);">
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <div style="font-weight:700;color:var(--green);font-size:15px;white-space:nowrap;">⚡ Quick Snipe</div>
+    <div style="display:flex;align-items:center;gap:6px;">
+      <label style="font-size:11px;color:var(--dim);white-space:nowrap;">Shares</label>
+      <input type="number" id="qs-size" value="100" step="10" min="1" max="10000" style="width:80px;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--green);border-radius:6px;font-size:14px;font-weight:700;text-align:center;">
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;">
+      <label style="font-size:11px;color:var(--dim);white-space:nowrap;">Price ¢</label>
+      <input type="number" id="qs-price" value="1" step="1" min="1" max="99" style="width:70px;padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--green);border-radius:6px;font-size:14px;font-weight:700;text-align:center;">
+      <span style="font-size:11px;color:var(--dim);">= $<span id="qs-price-dec">0.01</span></span>
+    </div>
+    <button onclick="tjQuickSnipe()" style="padding:8px 28px;font-size:15px;font-weight:900;background:linear-gradient(135deg,#00c853,#00e676);color:#000;border:none;border-radius:8px;cursor:pointer;box-shadow:0 0 12px rgba(0,200,83,0.4);transition:all 0.2s;white-space:nowrap;" onmouseover="this.style.transform='scale(1.05)';this.style.boxShadow='0 0 20px rgba(0,200,83,0.6)'" onmouseout="this.style.transform='scale(1)';this.style.boxShadow='0 0 12px rgba(0,200,83,0.4)'">
+      🚀 SNIPE BOTH SIDES
+    </button>
+    <div style="display:flex;align-items:center;gap:6px;">
+      <label style="font-size:11px;color:var(--dim);white-space:nowrap;">Side</label>
+      <select id="qs-side" style="padding:6px 8px;background:var(--bg);color:var(--text);border:1px solid var(--green);border-radius:6px;font-size:12px;">
+        <option value="BOTH" selected>BOTH</option>
+        <option value="UP">UP only</option>
+        <option value="DOWN">DOWN only</option>
+      </select>
+    </div>
+    <div style="flex:1;"></div>
+    <div id="qs-cost" style="font-size:13px;color:var(--cyan);font-weight:700;white-space:nowrap;">Cost: $2.00</div>
+    <div id="qs-status" style="font-size:12px;color:var(--dim);min-width:120px;text-align:right;"></div>
+  </div>
+</div>
+
+<!-- ── Stats Panel ── -->
+<div id="tj-stats-panel" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:12px;">
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Total Trades</div>
+    <div class="stat-value" id="tj-st-total">0</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Open</div>
+    <div class="stat-value" id="tj-st-open" style="color:var(--cyan);">0</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Wins</div>
+    <div class="stat-value green" id="tj-st-wins">0</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Losses</div>
+    <div class="stat-value red" id="tj-st-losses">0</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Win Rate</div>
+    <div class="stat-value" id="tj-st-winrate">0%</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Total PnL</div>
+    <div class="stat-value" id="tj-st-pnl">$0.00</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Best Trade</div>
+    <div class="stat-value green" id="tj-st-best">$0.00</div>
+  </div>
+  <div class="stat-card" style="text-align:center;padding:8px;">
+    <div class="stat-label">Worst Trade</div>
+    <div class="stat-value red" id="tj-st-worst">$0.00</div>
+  </div>
+</div>
+
+<!-- ── Pattern Comparison (Wins vs Losses) ── -->
+<div id="tj-patterns" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px;">
+  <div style="font-weight:700;color:var(--cyan);margin-bottom:8px;font-size:14px;">🔍 Pattern Analysis: Winners vs Losers</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div>
+      <div style="font-weight:600;color:var(--green);margin-bottom:6px;font-size:13px;">✅ Winner Patterns</div>
+      <div id="tj-win-patterns" style="font-size:12px;color:var(--dim);line-height:1.8;"></div>
+    </div>
+    <div>
+      <div style="font-weight:600;color:var(--red);margin-bottom:6px;font-size:13px;">❌ Loser Patterns</div>
+      <div id="tj-loss-patterns" style="font-size:12px;color:var(--dim);line-height:1.8;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Per-Asset Breakdown ── -->
+<div id="tj-asset-breakdown" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px;">
+  <div style="font-weight:700;color:var(--yellow);margin-bottom:8px;font-size:14px;">📊 Per-Asset Breakdown</div>
+  <div id="tj-asset-table-wrap"></div>
+</div>
+
+<!-- ── Trade Table ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;">
+  <div style="padding:8px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);">
+    <span style="font-weight:700;color:var(--text);font-size:14px;">Trade History</span>
+    <select id="tj-filter-status" onchange="tjRenderTable()" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:11px;">
+      <option value="all">All Status</option>
+      <option value="open">Open</option>
+      <option value="filled">Filled</option>
+      <option value="resolved">Resolved</option>
+      <option value="cancelled">Cancelled</option>
+    </select>
+    <select id="tj-filter-outcome" onchange="tjRenderTable()" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:11px;">
+      <option value="all">All Outcomes</option>
+      <option value="WIN">Wins</option>
+      <option value="LOSS">Losses</option>
+      <option value="BOTH">Both Filled</option>
+      <option value="pending">Pending</option>
+    </select>
+    <select id="tj-filter-asset" onchange="tjRenderTable()" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:11px;">
+      <option value="all">All Assets</option>
+      <option value="BTC">BTC</option>
+      <option value="ETH">ETH</option>
+      <option value="SOL">SOL</option>
+      <option value="XRP">XRP</option>
+    </select>
+    <div style="flex:1;"></div>
+    <span style="font-size:11px;color:var(--dim);" id="tj-filter-count">Showing 0 trades</span>
+  </div>
+  <div style="overflow-x:auto;max-height:500px;overflow-y:auto;">
+    <table class="data-table" style="width:100%;font-size:11px;">
+      <thead>
+        <tr style="position:sticky;top:0;background:var(--card);z-index:1;">
+          <th style="min-width:65px;">Time</th>
+          <th style="min-width:40px;">Asset</th>
+          <th style="min-width:35px;">Side</th>
+          <th style="min-width:45px;">Price</th>
+          <th style="min-width:35px;">Size</th>
+          <th style="min-width:50px;">Cost</th>
+          <th style="min-width:55px;">Status</th>
+          <th style="min-width:50px;">Outcome</th>
+          <th style="min-width:50px;">PnL</th>
+          <th style="min-width:60px;">OB State</th>
+          <th style="min-width:50px;">Distance</th>
+          <th style="min-width:55px;">Range%</th>
+          <th style="min-width:50px;">Secs Left</th>
+          <th style="min-width:60px;">Strategy</th>
+          <th style="min-width:50px;">Conf</th>
+          <th style="min-width:100px;">Notes</th>
+          <th style="min-width:80px;">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="tj-table-body">
+        <tr><td colspan="17" class="empty">No journal entries yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Expanded Trade Detail (hidden by default, shown on click) ── -->
+<div id="tj-detail-panel" style="display:none;background:var(--card);border:1px solid var(--green);border-radius:10px;padding:16px;margin-top:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+    <span style="font-weight:700;color:var(--green);font-size:14px;">📋 Trade Detail</span>
+    <button onclick="document.getElementById('tj-detail-panel').style.display='none'" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px;">✕</button>
+  </div>
+  <div id="tj-detail-content" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:12px;"></div>
+</div>
+
+</div><!-- /tab-journal -->
+
+<!-- ══════ TAB 5: ARB ENGINE ══════ -->
+<div class="tab-content" id="tab-arb">
+
+<!-- ── Arb Controls ── -->
+<div style="display:flex;align-items:center;gap:16px;padding:12px 16px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:12px;flex-wrap:wrap;">
+  <div style="display:flex;align-items:center;gap:8px;">
+    <span style="color:var(--purple);font-weight:700;">Combined-Ask Arbitrage</span>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+      <input type="checkbox" id="arb-enabled" onchange="arbToggle(this.checked)"
+             style="width:18px;height:18px;accent-color:var(--purple);">
+      <span id="arb-status-label" style="font-size:12px;color:var(--dim);">OFF</span>
+    </label>
+  </div>
+  <div style="flex:1;"></div>
+  <span id="arb-stats-summary" style="font-size:12px;color:var(--dim);"></span>
+</div>
+
+<!-- ── Arb Parameters ── -->
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:12px;">
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Min Edge (profit/share)</label>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <span style="color:var(--dim);">$</span>
+      <input type="number" id="arb-min-edge" step="0.005" min="0.005" max="0.20" value="0.03"
+             style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:80px;font-size:13px;">
+      <button onclick="arbSaveParams()" style="background:var(--purple);color:#fff;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;">Set</button>
+    </div>
+  </div>
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Trade Size ($/arb)</label>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <span style="color:var(--dim);">$</span>
+      <input type="number" id="arb-trade-size" step="0.50" min="0.50" max="100" value="5.00"
+             style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:80px;font-size:13px;">
+    </div>
+  </div>
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Max Positions</label>
+    <input type="number" id="arb-max-pos" step="1" min="1" max="10" value="3"
+           style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:60px;font-size:13px;">
+  </div>
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Cooldown (s)</label>
+    <input type="number" id="arb-cooldown" step="5" min="5" max="300" value="30"
+           style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:60px;font-size:13px;">
+  </div>
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Fill Timeout (s)</label>
+    <input type="number" id="arb-timeout" step="5" min="10" max="120" value="45"
+           style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:60px;font-size:13px;">
+  </div>
+  <div class="controls" style="padding:12px;">
+    <label style="font-size:11px;color:var(--dim);">Daily Cap ($)</label>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <span style="color:var(--dim);">$</span>
+      <input type="number" id="arb-daily-cap" step="1" min="1" max="500" value="25"
+             style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:6px;width:70px;font-size:13px;">
+    </div>
+  </div>
+</div>
+
+<!-- ── Live Combined Asks (shows edge on all watched markets) ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--purple);font-size:13px;">Live Combined Asks</span>
+    <span style="font-size:11px;color:var(--dim);">Green = arb opportunity (edge ≥ min)</span>
+  </div>
+  <div id="arb-live-markets" style="max-height:280px;overflow-y:auto;font-size:12px;"></div>
+</div>
+
+<!-- ── Arb Positions (active + recent resolved) ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--purple);font-size:13px;">Arb Positions</span>
+    <span id="arb-pnl-summary" style="font-size:12px;color:var(--dim);"></span>
+  </div>
+  <table class="data-table" style="width:100%;font-size:11px;">
+    <thead><tr>
+      <th>Asset</th><th>Combined</th><th>Edge</th><th>Shares</th>
+      <th>Cost</th><th>Up</th><th>Down</th><th>Profit</th><th>Status</th>
+    </tr></thead>
+    <tbody id="arb-positions-body"></tbody>
+  </table>
+</div>
+
+</div><!-- /tab-arb -->
+
 <script>
 const socket = io();
 let botRunning = {{ 'true' if sv_running else 'false' }};
@@ -3953,6 +5217,25 @@ _acAssets.forEach(a => _acFields.forEach(f => _acInputIds.push('inp-ac-' + a + '
   el.addEventListener('keydown', () => markDirty(id));
   el.addEventListener('mousedown', () => markDirty(id));
 });
+
+// ── Market toggle label styling ──
+function updateMarketLabel(asset) {
+  const cb = document.getElementById('inp-enabled-' + asset);
+  const lbl = document.getElementById('market-label-' + asset);
+  if (!cb || !lbl) return;
+  if (cb.checked) {
+    lbl.style.borderColor = 'var(--green)';
+    lbl.style.background = 'rgba(0,200,100,0.10)';
+    lbl.style.opacity = '1';
+  } else {
+    lbl.style.borderColor = '#555';
+    lbl.style.background = 'rgba(255,255,255,0.03)';
+    lbl.style.opacity = '0.5';
+  }
+  updateCostPreview();
+}
+// Init all market labels on load
+_acAssets.forEach(a => updateMarketLabel(a));
 
 // ── Scanner: Initialize category checkboxes from server ──
 (function initScannerCats() {
@@ -4022,68 +5305,39 @@ function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
 
 // ── Cost preview live update ──
 function updateCostPreview() {
-  let totalCost = 0;
-  let totalPayout = 0;
-  const parts = [];
+  const tokens = parseInt(document.getElementById('inp-tokens').value) || 0;
+  let enabledCount = 0;
+  const names = [];
   _acAssets.forEach(a => {
     const enEl = document.getElementById('inp-enabled-' + a);
-    if (!enEl || !enEl.checked) return;
-    const bp = parseFloat(document.getElementById('inp-ac-' + a + '-bid_price').value) || 0;
-    const t = parseInt(document.getElementById('inp-ac-' + a + '-tokens_per_side').value) || 0;
-    const c = bp * t * 2;
-    const p = t * 1.0;
-    totalCost += c;
-    totalPayout += p;
-    parts.push(a + ': $' + c.toFixed(2));
+    if (enEl && enEl.checked) { enabledCount++; names.push(a); }
   });
+  const totalCost = 0.01 * tokens * 2 * enabledCount;
+  const totalPayout = tokens * 1.0 * enabledCount;
   const totalProfit = totalPayout - totalCost;
-  if (parts.length === 0) {
+  if (enabledCount === 0) {
     document.getElementById('cost-preview').textContent = '--';
     document.getElementById('payout-preview').textContent = '--';
     document.getElementById('profit-preview').textContent = '--';
     document.getElementById('cost-per-asset').textContent = '(no assets enabled)';
-  } else if (parts.length === 1) {
-    document.getElementById('cost-preview').textContent = '$' + totalCost.toFixed(2);
-    document.getElementById('payout-preview').textContent = '$' + totalPayout.toFixed(2);
-    document.getElementById('profit-preview').textContent = '$' + totalProfit.toFixed(2);
-    document.getElementById('cost-per-asset').textContent = '';
   } else {
-    document.getElementById('cost-preview').textContent = '$' + totalCost.toFixed(2) + ' total';
+    document.getElementById('cost-preview').textContent = '$' + totalCost.toFixed(2) + (enabledCount > 1 ? ' total' : '');
     document.getElementById('payout-preview').textContent = '$' + totalPayout.toFixed(2);
     document.getElementById('profit-preview').textContent = '$' + totalProfit.toFixed(2);
-    document.getElementById('cost-per-asset').textContent = '(' + parts.join(' | ') + ')';
+    document.getElementById('cost-per-asset').textContent = enabledCount > 1 ? '(' + names.join(' | ') + ')' : '';
   }
 }
-// Listen to global inputs + all per-asset bid price & token changes
+// Listen to shares input + market toggles
 document.getElementById('inp-tokens').addEventListener('input', updateCostPreview);
 _acAssets.forEach(a => {
-  const bp = document.getElementById('inp-ac-' + a + '-bid_price');
-  if (bp) bp.addEventListener('input', updateCostPreview);
-  const tk = document.getElementById('inp-ac-' + a + '-tokens_per_side');
-  if (tk) tk.addEventListener('input', updateCostPreview);
   const en = document.getElementById('inp-enabled-' + a);
   if (en) en.addEventListener('change', updateCostPreview);
 });
 updateCostPreview();
 
-// ── Toggle asset config panel ──
-let assetPanelOpen = false;
-function toggleAssetPanel() {
-  const panel = document.getElementById('asset-config-panel');
-  const btn = document.getElementById('btn-asset-panel');
-  assetPanelOpen = !assetPanelOpen;
-  if (assetPanelOpen) {
-    panel.style.maxHeight = '300px';
-    btn.innerHTML = '&#9650; Asset Filters &#9650;';
-  } else {
-    panel.style.maxHeight = '0';
-    btn.innerHTML = '&#9660; Asset Filters &#9660;';
-  }
-}
-
 // ── Apply params ──
 function applyParams() {
-  const price = parseFloat(document.getElementById('inp-price').value);
+  const price = 0.01;  // Always fixed at $0.01
   const tokens = parseInt(document.getElementById('inp-tokens').value);
   const windowOpen = parseInt(document.getElementById('inp-window-open').value);
   const windowClose = parseInt(document.getElementById('inp-window-close').value);
@@ -4091,37 +5345,24 @@ function applyParams() {
   const obMinSize = parseFloat(document.getElementById('inp-ob-min-size').value);
   const obMaxImbalance = parseFloat(document.getElementById('inp-ob-max-imbalance').value);
 
-  // If user changed the global "Bid $", propagate to all per-asset bid prices
-  // so the top-level control acts as a "set all" master
-  if (isDirty('inp-price')) {
-    _acAssets.forEach(a => {
-      const el = document.getElementById('inp-ac-' + a + '-bid_price');
-      if (el) el.value = price;
-    });
-  }
-  // If user changed the global "Shares/Side", propagate to all per-asset tokens
-  if (isDirty('inp-tokens')) {
-    _acAssets.forEach(a => {
-      const el = document.getElementById('inp-ac-' + a + '-tokens_per_side');
-      if (el) el.value = tokens;
-    });
-  }
-  // If user changed the global "Bid Start", propagate to all per-asset window open
-  if (isDirty('inp-window-open')) {
-    _acAssets.forEach(a => {
-      const el = document.getElementById('inp-ac-' + a + '-bid_window_open');
-      if (el) el.value = windowOpen;
-    });
-  }
+  // Propagate global values to all per-asset hidden inputs
+  _acAssets.forEach(a => {
+    const bp = document.getElementById('inp-ac-' + a + '-bid_price');
+    if (bp) bp.value = 0.01;
+    const tk = document.getElementById('inp-ac-' + a + '-tokens_per_side');
+    if (tk) tk.value = tokens;
+    const wo = document.getElementById('inp-ac-' + a + '-bid_window_open');
+    if (wo) wo.value = windowOpen;
+  });
 
-  // Build full per-asset config from UI
+  // Build full per-asset config from hidden inputs
   const assetConfig = {};
   _acAssets.forEach(a => {
     assetConfig[a] = {
       enabled: document.getElementById('inp-enabled-' + a).checked,
-      bid_price: parseFloat(document.getElementById('inp-ac-' + a + '-bid_price').value) || 0.02,
-      tokens_per_side: parseInt(document.getElementById('inp-ac-' + a + '-tokens_per_side').value) || 100,
-      bid_window_open: parseInt(document.getElementById('inp-ac-' + a + '-bid_window_open').value) || 120,
+      bid_price: 0.01,
+      tokens_per_side: tokens,
+      bid_window_open: windowOpen,
       dollar_range: parseFloat(document.getElementById('inp-ac-' + a + '-dollar_range').value) || 0,
       distance_pct_max: parseFloat(document.getElementById('inp-ac-' + a + '-distance_pct_max').value) || 0,
       candle_range_max: parseFloat(document.getElementById('inp-ac-' + a + '-candle_range_max').value) || 0,
@@ -4194,38 +5435,31 @@ socket.on('state', (d) => {
     wl.textContent = 'OB: OFF';
   }
 
-  // Params (only update if user isn't editing — use dirty flag + activeElement)
-  if (!isDirty('inp-price') && document.activeElement.id !== 'inp-price')
-    document.getElementById('inp-price').value = d.bid_price;
+  // Params sync — bid price is always $0.01 (hidden), only sync tokens + window
+  document.getElementById('inp-price').value = 0.01;
   if (!isDirty('inp-tokens') && document.activeElement.id !== 'inp-tokens')
     document.getElementById('inp-tokens').value = d.tokens_per_side;
   if (!isDirty('inp-window-open') && document.activeElement.id !== 'inp-window-open')
     document.getElementById('inp-window-open').value = d.bid_window_open;
-  if (!isDirty('inp-window-close') && document.activeElement.id !== 'inp-window-close')
-    document.getElementById('inp-window-close').value = d.bid_window_close;
-  // Per-asset full config sync
+  document.getElementById('inp-window-close').value = d.bid_window_close;
+  // Per-asset config sync (all hidden inputs + market toggle checkboxes)
   if (d.asset_config) {
     _acAssets.forEach(a => {
       const cfg = d.asset_config[a];
       if (!cfg) return;
-      // Enabled checkbox (always sync — no dirty flag for checkboxes)
       const enEl = document.getElementById('inp-enabled-' + a);
       if (enEl) enEl.checked = cfg.enabled;
-      // Numeric filter params (respect dirty flag)
+      // Sync all hidden per-asset inputs
       _acFields.forEach(f => {
-        const id = 'inp-ac-' + a + '-' + f;
-        if (!isDirty(id) && document.activeElement.id !== id) {
-          const el = document.getElementById(id);
-          if (el && cfg[f] !== undefined) el.value = cfg[f];
-        }
+        const el = document.getElementById('inp-ac-' + a + '-' + f);
+        if (el && cfg[f] !== undefined) el.value = (f === 'bid_price') ? 0.01 : cfg[f];
       });
+      updateMarketLabel(a);
     });
   }
   document.getElementById('inp-ob-filter').checked = d.ob_filter_enabled;
-  if (!isDirty('inp-ob-min-size') && document.activeElement.id !== 'inp-ob-min-size')
-    document.getElementById('inp-ob-min-size').value = d.ob_min_size;
-  if (!isDirty('inp-ob-max-imbalance') && document.activeElement.id !== 'inp-ob-max-imbalance')
-    document.getElementById('inp-ob-max-imbalance').value = d.ob_max_imbalance;
+  document.getElementById('inp-ob-min-size').value = d.ob_min_size;
+  document.getElementById('inp-ob-max-imbalance').value = d.ob_max_imbalance;
   updateCostPreview();
 
   // BTC WS source indicator (WS vs REST fallback) — prices come via price_tick
@@ -4540,6 +5774,29 @@ socket.on('state', (d) => {
   // Just update the badge count from the lightweight ah_count field
   const ahBadge = document.getElementById('ah-tab-badge');
   if (ahBadge && d.ah_count != null) ahBadge.textContent = d.ah_count;
+
+  // ══════════ TRADE JOURNAL TAB ══════════
+  if (d.tj_entries) {
+    tjEntries = d.tj_entries;
+    tjRenderTable();
+  }
+  if (d.tj_count !== undefined) {
+    const tjBadge = document.getElementById('tj-tab-badge');
+    if (tjBadge) tjBadge.textContent = d.tj_count;
+    const tjSummary = document.getElementById('tj-summary');
+    if (tjSummary) tjSummary.textContent = d.tj_count + ' trades';
+  }
+  if (d.auto_trade_enabled !== undefined) {
+    tjSyncAutoToggle(d.auto_trade_enabled);
+  }
+  if (d.all_markets) {
+    tjPopulateMarkets(d.all_markets);
+  }
+
+  // ══════════ ARB ENGINE TAB ══════════
+  if (d.arb) {
+    arbUpdateUI(d.arb, d.arb_positions || [], d.markets || []);
+  }
 });
 
 // ── AH events: full list on connect, incremental on new fill ──
@@ -4985,6 +6242,594 @@ function updateThresholdLabel() {
 function applyLearnerParams() {
   const threshold = parseInt(document.getElementById('ai-threshold').value) / 100;
   socket.emit('update_learner_params', { confidence_threshold: threshold });
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TRADE JOURNAL JS
+// ══════════════════════════════════════════════════════════════════════════════
+
+let tjEntries = [];
+let tjStats = null;
+
+// ── Auto-trade toggle ──
+function tjToggleAutoTrade() {
+  const checked = document.getElementById('tj-auto-toggle').checked;
+  socket.emit('toggle_auto_trade', { enabled: checked });
+}
+function tjSyncAutoToggle(enabled) {
+  const tog = document.getElementById('tj-auto-toggle');
+  const slider = document.getElementById('tj-auto-slider');
+  const label = document.getElementById('tj-auto-label');
+  if (tog) tog.checked = enabled;
+  if (slider) slider.style.background = enabled ? 'var(--green)' : '#333';
+  if (label) {
+    label.textContent = enabled ? 'ON' : 'OFF';
+    label.style.color = enabled ? 'var(--green)' : 'var(--dim)';
+  }
+}
+
+// ── Place a manual trade ──
+function tjPlaceTrade() {
+  const mid = document.getElementById('tj-market').value;
+  if (!mid) { alert('Select a market first'); return; }
+  socket.emit('tj_place_trade', {
+    market_id: mid,
+    side: document.getElementById('tj-side').value,
+    price: parseFloat(document.getElementById('tj-price').value),
+    size: parseInt(document.getElementById('tj-size').value),
+    strategy: document.getElementById('tj-strategy').value,
+    confidence: document.getElementById('tj-confidence').value,
+    notes: document.getElementById('tj-notes').value,
+    reason: document.getElementById('tj-notes').value,
+  });
+  document.getElementById('tj-notes').value = '';
+}
+
+// ── Log-only (no order placement) ──
+// ── Quick Snipe ──
+function tjQuickSnipe() {
+  const mid = document.getElementById('tj-market').value;
+  if (!mid) { alert('Select a market first'); return; }
+  const btn = event.target.closest('button');
+  const origText = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '⏳ PLACING...';
+  btn.style.background = '#555';
+  const statusEl = document.getElementById('qs-status');
+  statusEl.textContent = 'Placing orders...';
+  statusEl.style.color = 'var(--cyan)';
+  socket.emit('tj_quick_snipe', {
+    market_id: mid,
+    side: document.getElementById('qs-side').value,
+    price_cents: parseInt(document.getElementById('qs-price').value),
+    size: parseInt(document.getElementById('qs-size').value),
+  });
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.innerHTML = origText;
+    btn.style.background = 'linear-gradient(135deg,#00c853,#00e676)';
+  }, 2000);
+}
+
+// Update cost display when inputs change
+document.addEventListener('DOMContentLoaded', () => {
+  function qsUpdateCost() {
+    const price = parseInt(document.getElementById('qs-price')?.value || 1);
+    const size = parseInt(document.getElementById('qs-size')?.value || 100);
+    const side = document.getElementById('qs-side')?.value || 'BOTH';
+    const priceDec = (price / 100).toFixed(2);
+    const sides = side === 'BOTH' ? 2 : 1;
+    const cost = (price / 100) * size * sides;
+    const decEl = document.getElementById('qs-price-dec');
+    if (decEl) decEl.textContent = priceDec;
+    const costEl = document.getElementById('qs-cost');
+    if (costEl) costEl.textContent = 'Cost: $' + cost.toFixed(2);
+  }
+  ['qs-price','qs-size','qs-side'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', qsUpdateCost);
+    if (el) el.addEventListener('change', qsUpdateCost);
+  });
+});
+
+socket.on('qs_result', (d) => {
+  const statusEl = document.getElementById('qs-status');
+  if (d.ok) {
+    statusEl.textContent = d.msg;
+    statusEl.style.color = 'var(--green)';
+  } else {
+    statusEl.textContent = '❌ ' + d.msg;
+    statusEl.style.color = 'var(--red)';
+  }
+  setTimeout(() => { statusEl.textContent = ''; }, 8000);
+});
+
+function tjLogOnly() {
+  const mid = document.getElementById('tj-market').value;
+  if (!mid) { alert('Select a market first'); return; }
+  socket.emit('tj_log_only', {
+    market_id: mid,
+    side: document.getElementById('tj-side').value,
+    price: parseFloat(document.getElementById('tj-price').value),
+    size: parseInt(document.getElementById('tj-size').value),
+    strategy: document.getElementById('tj-strategy').value,
+    confidence: document.getElementById('tj-confidence').value,
+    notes: document.getElementById('tj-notes').value,
+    reason: document.getElementById('tj-notes').value,
+  });
+  document.getElementById('tj-notes').value = '';
+}
+
+// ── Action buttons ──
+function tjCheckFills() { socket.emit('tj_check_fills'); }
+function tjRequestStats() { socket.emit('tj_get_stats'); }
+function tjExport() { socket.emit('tj_export'); }
+function tjClear() { socket.emit('tj_clear'); tjEntries = []; tjRenderTable(); }
+
+function tjCancelTrade(id) {
+  if (confirm('Cancel this trade and its orders?')) {
+    socket.emit('tj_cancel_trade', { id: id });
+  }
+}
+function tjResolveTrade(id, winner) {
+  socket.emit('tj_resolve', { id: id, winner: winner });
+}
+
+// ── Populate market dropdown from state ──
+function tjPopulateMarkets(markets) {
+  const sel = document.getElementById('tj-market');
+  if (!sel) return;
+  const curVal = sel.value;
+  let html = '<option value="">-- Select Market --</option>';
+  if (markets && markets.length > 0) {
+    // Show ALL active markets (not expired), sorted by time remaining (shortest first)
+    markets.filter(m => m.secs > 0).sort((a,b) => a.secs - b.secs).forEach(m => {
+      let timeStr;
+      if (m.secs < 60) timeStr = m.secs.toFixed(0) + 's';
+      else if (m.secs < 3600) timeStr = (m.secs/60).toFixed(1) + 'm';
+      else timeStr = (m.secs/3600).toFixed(1) + 'h';
+      const marker = m.secs < 300 ? '🔴 ' : m.secs < 600 ? '🟡 ' : '';
+      html += '<option value="' + m.market_id + '">' + marker + (m.name || m.asset || '?') + ' (' + timeStr + ')</option>';
+    });
+  }
+  sel.innerHTML = html;
+  if (curVal) sel.value = curVal;  // preserve selection
+}
+
+// ── Render trade table ──
+function tjRenderTable() {
+  const tbody = document.getElementById('tj-table-body');
+  if (!tbody) return;
+
+  const filterStatus = document.getElementById('tj-filter-status').value;
+  const filterOutcome = document.getElementById('tj-filter-outcome').value;
+  const filterAsset = document.getElementById('tj-filter-asset').value;
+
+  let filtered = tjEntries.filter(t => {
+    if (filterStatus !== 'all' && t.status !== filterStatus) return false;
+    if (filterOutcome !== 'all' && t.won !== filterOutcome) return false;
+    if (filterAsset !== 'all' && t.asset !== filterAsset) return false;
+    return true;
+  });
+
+  document.getElementById('tj-filter-count').textContent = 'Showing ' + filtered.length + ' trades';
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="17" class="empty">No matching trades</td></tr>';
+    return;
+  }
+
+  let html = '';
+  filtered.forEach(t => {
+    const pnlClass = t.pnl > 0 ? 'green' : t.pnl < 0 ? 'red' : '';
+    const pnlStr = t.status === 'resolved' ? (t.pnl >= 0 ? '+' : '') + '$' + t.pnl.toFixed(2) : '-';
+    const wonBadge = t.won === 'WIN' ? '<span style="color:var(--green);font-weight:700;">WIN</span>' :
+                     t.won === 'LOSS' ? '<span style="color:var(--red);font-weight:700;">LOSS</span>' :
+                     t.won === 'BOTH' ? '<span style="color:var(--cyan);font-weight:700;">BOTH</span>' :
+                     '<span style="color:var(--dim);">-</span>';
+    const statusBadge = t.status === 'open' ? '<span class="badge badge-active">open</span>' :
+                        t.status === 'filled' ? '<span class="badge badge-filled" style="background:#0a3014;color:var(--green);">filled</span>' :
+                        t.status === 'both_filled' ? '<span class="badge" style="background:#0a2030;color:var(--cyan);">both</span>' :
+                        t.status === 'resolved' ? '<span class="badge badge-resolved" style="background:#1a1a0a;color:var(--yellow);">done</span>' :
+                        t.status === 'cancelled' ? '<span class="badge" style="background:#2a0a0a;color:var(--red);">canx</span>' :
+                        '<span class="badge">' + (t.status||'-') + '</span>';
+    const obStr = t.up_ask > 0 ? 'U:' + t.up_ask.toFixed(2) + ' D:' + t.down_ask.toFixed(2) : '-';
+    const distStr = t.price_distance > 0 ? '$' + t.price_distance.toFixed(2) : '-';
+    const rangeStr = t.range_pct > 0 ? (t.range_pct * 100).toFixed(1) + '%' : '-';
+
+    let actions = '';
+    if (t.status === 'open' || t.status === 'filled' || t.status === 'both_filled') {
+      actions += '<button onclick="tjCancelTrade(\'' + t.id + '\')" style="font-size:10px;padding:2px 6px;background:#3a0a0a;color:var(--red);border:1px solid var(--red);border-radius:4px;cursor:pointer;margin:1px;">Cancel</button> ';
+    }
+    if ((t.status === 'filled' || t.status === 'both_filled') && t.won === 'pending') {
+      actions += '<button onclick="tjResolveTrade(\'' + t.id + '\',\'Up\')" style="font-size:10px;padding:2px 6px;background:#0a3014;color:var(--green);border:1px solid var(--green);border-radius:4px;cursor:pointer;margin:1px;">Up Won</button> ';
+      actions += '<button onclick="tjResolveTrade(\'' + t.id + '\',\'Down\')" style="font-size:10px;padding:2px 6px;background:#0a1430;color:var(--cyan);border:1px solid var(--cyan);border-radius:4px;cursor:pointer;margin:1px;">Down Won</button>';
+    }
+    actions += ' <button onclick="tjShowDetail(\'' + t.id + '\')" style="font-size:10px;padding:2px 6px;background:var(--bg);color:var(--dim);border:1px solid var(--border);border-radius:4px;cursor:pointer;margin:1px;">🔍</button>';
+
+    html += '<tr style="cursor:pointer;" ondblclick="tjShowDetail(\'' + t.id + '\')">' +
+      '<td>' + (t.time || '-') + '</td>' +
+      '<td style="font-weight:700;">' + (t.asset || '-') + '</td>' +
+      '<td>' + (t.side || '-') + '</td>' +
+      '<td>$' + (t.price||0).toFixed(2) + '</td>' +
+      '<td>' + (t.size||0) + '</td>' +
+      '<td>$' + (t.cost||0).toFixed(2) + '</td>' +
+      '<td>' + statusBadge + '</td>' +
+      '<td>' + wonBadge + '</td>' +
+      '<td class="' + pnlClass + '" style="font-weight:700;">' + pnlStr + '</td>' +
+      '<td style="font-size:10px;">' + obStr + '</td>' +
+      '<td>' + distStr + '</td>' +
+      '<td>' + rangeStr + '</td>' +
+      '<td>' + (t.secs_to_close > 0 ? t.secs_to_close.toFixed(0) + 's' : '-') + '</td>' +
+      '<td style="font-size:10px;">' + (t.strategy || '-') + '</td>' +
+      '<td style="font-size:10px;">' + (t.confidence || '-') + '</td>' +
+      '<td style="font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + (t.notes||'').replace(/"/g,'&quot;') + '">' + (t.notes || '-') + '</td>' +
+      '<td style="white-space:nowrap;">' + actions + '</td>' +
+      '</tr>';
+  });
+  tbody.innerHTML = html;
+}
+
+// ── Show full detail for a trade ──
+function tjShowDetail(id) {
+  const t = tjEntries.find(e => e.id === id);
+  if (!t) return;
+
+  const panel = document.getElementById('tj-detail-panel');
+  const content = document.getElementById('tj-detail-content');
+  panel.style.display = 'block';
+
+  const fmtRow = (label, val, color) => '<div style="padding:3px 0;border-bottom:1px solid var(--border);"><span style="color:var(--dim);font-size:11px;">' + label + ':</span> <span style="color:' + (color || 'var(--text)') + ';font-weight:600;">' + val + '</span></div>';
+
+  let leftHtml = '<div style="font-weight:700;color:var(--cyan);margin-bottom:6px;">Trade Info</div>';
+  leftHtml += fmtRow('ID', t.id);
+  leftHtml += fmtRow('Time', t.ts_str || t.time);
+  leftHtml += fmtRow('Market ID', (t.market_id||'').slice(0,16) + '...');
+  leftHtml += fmtRow('Question', t.question || '-');
+  leftHtml += fmtRow('Asset', t.asset);
+  leftHtml += fmtRow('Side', t.side, t.side === 'UP' ? 'var(--green)' : t.side === 'DOWN' ? 'var(--red)' : 'var(--cyan)');
+  leftHtml += fmtRow('Price', '$' + (t.price||0).toFixed(2));
+  leftHtml += fmtRow('Size', t.size);
+  leftHtml += fmtRow('Cost', '$' + (t.cost||0).toFixed(2));
+  leftHtml += fmtRow('Status', t.status);
+  leftHtml += fmtRow('Outcome', t.won, t.won === 'WIN' ? 'var(--green)' : t.won === 'LOSS' ? 'var(--red)' : 'var(--dim)');
+  leftHtml += fmtRow('PnL', t.pnl !== 0 ? '$' + t.pnl.toFixed(2) : '-', t.pnl > 0 ? 'var(--green)' : t.pnl < 0 ? 'var(--red)' : 'var(--dim)');
+  leftHtml += fmtRow('Winner', t.winner || 'pending');
+  leftHtml += fmtRow('Strategy', t.strategy || '-');
+  leftHtml += fmtRow('Confidence', t.confidence || '-');
+  leftHtml += fmtRow('Notes', t.notes || '-');
+
+  let rightHtml = '<div style="font-weight:700;color:var(--yellow);margin-bottom:6px;">Market Snapshot</div>';
+  rightHtml += fmtRow('Secs to Close', t.secs_to_close > 0 ? t.secs_to_close.toFixed(1) + 's' : '-');
+  rightHtml += fmtRow('Asset Price', t.asset_price > 0 ? '$' + t.asset_price.toFixed(2) : '-');
+  rightHtml += fmtRow('Candle Open', t.candle_open > 0 ? '$' + t.candle_open.toFixed(2) : '-');
+  rightHtml += fmtRow('Candle High', t.candle_high > 0 ? '$' + t.candle_high.toFixed(2) : '-');
+  rightHtml += fmtRow('Candle Low', t.candle_low > 0 ? '$' + t.candle_low.toFixed(2) : '-');
+  rightHtml += fmtRow('Candle Range', t.candle_range > 0 ? '$' + t.candle_range.toFixed(6) : '-');
+  rightHtml += fmtRow('Price Distance', t.price_distance > 0 ? '$' + t.price_distance.toFixed(6) : '-');
+  rightHtml += fmtRow('Distance %', t.price_distance_pct > 0 ? (t.price_distance_pct * 100).toFixed(4) + '%' : '-');
+  rightHtml += fmtRow('Range %', t.range_pct > 0 ? (t.range_pct * 100).toFixed(1) + '%' : '-');
+  rightHtml += fmtRow('Price vs Open', t.price_vs_open || '-', t.price_vs_open === 'ABOVE' ? 'var(--green)' : 'var(--red)');
+  rightHtml += fmtRow('Expansion Ratio', t.expansion_ratio > 0 ? t.expansion_ratio.toFixed(2) + 'x' : '-');
+  rightHtml += '<div style="font-weight:700;color:var(--cyan);margin-top:12px;margin-bottom:6px;">Order Book</div>';
+  rightHtml += fmtRow('Up Ask', t.up_ask > 0 ? '$' + t.up_ask.toFixed(4) + ' (' + (t.up_ask_size||0).toFixed(0) + ')' : '-');
+  rightHtml += fmtRow('Up Bid', t.up_bid > 0 ? '$' + t.up_bid.toFixed(4) + ' (' + (t.up_bid_size||0).toFixed(0) + ')' : '-');
+  rightHtml += fmtRow('Down Ask', t.down_ask > 0 ? '$' + t.down_ask.toFixed(4) + ' (' + (t.down_ask_size||0).toFixed(0) + ')' : '-');
+  rightHtml += fmtRow('Down Bid', t.down_bid > 0 ? '$' + t.down_bid.toFixed(4) + ' (' + (t.down_bid_size||0).toFixed(0) + ')' : '-');
+  rightHtml += fmtRow('Combined Ask', t.combined_ask > 0 ? '$' + t.combined_ask.toFixed(4) : '-');
+  rightHtml += fmtRow('Ask Diff', t.ask_diff > 0 ? '$' + t.ask_diff.toFixed(4) : '-');
+  rightHtml += fmtRow('OB Imbalance', t.ob_imbalance > 0 ? t.ob_imbalance.toFixed(2) + 'x ' + t.ob_heavy_side : '-');
+  rightHtml += '<div style="font-weight:700;color:var(--green);margin-top:12px;margin-bottom:6px;">Fill Info</div>';
+  rightHtml += fmtRow('Fill Time', t.fill_time || '-');
+  rightHtml += fmtRow('Up Filled', t.up_filled ? 'YES (' + (t.up_fill_size||0) + ')' : 'No', t.up_filled ? 'var(--green)' : 'var(--dim)');
+  rightHtml += fmtRow('Down Filled', t.down_filled ? 'YES (' + (t.down_fill_size||0) + ')' : 'No', t.down_filled ? 'var(--green)' : 'var(--dim)');
+  rightHtml += fmtRow('Payout', t.payout > 0 ? '$' + t.payout.toFixed(2) : '-');
+  rightHtml += fmtRow('Order Up', t.order_id_up ? t.order_id_up.slice(0,12) + '...' : '-');
+  rightHtml += fmtRow('Order Down', t.order_id_down ? t.order_id_down.slice(0,12) + '...' : '-');
+
+  content.innerHTML = '<div>' + leftHtml + '</div><div>' + rightHtml + '</div>';
+}
+
+// ── Stats rendering ──
+function tjRenderStats(stats) {
+  if (!stats) return;
+  tjStats = stats;
+  document.getElementById('tj-st-total').textContent = stats.total;
+  document.getElementById('tj-st-open').textContent = stats.open;
+  document.getElementById('tj-st-wins').textContent = stats.wins;
+  document.getElementById('tj-st-losses').textContent = stats.losses;
+
+  const wrEl = document.getElementById('tj-st-winrate');
+  wrEl.textContent = stats.win_rate + '%';
+  wrEl.className = 'stat-value ' + (stats.win_rate >= 50 ? 'green' : stats.win_rate > 0 ? 'red' : '');
+
+  const pnlEl = document.getElementById('tj-st-pnl');
+  pnlEl.textContent = (stats.total_pnl >= 0 ? '+' : '') + '$' + stats.total_pnl.toFixed(2);
+  pnlEl.className = 'stat-value ' + (stats.total_pnl > 0 ? 'green' : stats.total_pnl < 0 ? 'red' : '');
+
+  document.getElementById('tj-st-best').textContent = '+$' + stats.best_trade.toFixed(2);
+  document.getElementById('tj-st-worst').textContent = '$' + stats.worst_trade.toFixed(2);
+
+  // Pattern comparison
+  const patPanel = document.getElementById('tj-patterns');
+  if (stats.win_patterns && Object.keys(stats.win_patterns).length > 0) {
+    patPanel.style.display = 'block';
+    const wp = stats.win_patterns;
+    const lp = stats.loss_patterns || {};
+
+    let wHtml = '';
+    wHtml += '<div>Avg Secs to Close: <b style="color:var(--text);">' + (wp.avg_secs_to_close||0).toFixed(0) + 's</b></div>';
+    wHtml += '<div>Avg Range %: <b style="color:var(--text);">' + ((wp.avg_range_pct||0)*100).toFixed(1) + '%</b></div>';
+    wHtml += '<div>Avg OB Imbalance: <b style="color:var(--text);">' + (wp.avg_ob_imbalance||0).toFixed(2) + 'x</b></div>';
+    wHtml += '<div>Avg Candle Range: <b style="color:var(--text);">$' + (wp.avg_candle_range||0).toFixed(4) + '</b></div>';
+    wHtml += '<div>Avg Ask Diff: <b style="color:var(--text);">$' + (wp.avg_ask_diff||0).toFixed(4) + '</b></div>';
+    wHtml += '<div>Avg Combined Ask: <b style="color:var(--text);">$' + (wp.avg_combined_ask||0).toFixed(4) + '</b></div>';
+    wHtml += '<div>Price Above Open: <b style="color:var(--text);">' + (wp.price_above_pct||0).toFixed(0) + '%</b></div>';
+    wHtml += '<div>Price Below Open: <b style="color:var(--text);">' + (wp.price_below_pct||0).toFixed(0) + '%</b></div>';
+    if (wp.strategy_dist) {
+      wHtml += '<div style="margin-top:6px;font-weight:600;color:var(--green);">Strategies:</div>';
+      Object.entries(wp.strategy_dist).forEach(([k,v]) => {
+        wHtml += '<div>&nbsp;&nbsp;' + k + ': <b>' + v + '</b></div>';
+      });
+    }
+    document.getElementById('tj-win-patterns').innerHTML = wHtml;
+
+    let lHtml = '';
+    if (Object.keys(lp).length > 0) {
+      lHtml += '<div>Avg Secs to Close: <b style="color:var(--text);">' + (lp.avg_secs_to_close||0).toFixed(0) + 's</b></div>';
+      lHtml += '<div>Avg Range %: <b style="color:var(--text);">' + ((lp.avg_range_pct||0)*100).toFixed(1) + '%</b></div>';
+      lHtml += '<div>Avg OB Imbalance: <b style="color:var(--text);">' + (lp.avg_ob_imbalance||0).toFixed(2) + 'x</b></div>';
+      lHtml += '<div>Avg Candle Range: <b style="color:var(--text);">$' + (lp.avg_candle_range||0).toFixed(4) + '</b></div>';
+      lHtml += '<div>Avg Ask Diff: <b style="color:var(--text);">$' + (lp.avg_ask_diff||0).toFixed(4) + '</b></div>';
+      lHtml += '<div>Avg Combined Ask: <b style="color:var(--text);">$' + (lp.avg_combined_ask||0).toFixed(4) + '</b></div>';
+      lHtml += '<div>Price Above Open: <b style="color:var(--text);">' + (lp.price_above_pct||0).toFixed(0) + '%</b></div>';
+      lHtml += '<div>Price Below Open: <b style="color:var(--text);">' + (lp.price_below_pct||0).toFixed(0) + '%</b></div>';
+    } else {
+      lHtml = '<div style="color:var(--dim);">No losses yet</div>';
+    }
+    document.getElementById('tj-loss-patterns').innerHTML = lHtml;
+  } else {
+    patPanel.style.display = 'none';
+  }
+
+  // Asset breakdown
+  const assetPanel = document.getElementById('tj-asset-breakdown');
+  if (stats.assets && Object.keys(stats.assets).length > 0) {
+    assetPanel.style.display = 'block';
+    let aHtml = '<table class="data-table" style="width:100%;font-size:12px;"><thead><tr><th>Asset</th><th>Wins</th><th>Losses</th><th>Both</th><th>PnL</th><th>Win Rate</th></tr></thead><tbody>';
+    Object.entries(stats.assets).forEach(([asset, s]) => {
+      const total = s.wins + s.losses + s.both;
+      const wr = total > 0 ? ((s.wins + s.both) / total * 100).toFixed(0) : '0';
+      const pnlClass = s.pnl > 0 ? 'green' : s.pnl < 0 ? 'red' : '';
+      aHtml += '<tr><td style="font-weight:700;">' + asset + '</td><td class="green">' + s.wins + '</td><td class="red">' + s.losses + '</td><td>' + s.both + '</td><td class="' + pnlClass + '">' + (s.pnl >= 0 ? '+' : '') + '$' + s.pnl.toFixed(2) + '</td><td>' + wr + '%</td></tr>';
+    });
+    aHtml += '</tbody></table>';
+    document.getElementById('tj-asset-table-wrap').innerHTML = aHtml;
+  } else {
+    assetPanel.style.display = 'none';
+  }
+}
+
+// ── Wire up state updates to TJ tab ──
+socket.on('state', (d) => {
+  // Update journal data
+  if (d.tj_entries) {
+    tjEntries = d.tj_entries;
+    tjRenderTable();
+  }
+  // Update badges
+  if (d.tj_count !== undefined) {
+    const badge = document.getElementById('tj-tab-badge');
+    if (badge) badge.textContent = d.tj_count;
+    const summary = document.getElementById('tj-summary');
+    if (summary) summary.textContent = d.tj_count + ' trades';
+  }
+  // Auto-trade toggle sync
+  if (d.auto_trade_enabled !== undefined) {
+    tjSyncAutoToggle(d.auto_trade_enabled);
+  }
+  // Populate market dropdown from active markets
+  if (d.all_markets) {
+    tjPopulateMarkets(d.all_markets);
+  }
+});
+
+// ── Socket events for TJ updates ──
+socket.on('tj_new_entry', (entry) => {
+  // Prepend to local array and re-render
+  tjEntries.unshift(entry);
+  tjRenderTable();
+  const badge = document.getElementById('tj-tab-badge');
+  if (badge) badge.textContent = tjEntries.length;
+});
+
+socket.on('tj_updated', (entry) => {
+  // Replace in local array
+  const idx = tjEntries.findIndex(e => e.id === entry.id);
+  if (idx >= 0) tjEntries[idx] = entry;
+  tjRenderTable();
+});
+
+socket.on('tj_stats', (stats) => {
+  tjRenderStats(stats);
+});
+
+socket.on('tj_export_data', (entries) => {
+  if (!entries || entries.length === 0) { alert('No data to export'); return; }
+  // Build CSV
+  const keys = Object.keys(entries[0]);
+  let csv = keys.join(',') + '\n';
+  entries.forEach(e => {
+    csv += keys.map(k => {
+      let v = e[k];
+      if (v === null || v === undefined) v = '';
+      v = String(v).replace(/"/g, '""');
+      if (v.includes(',') || v.includes('"') || v.includes('\n')) v = '"' + v + '"';
+      return v;
+    }).join(',') + '\n';
+  });
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'trade_journal_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// Auto-request stats when switching to journal tab
+const origSwitchTab = switchTab;
+switchTab = function(tab) {
+  origSwitchTab(tab);
+  if (tab === 'journal') {
+    socket.emit('tj_get_stats');
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════
+//  ARB ENGINE
+// ══════════════════════════════════════════════════════════════════════════
+
+function arbToggle(on) {
+  socket.emit('arb_toggle', {enabled: on});
+}
+
+function arbSaveParams() {
+  socket.emit('arb_update_params', {
+    min_edge: parseFloat(document.getElementById('arb-min-edge').value) || 0.03,
+    trade_size: parseFloat(document.getElementById('arb-trade-size').value) || 5.0,
+    max_positions: parseInt(document.getElementById('arb-max-pos').value) || 3,
+    cooldown: parseFloat(document.getElementById('arb-cooldown').value) || 30,
+    fill_timeout: parseFloat(document.getElementById('arb-timeout').value) || 45,
+    max_daily_spend: parseFloat(document.getElementById('arb-daily-cap').value) || 25,
+  });
+}
+
+function arbManual(mid) {
+  socket.emit('arb_manual', {market_id: mid});
+}
+
+function arbUpdateUI(arb, positions, markets) {
+  // Badge
+  const badge = document.getElementById('arb-tab-badge');
+  if (badge) badge.textContent = arb.active_count || 0;
+
+  // Toggle checkbox
+  const cb = document.getElementById('arb-enabled');
+  if (cb && document.activeElement !== cb) cb.checked = arb.enabled;
+  const lbl = document.getElementById('arb-status-label');
+  if (lbl) {
+    lbl.textContent = arb.enabled ? 'ON' : 'OFF';
+    lbl.style.color = arb.enabled ? 'var(--purple)' : 'var(--dim)';
+  }
+
+  // Sync param inputs (only if not focused)
+  function syncInput(id, val) {
+    const el = document.getElementById(id);
+    if (el && document.activeElement !== el) el.value = val;
+  }
+  syncInput('arb-min-edge', arb.min_edge);
+  syncInput('arb-trade-size', arb.trade_size);
+  syncInput('arb-max-pos', arb.max_positions);
+  syncInput('arb-cooldown', arb.cooldown);
+  syncInput('arb-timeout', arb.fill_timeout);
+  syncInput('arb-daily-cap', arb.max_daily_spend);
+
+  // Stats summary
+  const ss = document.getElementById('arb-stats-summary');
+  if (ss) {
+    ss.innerHTML = `Opps: ${arb.opportunities_seen} | Arbs: ${arb.total_arbs} | ` +
+      `Active: ${arb.active_count} | ` +
+      `Spent: $${arb.total_spent.toFixed(2)} | ` +
+      `Profit: <span style="color:${arb.total_profit >= 0 ? 'var(--green)' : 'var(--red)'}">` +
+      `$${arb.total_profit.toFixed(2)}</span> | ` +
+      `Daily: $${arb.daily_spend.toFixed(2)}/$${arb.max_daily_spend.toFixed(0)}`;
+  }
+
+  // PnL summary above positions
+  const ps = document.getElementById('arb-pnl-summary');
+  if (ps) {
+    const wc = arb.both_filled_count || 0;
+    const pc = arb.partial_count || 0;
+    ps.innerHTML = `${wc} both-filled | ${pc} partial | ` +
+      `P&L: <span style="color:${arb.total_profit >= 0 ? 'var(--green)' : 'var(--red)'}">` +
+      `$${arb.total_profit.toFixed(2)}</span>`;
+  }
+
+  // ── Live combined asks ──
+  const lm = document.getElementById('arb-live-markets');
+  if (lm && markets && markets.length > 0) {
+    const minEdge = arb.min_edge || 0.03;
+    let html = '<table style="width:100%;border-collapse:collapse;">' +
+      '<tr style="color:var(--dim);font-size:10px;"><th>Asset</th><th>Time</th>' +
+      '<th>Up Ask</th><th>Down Ask</th><th>Combined</th><th>Edge</th><th>Liq</th><th></th></tr>';
+    markets.forEach(m => {
+      if (!m.up_ask || !m.down_ask) return;
+      const combined = m.up_ask + m.down_ask;
+      const edge = 1.0 - combined;
+      const isOpp = edge >= minEdge;
+      const rowColor = isOpp ? 'color:var(--green);font-weight:700;' : '';
+      const secs = m.secs || 0;
+      const timeStr = secs > 0 ? Math.floor(secs) + 's' : 'closed';
+      const asset = m.asset || '?';
+      // Extract time part from name
+      const nm = m.name || m.question || '';
+      const tmMatch = nm.match(/(\d{1,2}:\d{2}[AP]M)/);
+      const tmLabel = tmMatch ? tmMatch[1] : nm.slice(-12);
+      const minLiq = Math.min(m.up_ask_size || 0, m.down_ask_size || 0);
+      html += '<tr style="border-bottom:1px solid var(--border);' + rowColor + '">' +
+        '<td style="padding:3px 6px;">' + asset + '</td>' +
+        '<td style="padding:3px 6px;">' + tmLabel + ' (' + timeStr + ')</td>' +
+        '<td style="padding:3px 6px;">$' + m.up_ask.toFixed(2) + '</td>' +
+        '<td style="padding:3px 6px;">$' + m.down_ask.toFixed(2) + '</td>' +
+        '<td style="padding:3px 6px;">$' + combined.toFixed(3) + '</td>' +
+        '<td style="padding:3px 6px;' + (isOpp ? 'color:var(--green);' : '') + '">' +
+          (edge > 0 ? '+' : '') + (edge * 100).toFixed(1) + '%</td>' +
+        '<td style="padding:3px 6px;">' + Math.floor(minLiq) + '</td>' +
+        '<td style="padding:3px 6px;">' +
+          (isOpp && secs > 15 ? '<button onclick="arbManual(\'' + m.market_id + '\')" ' +
+          'style="background:var(--purple);color:#fff;border:none;padding:2px 8px;' +
+          'border-radius:4px;cursor:pointer;font-size:10px;">ARB</button>' : '') +
+        '</td></tr>';
+    });
+    html += '</table>';
+    lm.innerHTML = html;
+  }
+
+  // ── Positions table ──
+  const tbody = document.getElementById('arb-positions-body');
+  if (tbody && positions) {
+    if (positions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--dim);padding:16px;">No arb positions yet</td></tr>';
+    } else {
+      let html = '';
+      positions.forEach(p => {
+        const upIcon = p.up_filled ? '&#x2705;' : (p.resolved ? '&#x274C;' : '&#x23F3;');
+        const dnIcon = p.down_filled ? '&#x2705;' : (p.resolved ? '&#x274C;' : '&#x23F3;');
+        let statusColor = 'var(--dim)';
+        let statusText = p.outcome || 'active';
+        if (p.outcome === 'both_filled') { statusColor = 'var(--green)'; statusText = 'BOTH FILLED'; }
+        else if (p.outcome.startsWith('partial_')) { statusColor = 'var(--yellow)'; statusText = 'PARTIAL'; }
+        else if (p.outcome === 'cancelled' || p.outcome === 'shutdown') { statusColor = 'var(--dim)'; }
+        else if (!p.resolved) { statusColor = 'var(--cyan)'; statusText = p.age_secs + 's'; }
+
+        const profitColor = p.profit >= 0 ? 'var(--green)' : 'var(--red)';
+        html += '<tr style="border-bottom:1px solid var(--border);">' +
+          '<td style="padding:4px 6px;">' + p.asset + '</td>' +
+          '<td style="padding:4px 6px;">$' + p.combined.toFixed(3) + '</td>' +
+          '<td style="padding:4px 6px;color:var(--green);">' + (p.edge * 100).toFixed(1) + '%</td>' +
+          '<td style="padding:4px 6px;">' + p.shares + '</td>' +
+          '<td style="padding:4px 6px;">$' + p.cost.toFixed(2) + '</td>' +
+          '<td style="padding:4px 6px;">' + upIcon + ' $' + p.up_price.toFixed(2) + '</td>' +
+          '<td style="padding:4px 6px;">' + dnIcon + ' $' + p.down_price.toFixed(2) + '</td>' +
+          '<td style="padding:4px 6px;color:' + profitColor + ';">' +
+            (p.resolved ? '$' + p.profit.toFixed(2) : '--') + '</td>' +
+          '<td style="padding:4px 6px;color:' + statusColor + ';">' + statusText + '</td>' +
+        '</tr>';
+      });
+      tbody.innerHTML = html;
+    }
+  }
 }
 </script>
 </body>
