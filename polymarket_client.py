@@ -431,6 +431,172 @@ def place_limit_buy(token_id: str, price: float, size: int,
 last_order_error: str = ""
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SELL SIDE
+#  Selling a conditional token needs two things the buy side does not: the
+#  tokens must have settled into the wallet, and the CLOB's balance allowance
+#  must be refreshed or the order is rejected for insufficient balance even
+#  when the tokens are held.  Both are handled below.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def check_token_balance(token_id: str) -> int:
+    """
+    Check how many conditional tokens we hold for a given token_id.
+    Returns the RAW balance (6-decimal units), or 0 on error.
+    To get human-readable shares: raw_balance / 1_000_000
+    """
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+    if config.PAPER_TRADING:
+        return 999_000_000  # Assume we have them in paper mode
+
+    try:
+        client = get_clob_client()
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        result = client.get_balance_allowance(params)
+        balance = int(result.get("balance", 0))
+        return balance
+    except Exception as e:
+        log.warning(f"check_token_balance error: {e}")
+        return 0
+
+
+def raw_balance_to_shares(raw_balance: int) -> int:
+    """Convert raw token balance (6 decimals) to whole shares."""
+    return int(raw_balance / 1_000_000)
+
+
+def place_limit_sell(token_id: str, price: float, size: int,
+                     market_id: str = "") -> Optional[str]:
+    """
+    Place a limit SELL order on Polymarket's CLOB.
+    Mirror of place_limit_buy but with side='SELL'.
+    Verifies we actually hold the tokens before attempting.
+    Retries up to 3 times with re-approval on allowance errors.
+    """
+    from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
+
+    if config.PAPER_TRADING:
+        fake_id = f"paper_sell_{int(time.time())}_{token_id[:8]}"
+        log.info(
+            f"[PAPER SELL] SELL {size} tokens of {token_id[:16]}... "
+            f"@ ${price:.4f} (market={market_id})"
+        )
+        return fake_id
+
+    if not config.TRADING_ENABLED:
+        log.warning("Trading is disabled. Sell order not placed.")
+        return None
+
+    # Polymarket CLOB minimum order size = 5 shares
+    MIN_ORDER_SIZE = 5
+    if size < MIN_ORDER_SIZE:
+        log.warning(
+            f"[SELL SKIP] Size ({size}) below Polymarket minimum ({MIN_ORDER_SIZE}). "
+            f"Cannot sell — shares stranded."
+        )
+        return None
+
+    MAX_SELL_RETRIES = 3
+
+    for attempt in range(1, MAX_SELL_RETRIES + 1):
+        try:
+            client = get_clob_client()
+
+            # ── Verify we actually hold the tokens before selling ──
+            try:
+                params = BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+                bal_result = client.get_balance_allowance(params)
+                raw_balance = int(bal_result.get("balance", 0))
+                actual_shares = raw_balance_to_shares(raw_balance)
+                if actual_shares < 1:
+                    log.warning(
+                        f"[SELL SKIP] Token balance={raw_balance} raw ({actual_shares} shares) — "
+                        f"tokens not yet settled, will retry"
+                    )
+                    if attempt < MAX_SELL_RETRIES:
+                        import time as _t; _t.sleep(2)
+                        continue
+                    return None
+                if actual_shares < size:
+                    log.info(
+                        f"[SELL] Adjusting size {size}→{actual_shares} shares "
+                        f"(raw balance={raw_balance}, fees reduced tokens)"
+                    )
+                    size = actual_shares
+                log.info(f"[SELL] Token balance confirmed: {actual_shares} shares (raw={raw_balance})")
+            except Exception as be:
+                log.warning(f"Balance check error (proceeding anyway): {be}")
+
+            # ── Update balance allowance so the CLOB recognises our tokens ──
+            # This is CRITICAL — without it, sell orders fail with
+            # "not enough balance / allowance" even when we hold the tokens.
+            # We do this EVERY attempt to ensure the allowance is refreshed.
+            try:
+                client.update_balance_allowance(
+                    BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token_id,
+                    )
+                )
+                log.info(f"[SELL] Allowance updated for token {token_id[:16]}...")
+            except Exception as ae:
+                log.warning(f"update_balance_allowance failed (attempt {attempt}): {ae}")
+                # If allowance update fails, wait and retry
+                if attempt < MAX_SELL_RETRIES:
+                    import time as _t; _t.sleep(2)
+                    continue
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=float(size),
+                side="SELL",
+            )
+            signed_order = client.create_order(order_args)
+            response = client.post_order(signed_order, orderType="GTC")
+            order_id = response.get("orderID") or response.get("id", "unknown")
+            log.info(
+                f"[LIVE SELL] SELL {size} tokens of {token_id[:16]}... "
+                f"@ ${price:.4f} → order_id={order_id}"
+            )
+            return order_id
+
+        except Exception as e:
+            error_str = str(e)
+            log.error(f"place_limit_sell error (attempt {attempt}/{MAX_SELL_RETRIES}): {e}")
+
+            # If it's a balance/allowance error, retry with fresh allowance
+            if "not enough balance" in error_str.lower() or "allowance" in error_str.lower():
+                if attempt < MAX_SELL_RETRIES:
+                    log.info(f"[SELL] Balance/allowance error — refreshing and retrying in 2s...")
+                    try:
+                        client = get_clob_client()
+                        client.update_balance_allowance(
+                            BalanceAllowanceParams(
+                                asset_type=AssetType.CONDITIONAL,
+                                token_id=token_id,
+                            )
+                        )
+                    except Exception:
+                        pass
+                    import time as _t; _t.sleep(2)
+                    continue
+
+            # Non-retryable error or max retries reached
+            return None
+
+    log.error(f"place_limit_sell: all {MAX_SELL_RETRIES} attempts failed")
+    return None
+
+
+
 def cancel_order(order_id: str) -> bool:
     """Cancel a specific order by ID."""
     if config.PAPER_TRADING:
