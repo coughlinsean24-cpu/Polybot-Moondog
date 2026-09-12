@@ -3164,8 +3164,10 @@ def pcm_background_loop():
 
     last_refresh = 0
     last_resolve_sweep = 0
+    last_idle_push = 0
     REFRESH_INTERVAL = 30  # seconds between market discovery polls
     RESOLVE_INTERVAL = 120  # seconds between pending-resolution sweeps
+    IDLE_PUSH_INTERVAL = 1.5  # state push cadence while the bot loop is stopped
 
     while True:
         try:
@@ -3175,6 +3177,14 @@ def pcm_background_loop():
             if now_ts - last_refresh >= REFRESH_INTERVAL:
                 refresh_watch_list()
                 last_refresh = now_ts
+
+            # While the bot loop is stopped it isn't pushing state, so keep
+            # the dashboard (Live 5-Min card, scanner, countdowns) fresh here
+            if not engine.running:
+                update_prices()
+                if now_ts - last_idle_push >= IDLE_PUSH_INTERVAL:
+                    push_state()
+                    last_idle_push = now_ts
 
             # Periodically retry resolution for pending events
             if now_ts - last_resolve_sweep >= RESOLVE_INTERVAL:
@@ -3255,6 +3265,31 @@ def push_state():
         })
     all_markets.sort(key=lambda m: m["secs"])
 
+    # Current 5-min window per asset — feeds the pinned Live 5-Min Markets card
+    live_by_asset = {}
+    for mid, mkt in engine.watch_list.items():
+        secs = seconds_until(mkt.end_time)
+        if secs <= 0:
+            continue
+        cur = live_by_asset.get(mkt.asset)
+        if cur is None or secs < cur[0]:
+            live_by_asset[mkt.asset] = (secs, mid, mkt)
+    live_5m = []
+    for asset in sorted(live_by_asset):
+        secs, mid, mkt = live_by_asset[asset]
+        prices = engine.market_prices.get(mid, {})
+        live_5m.append({
+            "asset": asset,
+            "market_id": mid,
+            "question": mkt.question,
+            "end_time": mkt.end_time.isoformat(),
+            "secs": round(secs, 0),
+            "token_id_up": mkt.token_id_up,
+            "token_id_down": mkt.token_id_down,
+            "up_ask": prices.get("up_ask", 0),
+            "down_ask": prices.get("down_ask", 0),
+        })
+
     # Bids summary
     bids_list = []
     for bid in engine.bids_posted.values():
@@ -3317,6 +3352,7 @@ def push_state():
         "manual_positions": manual_positions.list_dicts(),
         "manual_only": config.MANUAL_ONLY,
         "manual_exit_default": config.MANUAL_EXIT_PRICE,
+        "live_5m": live_5m,
         "arb": engine.arb.stats() if engine.arb else {},
         "arb_positions": engine.arb.get_positions_list() if engine.arb else [],
     }
@@ -4720,6 +4756,11 @@ DASHBOARD_HTML = r"""
     font-weight: 700; text-transform: uppercase;
   }
   .btn-bid-sm:hover { background: var(--cyan); color: #000; }
+  .btn-bid-sm.side-yes { border-color: var(--green); color: var(--green); }
+  .btn-bid-sm.side-yes:hover { background: var(--green); color: #000; }
+  .btn-bid-sm.side-no { border-color: var(--red); color: var(--red); }
+  .btn-bid-sm.side-no:hover { background: var(--red); color: #000; }
+  .bid-btn-group { display: flex; gap: 3px; justify-content: center; }
   .scan-row-input {
     width: 62px; padding: 2px 4px; font-size: 11px; text-align: center;
     background: var(--bg); border: 1px solid var(--border); color: var(--text);
@@ -5107,6 +5148,36 @@ DASHBOARD_HTML = r"""
 <!-- ══════ TAB 2: MARKET SCANNER ══════ -->
 <div class="tab-content" id="tab-scanner">
 
+<!-- Live 5-Min Markets — always on, rolls to the new window automatically -->
+<div style="padding: 12px 24px 0 24px;">
+  <div class="card">
+    <div class="card-title">Live 5-Min Markets
+      <span style="color:var(--dim);font-size:11px;margin-left:8px;">
+        always the current window &mdash; rolls over automatically, no scanner needed</span>
+    </div>
+    <div class="card-body" style="padding:0;">
+      <table>
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th>Market</th>
+            <th style="text-align:right">Time Left</th>
+            <th style="text-align:right">UP Ask</th>
+            <th style="text-align:right">DOWN Ask</th>
+            <th style="text-align:center">Bid $</th>
+            <th style="text-align:center">Exit $</th>
+            <th style="text-align:center">Shares</th>
+            <th style="text-align:center">Trade</th>
+          </tr>
+        </thead>
+        <tbody id="live5m-body">
+          <tr><td colspan="9" class="empty">Waiting for market data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <!-- Scanner Filter Controls -->
 <div class="scanner-controls">
   <div>
@@ -5228,12 +5299,12 @@ DASHBOARD_HTML = r"""
                title="Pre-fills the Exit $ box on every scanned market. 0 = no exit.">
       </div>
       <div class="control-group">
-        <label>Sides to Bid</label>
-        <select id="manual-bid-side" class="scan-row-input" style="width:100%;">
-          <option value="both">Both (YES + NO)</option>
-          <option value="yes">YES only</option>
-          <option value="no">NO only</option>
-        </select>
+        <label>One-Click Trading</label>
+        <label style="display:flex; align-items:center; gap:6px; font-size:11px; cursor:pointer;">
+          <input type="checkbox" id="manual-one-click"
+                 title="Skip the confirmation popup — YES/NO/BOTH buttons place the order immediately.">
+          Skip confirm popup
+        </label>
       </div>
     </div>
     <div style="margin-top:6px; font-size:11px; color:var(--dim); line-height:1.5;">
@@ -5893,28 +5964,30 @@ function toggleScannerAutoBid() {
   socket.emit('toggle_scanner_auto_bid');
 }
 
-function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
+function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question, side) {
   const priceEl = document.getElementById('scan-row-price-' + rowIdx);
   const sizeEl = document.getElementById('scan-row-size-' + rowIdx);
   const exitEl = document.getElementById('scan-row-exit-' + rowIdx);
-  const sideEl = document.getElementById('manual-bid-side');
   const price = priceEl ? parseFloat(priceEl.value) || 0.05 : 0.05;
   const size = sizeEl ? parseInt(sizeEl.value) || 100 : 100;
   const exitPrice = exitEl ? parseFloat(exitEl.value) || 0 : 0;
-  const side = sideEl ? sideEl.value : 'both';
+  side = side || 'both';
 
   if (exitPrice && exitPrice <= price) {
     alert('Exit price ($' + exitPrice.toFixed(2) + ') must be above the bid price ($' +
           price.toFixed(2) + ').');
     return;
   }
-  const sideDesc = side === 'both' ? 'BOTH sides' : side.toUpperCase() + ' only';
-  const exitDesc = exitPrice
-    ? 'Exit will rest at $' + exitPrice.toFixed(2) + ' once filled.'
-    : 'NO exit will be queued.';
-  if (!confirm('Bid $' + price.toFixed(2) + ' x ' + size + ' shares on ' + sideDesc +
-               '.\n' + exitDesc + '\n\nPlace this order?')) {
-    return;
+  const oneClickEl = document.getElementById('manual-one-click');
+  if (!oneClickEl || !oneClickEl.checked) {
+    const sideDesc = side === 'both' ? 'BOTH sides' : side.toUpperCase() + ' only';
+    const exitDesc = exitPrice
+      ? 'Exit will rest at $' + exitPrice.toFixed(2) + ' once filled.'
+      : 'NO exit will be queued.';
+    if (!confirm('Bid $' + price.toFixed(2) + ' x ' + size + ' shares on ' + sideDesc +
+                 '.\n' + exitDesc + '\n\nPlace this order?')) {
+      return;
+    }
   }
 
   socket.emit('scanner_manual_bid', {
@@ -5927,6 +6000,111 @@ function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
     exit_price: exitPrice,
     side: side
   });
+}
+
+// ── Live 5-Min Markets card ──
+let live5mMarkets = {};  // asset -> current-window market data, from state pushes
+
+// Market questions come from the Polymarket API — escape before innerHTML
+const escHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function live5mBid(asset, side) {
+  const m = live5mMarkets[asset];
+  if (!m) { alert('No live market for ' + asset + ' right now.'); return; }
+  const secsLeft = Math.round((new Date(m.end_time).getTime() - Date.now()) / 1000);
+  if (secsLeft <= 0) { alert('That window just closed — the card will roll to the next one.'); return; }
+  const price = parseFloat((document.getElementById('live-price-' + asset) || {}).value) || 0.05;
+  const size = parseInt((document.getElementById('live-size-' + asset) || {}).value) || 100;
+  const exitPrice = parseFloat((document.getElementById('live-exit-' + asset) || {}).value) || 0;
+
+  if (exitPrice && exitPrice <= price) {
+    alert('Exit price ($' + exitPrice.toFixed(2) + ') must be above the bid price ($' +
+          price.toFixed(2) + ').');
+    return;
+  }
+  const oneClickEl = document.getElementById('manual-one-click');
+  if (!oneClickEl || !oneClickEl.checked) {
+    const sideDesc = side === 'both' ? 'BOTH sides' : (side === 'yes' ? 'UP' : 'DOWN');
+    const exitDesc = exitPrice
+      ? 'Exit will rest at $' + exitPrice.toFixed(2) + ' once filled.'
+      : 'NO exit will be queued.';
+    if (!confirm('Bid $' + price.toFixed(2) + ' x ' + size + ' shares on ' + sideDesc +
+                 ' — ' + asset + ' (' + secsLeft + 's left).\n' + exitDesc +
+                 '\n\nPlace this order?')) {
+      return;
+    }
+  }
+  socket.emit('scanner_manual_bid', {
+    market_id: m.market_id,
+    token_id_yes: m.token_id_up,
+    token_id_no: m.token_id_down,
+    question: m.question,
+    bid_price: price,
+    tokens: size,
+    exit_price: exitPrice,
+    side: side
+  });
+}
+
+function renderLive5m(list) {
+  const body = document.getElementById('live5m-body');
+  if (!body) return;
+  live5mMarkets = {};
+  if (!list || list.length === 0) {
+    body.innerHTML = '<tr><td colspan="9" class="empty">Waiting for market data...</td></tr>';
+    return;
+  }
+  // Preserve user-edited inputs across re-renders (keyed by asset, so they
+  // also survive the roll to a new window)
+  const prev = {};
+  body.querySelectorAll('input[id^="live-"]').forEach(el => {
+    if (document.activeElement === el || el.dataset.dirty === '1') prev[el.id] = el.value;
+  });
+  const defaultPrice = parseFloat(document.getElementById('scan-ab-price').value) || 0.05;
+  const defaultSize = parseInt(document.getElementById('scan-ab-size').value) || 100;
+  const defaultExit = parseFloat(document.getElementById('manual-exit-default').value) || 0;
+
+  let html = '';
+  list.forEach(m => {
+    live5mMarkets[m.asset] = m;
+    const secsLeft = Math.max(0, Math.round((new Date(m.end_time).getTime() / 1000) - (Date.now() / 1000)));
+    const timeClass = secsLeft <= 60 ? 'hot' : secsLeft <= 180 ? 'warm' : 'cool';
+    const upAsk = m.up_ask > 0 ? '$' + m.up_ask.toFixed(3) : '--';
+    const downAsk = m.down_ask > 0 ? '$' + m.down_ask.toFixed(3) : '--';
+    const q = (m.question || '').length > 55 ? m.question.substring(0, 52) + '...' : (m.question || '--');
+    const pv = (id, dflt) => (id in prev) ? prev[id] : dflt;
+    html += '<tr>' +
+      '<td style="font-weight:700;color:var(--cyan)">' + escHtml(m.asset) + '</td>' +
+      '<td title="' + escHtml(m.question) + '">' + escHtml(q) + '</td>' +
+      '<td class="time-cell ' + timeClass + '" style="text-align:right">' + fmtTime(secsLeft) + '</td>' +
+      '<td class="price" style="text-align:right">' + upAsk + '</td>' +
+      '<td class="price" style="text-align:right">' + downAsk + '</td>' +
+      '<td style="text-align:center">' +
+        '<input type="number" class="scan-row-input" id="live-price-' + m.asset + '" ' +
+        'step="0.01" min="0.01" max="0.50" value="' + pv('live-price-' + m.asset, defaultPrice) + '" ' +
+        'oninput="this.dataset.dirty=1"></td>' +
+      '<td style="text-align:center">' +
+        '<input type="number" class="scan-row-input scan-row-exit" id="live-exit-' + m.asset + '" ' +
+        'step="0.01" min="0" max="0.99" value="' + pv('live-exit-' + m.asset, defaultExit) + '" ' +
+        'title="Resting sell placed once the buy fills. 0 = no exit." ' +
+        'oninput="this.dataset.dirty=1"></td>' +
+      '<td style="text-align:center">' +
+        '<input type="number" class="scan-row-input" id="live-size-' + m.asset + '" ' +
+        'step="10" min="10" max="10000" value="' + pv('live-size-' + m.asset, defaultSize) + '" ' +
+        'oninput="this.dataset.dirty=1"></td>' +
+      '<td style="text-align:center">' +
+        '<div class="bid-btn-group">' +
+        '<button class="btn-bid-sm side-yes" onclick="live5mBid(\'' + m.asset + '\',\'yes\')" ' +
+        'title="Bid UP only">UP &#9650;</button>' +
+        '<button class="btn-bid-sm side-no" onclick="live5mBid(\'' + m.asset + '\',\'no\')" ' +
+        'title="Bid DOWN only">DOWN &#9660;</button>' +
+        '<button class="btn-bid-sm" onclick="live5mBid(\'' + m.asset + '\',\'both\')" ' +
+        'title="Bid BOTH sides">BOTH</button>' +
+        '</div></td>' +
+      '</tr>';
+  });
+  body.innerHTML = html;
 }
 
 // ── Manual position controls ──
@@ -6438,6 +6616,9 @@ socket.on('state', (d) => {
     }
   }
 
+  // Live 5-min markets card (always on, independent of the scanner)
+  renderLive5m(d.live_5m || []);
+
   // Scanner results table
   const scanResults = d.scanner_results || [];
   document.getElementById('scan-st-found').textContent = scanResults.length;
@@ -6489,7 +6670,7 @@ socket.on('state', (d) => {
       const rowSize = (idx in prevSizes) ? prevSizes[idx] : defaultSize;
       const rowExit = (idx in prevExits) ? prevExits[idx] : defaultExit;
       sHtml += '<tr>' +
-        '<td title="' + (m.question || '').replace(/"/g, '&quot;') + '">' + question + '</td>' +
+        '<td title="' + escHtml(m.question) + '">' + escHtml(question) + '</td>' +
         '<td><span class="cat-badge ' + catCls + '">' + m.category + '</span></td>' +
         '<td class="time-cell ' + timeClass + '" style="text-align:right">' + fmtTime(secsLeft) + '</td>' +
         '<td style="text-align:right">$' + (m.liquidity || 0).toFixed(0) + '</td>' +
@@ -6513,9 +6694,17 @@ socket.on('state', (d) => {
           'oninput="this.dataset.dirty=1">' +
         '</td>' +
         '<td style="text-align:center">' +
+          '<div class="bid-btn-group">' +
+          '<button class="btn-bid-sm side-yes" onclick="scannerManualBid(' + idx + ',\'' + m.market_id + '\',\'' +
+          m.token_id_yes + '\',\'' + m.token_id_no + '\',\'' + escQ + '\',\'yes\')" ' +
+          'title="Bid YES / Up only">YES &#9650;</button>' +
+          '<button class="btn-bid-sm side-no" onclick="scannerManualBid(' + idx + ',\'' + m.market_id + '\',\'' +
+          m.token_id_yes + '\',\'' + m.token_id_no + '\',\'' + escQ + '\',\'no\')" ' +
+          'title="Bid NO / Down only">NO &#9660;</button>' +
           '<button class="btn-bid-sm" onclick="scannerManualBid(' + idx + ',\'' + m.market_id + '\',\'' +
-          m.token_id_yes + '\',\'' + m.token_id_no + '\',\'' + escQ + '\')">' +
-          'BID</button>' +
+          m.token_id_yes + '\',\'' + m.token_id_no + '\',\'' + escQ + '\',\'both\')" ' +
+          'title="Bid BOTH sides">BOTH</button>' +
+          '</div>' +
         '</td>' +
         '</tr>';
     });
