@@ -43,9 +43,10 @@ from polymarket_client import (
     MarketWindow, OrderBookSnapshot, ScannedMarket,
     get_clob_client, fetch_active_btc_markets, fetch_active_markets,
     fetch_orderbook, fetch_orderbooks_parallel, fetch_full_orderbook,
-    place_limit_buy, cancel_order, get_order_status,
+    place_limit_buy, place_limit_sell, cancel_order, get_order_status,
     seconds_until, get_adaptive_poll_interval,
     check_market_resolution, scan_active_markets,
+    check_token_balance, raw_balance_to_shares,
 )
 import polymarket_client as _pm
 from ws_feed import PriceFeed
@@ -133,8 +134,15 @@ def _load_settings():
                         engine.scanner_cfg[k] = int(v)
                     else:
                         engine.scanner_cfg[k] = float(v)
-        engine.scanner_auto_bid = bool(data.get("scanner_auto_bid", False))
-        engine.auto_trade_enabled = bool(data.get("auto_trade_enabled", False))
+        # Saved automation flags are ignored entirely in manual-only mode, so a
+        # settings.json written before MANUAL_ONLY was turned on cannot re-arm
+        # the bot on the next restart.
+        if config.MANUAL_ONLY:
+            engine.scanner_auto_bid = False
+            engine.auto_trade_enabled = False
+        else:
+            engine.scanner_auto_bid = bool(data.get("scanner_auto_bid", False))
+            engine.auto_trade_enabled = bool(data.get("auto_trade_enabled", False))
         # Arb settings — applied to engine.arb once it's initialized
         arb_cfg = data.get("arb", {})
         if arb_cfg and isinstance(arb_cfg, dict):
@@ -1214,6 +1222,403 @@ def tj_get_stats() -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  MANUAL POSITIONS — bid with a queued exit
+#
+#  A manual bid placed from the scanner can carry an exit price.  When the buy
+#  fills, this tracker waits for the conditional tokens to settle into the
+#  wallet and then rests a GTC limit SELL at that price, so the order is
+#  already sitting in the book when a spike comes through.  That is the whole
+#  point: a resting limit gets matched by the taker driving the spike, whereas
+#  a bot that notices the spike and then sells is always a step behind.
+#
+#  Nothing here acts on its own.  A position exists only because someone
+#  clicked BID, and every transition is mechanical follow-through on that one
+#  click — no strategy, no entries, no re-entries.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ManualState:
+    """Lifecycle of one manually-placed bid."""
+    PENDING_FILL = "pending_fill"   # Buy order resting, not yet filled
+    SETTLING     = "settling"       # Buy filled, waiting for tokens to land
+    EXIT_RESTING = "exit_resting"   # Exit sell order is live in the book
+    HOLDING      = "holding"        # Tokens held, no exit order (user cancelled it)
+    EXITED       = "exited"         # Exit sell filled — round trip complete
+    CANCELLED    = "cancelled"      # Buy cancelled or expired before filling
+    FAILED       = "failed"         # Something went wrong; needs a human
+
+
+# States that no longer need polling
+_MANUAL_TERMINAL = (ManualState.EXITED, ManualState.CANCELLED)
+
+
+class ManualPosition:
+    """One manual bid on one token, plus the exit queued behind it."""
+
+    _seq = 0
+
+    def __init__(self, market_id: str, question: str, token_id: str,
+                 side_label: str, entry_price: float, size: int,
+                 exit_price: float, buy_order_id: str):
+        ManualPosition._seq += 1
+        self.id: str = f"m{ManualPosition._seq}"
+        self.market_id = market_id
+        self.question = question
+        self.token_id = token_id
+        self.side_label = side_label          # "YES" or "NO"
+        self.entry_price = entry_price
+        self.size = size                       # Shares requested
+        self.filled_size = 0                   # Shares actually filled
+        self.exit_price = exit_price           # 0 = no exit wanted
+        self.buy_order_id = buy_order_id
+        self.sell_order_id = ""
+        self.state = ManualState.PENDING_FILL
+        self.created = time.time()
+        self.filled_at = 0.0
+        self.exit_placed_at = 0.0
+        self.exited_at = 0.0
+        self.error = ""
+        self.note = "Buy order resting"
+        self._settle_started = 0.0
+        self._next_poll = 0.0
+        self._exit_attempts = 0
+
+    # ── Derived numbers for the dashboard ──
+    @property
+    def cost(self) -> float:
+        return self.entry_price * (self.filled_size or self.size)
+
+    @property
+    def exit_proceeds(self) -> float:
+        return self.exit_price * self.filled_size if self.filled_size else 0.0
+
+    @property
+    def potential_pnl(self) -> float:
+        """Profit if the resting exit fills at its limit price."""
+        if not self.filled_size or self.exit_price <= 0:
+            return 0.0
+        return (self.exit_price - self.entry_price) * self.filled_size
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "market_id": self.market_id,
+            "question": self.question,
+            "side": self.side_label,
+            "entry_price": round(self.entry_price, 4),
+            "size": self.size,
+            "filled_size": self.filled_size,
+            "exit_price": round(self.exit_price, 4),
+            "state": self.state,
+            "buy_order_id": self.buy_order_id,
+            "sell_order_id": self.sell_order_id,
+            "cost": round(self.cost, 2),
+            "potential_pnl": round(self.potential_pnl, 2),
+            "note": self.note,
+            "error": self.error,
+            "age": int(time.time() - self.created),
+        }
+
+
+class ManualPositionManager:
+    """Polls manual positions and rests their exits. One background thread."""
+
+    POLL_SECONDS = 2.0
+
+    def __init__(self):
+        self.positions: dict[str, ManualPosition] = {}
+        self.lock = threading.Lock()
+        self.running = False
+        self._thread = None
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="manual-pos")
+        self._thread.start()
+        log.info("[MANUAL] Position manager started")
+
+    def stop(self):
+        self.running = False
+
+    def track(self, market_id: str, question: str, token_id: str, side_label: str,
+              entry_price: float, size: int, exit_price: float,
+              buy_order_id: str) -> ManualPosition:
+        """Register a manual buy so its exit gets placed when it fills."""
+        pos = ManualPosition(
+            market_id=market_id, question=question, token_id=token_id,
+            side_label=side_label, entry_price=entry_price, size=size,
+            exit_price=exit_price, buy_order_id=buy_order_id,
+        )
+        if exit_price <= 0:
+            pos.note = "Buy resting — no exit queued"
+        with self.lock:
+            self.positions[pos.id] = pos
+        return pos
+
+    def get(self, pos_id: str):
+        with self.lock:
+            return self.positions.get(pos_id)
+
+    def list_dicts(self) -> list[dict]:
+        with self.lock:
+            items = list(self.positions.values())
+        items.sort(key=lambda p: p.created, reverse=True)
+        return [p.to_dict() for p in items]
+
+    def remove(self, pos_id: str) -> bool:
+        with self.lock:
+            return self.positions.pop(pos_id, None) is not None
+
+    # ── Polling loop ─────────────────────────────────────────────────────
+    def _loop(self):
+        while self.running:
+            try:
+                with self.lock:
+                    active = [
+                        p for p in self.positions.values()
+                        if p.state not in _MANUAL_TERMINAL
+                    ]
+                changed = False
+                now = time.time()
+                for pos in active:
+                    if now < pos._next_poll:
+                        continue
+                    pos._next_poll = now + self.POLL_SECONDS
+                    try:
+                        if self._advance(pos):
+                            changed = True
+                    except Exception as e:
+                        pos.error = str(e)
+                        log.error(f"[MANUAL] {pos.id} advance error: {e}")
+                if changed:
+                    push_state()
+            except Exception as e:
+                log.error(f"[MANUAL] Loop error: {e}")
+            time.sleep(1.0)
+
+    def _advance(self, pos: ManualPosition) -> bool:
+        """Move one position forward. Returns True if its state changed."""
+        if pos.state == ManualState.PENDING_FILL:
+            return self._check_buy_fill(pos)
+        if pos.state == ManualState.SETTLING:
+            return self._check_settlement(pos)
+        if pos.state == ManualState.EXIT_RESTING:
+            return self._check_exit_fill(pos)
+        return False
+
+    # ── Step 1: did the buy fill? ────────────────────────────────────────
+    def _check_buy_fill(self, pos: ManualPosition) -> bool:
+        if config.PAPER_TRADING:
+            # Deterministic paper fill so the flow is observable end to end.
+            # (get_order_status randomises fills in paper mode, which would
+            #  make manual positions flap.)
+            if time.time() - pos.created < 3.0:
+                return False
+            pos.filled_size = pos.size
+            pos.filled_at = time.time()
+            pos.state = ManualState.SETTLING
+            pos._settle_started = time.time()
+            pos.note = "[PAPER] Buy filled — settling"
+            _manual_log(f"[PAPER] BUY FILLED {pos.side_label} {pos.size} @ ${pos.entry_price:.3f}", "fill")
+            return True
+
+        status = get_order_status(pos.buy_order_id)
+        matched = float(status.get("size_matched", 0) or 0)
+        state = str(status.get("status", "")).lower()
+
+        if matched > 0:
+            pos.filled_size = int(matched)
+            pos.filled_at = time.time()
+            pos.state = ManualState.SETTLING
+            pos._settle_started = time.time()
+            partial = "" if pos.filled_size >= pos.size else f" (partial of {pos.size})"
+            pos.note = f"Buy filled {pos.filled_size}{partial} — waiting for settlement"
+            _manual_log(
+                f"BUY FILLED {pos.side_label} {pos.filled_size}{partial} @ ${pos.entry_price:.3f}",
+                "fill",
+            )
+            return True
+
+        if state in ("cancelled", "canceled", "expired"):
+            pos.state = ManualState.CANCELLED
+            pos.note = f"Buy order {state} before filling"
+            _manual_log(f"Buy {state}: {pos.side_label} on {pos.question[:40]}", "warn")
+            return True
+
+        return False
+
+    # ── Step 2: have the tokens landed in the wallet? ────────────────────
+    def _check_settlement(self, pos: ManualPosition) -> bool:
+        if pos.exit_price <= 0:
+            pos.state = ManualState.HOLDING
+            pos.note = "Filled — no exit queued (place one below)"
+            return True
+
+        if config.PAPER_TRADING:
+            return self._place_exit(pos)
+
+        raw = check_token_balance(pos.token_id)
+        shares = raw_balance_to_shares(raw)
+        if shares >= 1:
+            if shares < pos.filled_size:
+                # Fees reduce the tokens actually received
+                pos.filled_size = shares
+            return self._place_exit(pos)
+
+        elapsed = time.time() - pos._settle_started
+        pos.note = f"Waiting for tokens to settle ({elapsed:.0f}s)"
+        if elapsed > config.MANUAL_SETTLE_TIMEOUT:
+            # Try anyway — the exchange sometimes sees tokens the balance API
+            # has not caught up with yet.
+            _manual_log(
+                f"Settlement timeout ({elapsed:.0f}s) for {pos.side_label} — attempting exit anyway",
+                "warn",
+            )
+            return self._place_exit(pos)
+        return False
+
+    # ── Step 3: rest the exit ────────────────────────────────────────────
+    def _place_exit(self, pos: ManualPosition) -> bool:
+        pos._exit_attempts += 1
+        order_id = place_limit_sell(
+            token_id=pos.token_id,
+            price=pos.exit_price,
+            size=pos.filled_size,
+            market_id=pos.market_id,
+        )
+        if order_id:
+            pos.sell_order_id = order_id
+            pos.state = ManualState.EXIT_RESTING
+            pos.exit_placed_at = time.time()
+            pos.error = ""
+            took = pos.exit_placed_at - pos.filled_at if pos.filled_at else 0.0
+            pos.note = f"Exit resting @ ${pos.exit_price:.2f}"
+            _manual_log(
+                f"EXIT RESTING: {pos.side_label} {pos.filled_size} @ ${pos.exit_price:.2f} "
+                f"({took:.0f}s after fill) — potential +${pos.potential_pnl:.2f}",
+                "trade",
+            )
+            return True
+
+        pos.error = "Exit order rejected"
+        if pos._exit_attempts >= 5:
+            pos.state = ManualState.HOLDING
+            pos.note = "Exit failed — tokens held, retry from the table"
+            _manual_log(
+                f"EXIT FAILED after {pos._exit_attempts} attempts: {pos.side_label} "
+                f"on {pos.question[:40]} — you still hold the shares",
+                "error",
+            )
+            return True
+        # Back off and let the next poll retry
+        pos._next_poll = time.time() + 5.0
+        pos.note = f"Exit rejected, retrying ({pos._exit_attempts}/5)"
+        return False
+
+    # ── Step 4: did the exit fill? ───────────────────────────────────────
+    def _check_exit_fill(self, pos: ManualPosition) -> bool:
+        if config.PAPER_TRADING:
+            # A resting exit well above the market should NOT pretend to fill.
+            # Leave it resting so paper mode reflects reality.
+            return False
+
+        status = get_order_status(pos.sell_order_id)
+        matched = float(status.get("size_matched", 0) or 0)
+        state = str(status.get("status", "")).lower()
+
+        if matched >= pos.filled_size or state == "matched":
+            pos.state = ManualState.EXITED
+            pos.exited_at = time.time()
+            pnl = (pos.exit_price - pos.entry_price) * pos.filled_size
+            pos.note = f"Exit filled @ ${pos.exit_price:.2f} — P&L ${pnl:+.2f}"
+            _manual_log(
+                f"EXIT FILLED: {pos.side_label} {pos.filled_size} @ ${pos.exit_price:.2f} "
+                f"— P&L ${pnl:+.2f}",
+                "profit",
+            )
+            return True
+
+        if state in ("cancelled", "canceled", "expired"):
+            pos.state = ManualState.HOLDING
+            pos.sell_order_id = ""
+            pos.note = f"Exit order {state} — tokens still held"
+            _manual_log(f"Exit {state} for {pos.side_label} — you still hold the shares", "warn")
+            return True
+
+        return False
+
+    # ── User-driven actions ──────────────────────────────────────────────
+    def cancel_buy(self, pos_id: str) -> tuple[bool, str]:
+        pos = self.get(pos_id)
+        if not pos:
+            return False, "Position not found"
+        if pos.state != ManualState.PENDING_FILL:
+            return False, f"Buy is not pending (state: {pos.state})"
+        if cancel_order(pos.buy_order_id):
+            pos.state = ManualState.CANCELLED
+            pos.note = "Buy cancelled by user"
+            return True, "Buy order cancelled"
+        return False, "Cancel request failed"
+
+    def cancel_exit(self, pos_id: str) -> tuple[bool, str]:
+        pos = self.get(pos_id)
+        if not pos:
+            return False, "Position not found"
+        if pos.state != ManualState.EXIT_RESTING or not pos.sell_order_id:
+            return False, "No resting exit to cancel"
+        if cancel_order(pos.sell_order_id):
+            pos.sell_order_id = ""
+            pos.state = ManualState.HOLDING
+            pos.note = "Exit cancelled — tokens held"
+            return True, "Exit order cancelled"
+        return False, "Cancel request failed"
+
+    def set_exit(self, pos_id: str, new_price: float) -> tuple[bool, str]:
+        """Place or replace the resting exit at a new price."""
+        pos = self.get(pos_id)
+        if not pos:
+            return False, "Position not found"
+        if new_price <= 0 or new_price >= 1.0:
+            return False, "Exit price must be between $0.01 and $0.99"
+
+        # Replace a live exit: cancel first so we don't double-sell.
+        if pos.state == ManualState.EXIT_RESTING and pos.sell_order_id:
+            if not cancel_order(pos.sell_order_id):
+                return False, "Could not cancel the existing exit — not replacing"
+            pos.sell_order_id = ""
+            pos.state = ManualState.HOLDING
+
+        pos.exit_price = new_price
+        pos._exit_attempts = 0
+        pos.error = ""
+
+        if pos.state == ManualState.HOLDING and pos.filled_size > 0:
+            if self._place_exit(pos):
+                return True, f"Exit placed @ ${new_price:.2f}"
+            return False, pos.error or "Exit placement failed"
+
+        if pos.state == ManualState.PENDING_FILL:
+            pos.note = f"Buy resting — exit queued @ ${new_price:.2f}"
+            return True, f"Exit queued @ ${new_price:.2f} (placed when the buy fills)"
+
+        return True, f"Exit price set to ${new_price:.2f}"
+
+    def dismiss(self, pos_id: str) -> tuple[bool, str]:
+        pos = self.get(pos_id)
+        if not pos:
+            return False, "Position not found"
+        if pos.state not in _MANUAL_TERMINAL and pos.state != ManualState.HOLDING:
+            return False, "Only finished positions can be dismissed"
+        self.remove(pos_id)
+        return True, "Dismissed"
+
+
+manual_positions = ManualPositionManager()
+
+
 class Engine:
     """Bot engine state & control."""
 
@@ -1340,6 +1745,12 @@ class Engine:
         """Initialize the arb engine (call after ws_feed is ready)."""
         self.arb = ArbEngine(self.ws_feed)
         self.arb.log_callback = self.add_log
+        if config.MANUAL_ONLY:
+            # ARB_ENABLED defaults to true in config.py; manual-only overrides it
+            # so the engine is off in the UI as well as skipped in the bot loop.
+            self.arb.enabled = False
+            log.info("[ARB] Disabled — MANUAL_ONLY is on")
+            return
         # Apply any saved settings from settings.json
         cfg = getattr(self, '_arb_saved_cfg', None)
         if cfg and isinstance(cfg, dict):
@@ -1489,6 +1900,9 @@ def post_bids(market: MarketWindow) -> bool:
     """PHASE 1 — Queue Early: Place BOTH sides immediately to get front-of-queue.
     Only queues the NEXT upcoming market per asset (one at a time).
     The smart cancel (Phase 2) runs later at T-20s to drop the loser."""
+    # Manual-only mode: this is automated order placement, so it never runs.
+    if config.MANUAL_ONLY:
+        return False
     if market.market_id in engine.bids_posted:
         return False
     if market.market_id in engine.failed_markets:
@@ -2564,7 +2978,10 @@ def bot_loop():
                 last_fill_check = now_ts
 
             # ── Combined-Ask Arbitrage scan ─────────────────────────────
-            if engine.arb and engine.arb.enabled:
+            # Deliberately also checks MANUAL_ONLY: this branch is not gated by
+            # auto_trade_enabled, so without it the arb engine would keep
+            # placing its own orders while "auto-trade" read as OFF.
+            if engine.arb and engine.arb.enabled and not config.MANUAL_ONLY:
                 for _arb_mid, _arb_mkt in engine.watch_list.items():
                     if not engine.running:
                         break
@@ -2897,6 +3314,9 @@ def push_state():
         "tj_count": len(engine.trade_journal),
         "tj_entries": list(engine.trade_journal)[:200],
         "all_markets": all_markets,
+        "manual_positions": manual_positions.list_dicts(),
+        "manual_only": config.MANUAL_ONLY,
+        "manual_exit_default": config.MANUAL_EXIT_PRICE,
         "arb": engine.arb.stats() if engine.arb else {},
         "arb_positions": engine.arb.get_positions_list() if engine.arb else [],
     }
@@ -2923,6 +3343,8 @@ def index():
         sv_running=engine.running,
         sv_scanner_cfg=dict(engine.scanner_cfg),
         sv_scanner_auto_bid=engine.scanner_auto_bid,
+        sv_manual_exit_default=(config.MANUAL_EXIT_PRICE if config.MANUAL_EXIT_ENABLED else 0),
+        sv_manual_only=config.MANUAL_ONLY,
     )
 
 
@@ -3305,6 +3727,15 @@ def on_reset_learner():
 
 # ── Market Scanner SocketIO Events ──────────────────────────────────────────
 
+def _manual_log(msg: str, level: str = "info"):
+    """Emit a manual-position message to the main log and the scanner log pane."""
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    tagged = f"[MANUAL] {msg}"
+    engine.activity_log.appendleft({"ts": ts, "msg": tagged, "level": level})
+    socketio.emit("log", {"ts": ts, "msg": tagged, "level": level})
+    socketio.emit("scanner_log", {"ts": ts, "msg": tagged, "level": level})
+
+
 def _scanner_log(msg: str, level: str = "info"):
     """Emit a log message to both main log and scanner-specific log channel."""
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -3397,6 +3828,9 @@ def _run_scanner():
 
 def _scanner_auto_bid(markets: list, cfg: dict):
     """Auto-bid on scanner markets matching criteria."""
+    # Manual-only mode: this is automated order placement, so it never runs.
+    if config.MANUAL_ONLY:
+        return
     auto_cats = set(cfg.get("auto_bid_categories", []))
     max_ask = cfg.get("auto_bid_max_ask", 0.15)
     min_liq = cfg.get("auto_bid_min_liq", 50.0)
@@ -3499,6 +3933,10 @@ def on_update_scanner_params(data):
 
 @socketio.on("toggle_scanner_auto_bid")
 def on_toggle_scanner_auto_bid():
+    if config.MANUAL_ONLY and not engine.scanner_auto_bid:
+        _scanner_log("Auto-bid refused: MANUAL_ONLY is on (set MANUAL_ONLY=false in .env)", "warn")
+        push_state()
+        return
     engine.scanner_auto_bid = not engine.scanner_auto_bid
     state = "ON" if engine.scanner_auto_bid else "OFF"
     _scanner_log(f"Scanner auto-bid {state}", "info")
@@ -3508,7 +3946,12 @@ def on_toggle_scanner_auto_bid():
 
 @socketio.on("scanner_manual_bid")
 def on_scanner_manual_bid(data):
-    """Place a manual bid on a scanned market from the dashboard."""
+    """Place a manual bid on a scanned market, with an exit queued behind it.
+
+    Each side that gets an order is registered with the manual position
+    manager, which rests a GTC limit SELL at `exit_price` once the buy fills
+    and the tokens settle. An exit_price of 0 means "just bid, no exit".
+    """
     try:
         market_id = data.get("market_id", "")
         token_yes = data.get("token_id_yes", "") or data.get("token_yes", "")
@@ -3516,27 +3959,116 @@ def on_scanner_manual_bid(data):
         price = min(float(data.get("bid_price", data.get("price", 0.05))), config.HARD_MAX_BID_PRICE)
         size = max(10, min(10000, int(data.get("tokens", data.get("size", 100)))))
 
+        # Exit price — 0 or absent means no exit is queued.
+        try:
+            exit_price = float(data.get("exit_price", 0) or 0)
+        except (TypeError, ValueError):
+            exit_price = 0.0
+        if exit_price and not (0.0 < exit_price < 1.0):
+            _scanner_log(f"Manual bid rejected: exit ${exit_price} must be between $0.01 and $0.99", "error")
+            return
+        if exit_price and exit_price <= price:
+            _scanner_log(
+                f"Manual bid rejected: exit ${exit_price:.2f} must be above entry ${price:.2f}",
+                "error",
+            )
+            return
+
+        # Which side(s) to bid: "both" (default), "yes", or "no".
+        side = str(data.get("side", "both")).lower()
+        if side not in ("both", "yes", "no"):
+            side = "both"
+
         if not market_id or not token_yes or not token_no:
             _scanner_log("Manual bid failed: missing market data", "error")
             return
 
         question = data.get("question", market_id[:16])
+        exit_desc = f", exit @ ${exit_price:.2f}" if exit_price else ", no exit"
         _scanner_log(
-            f"MANUAL BID: {question[:60]}  ${price} x {size}/side",
+            f"MANUAL BID [{side.upper()}]: {question[:60]}  ${price} x {size}/side{exit_desc}",
             "trade",
         )
 
-        oid_yes = place_limit_buy(token_id=token_yes, price=price, size=size, market_id=market_id)
-        oid_no = place_limit_buy(token_id=token_no, price=price, size=size, market_id=market_id)
+        targets = []
+        if side in ("both", "yes"):
+            targets.append(("YES", token_yes))
+        if side in ("both", "no"):
+            targets.append(("NO", token_no))
 
-        if oid_yes or oid_no:
-            _scanner_log(f"MANUAL BIDS POSTED: {question[:60]}", "trade")
+        placed = 0
+        for side_label, token_id in targets:
+            oid = place_limit_buy(token_id=token_id, price=price, size=size, market_id=market_id)
+            if not oid:
+                _scanner_log(f"BID FAILED ({side_label}): {question[:50]}", "error")
+                continue
+            placed += 1
+            manual_positions.track(
+                market_id=market_id, question=question, token_id=token_id,
+                side_label=side_label, entry_price=price, size=size,
+                exit_price=exit_price, buy_order_id=oid,
+            )
+
+        if placed:
+            _scanner_log(
+                f"MANUAL BIDS POSTED ({placed}/{len(targets)}): {question[:50]}"
+                + (f" — exit queued @ ${exit_price:.2f}" if exit_price else ""),
+                "trade",
+            )
         else:
             _scanner_log(f"MANUAL BIDS FAILED: {question[:60]}", "error")
 
         push_state()
     except Exception as e:
         _scanner_log(f"Manual bid error: {e}", "error")
+
+
+# ── Manual Position Controls ────────────────────────────────────────────────
+# Every one of these is a button in the Manual Positions table. Nothing here
+# runs on a timer or a signal — the manager only ever follows through on an
+# order a person already placed.
+
+@socketio.on("manual_cancel_buy")
+def on_manual_cancel_buy(data):
+    """Cancel a manual buy order that has not filled yet."""
+    pos_id = (data or {}).get("id", "")
+    ok, msg = manual_positions.cancel_buy(pos_id)
+    _manual_log(msg, "trade" if ok else "warn")
+    push_state()
+
+
+@socketio.on("manual_cancel_exit")
+def on_manual_cancel_exit(data):
+    """Pull a resting exit order back out of the book."""
+    pos_id = (data or {}).get("id", "")
+    ok, msg = manual_positions.cancel_exit(pos_id)
+    _manual_log(msg, "trade" if ok else "warn")
+    push_state()
+
+
+@socketio.on("manual_set_exit")
+def on_manual_set_exit(data):
+    """Place or re-price the resting exit on a manual position."""
+    data = data or {}
+    pos_id = data.get("id", "")
+    try:
+        new_price = float(data.get("exit_price", 0) or 0)
+    except (TypeError, ValueError):
+        _manual_log("Invalid exit price", "error")
+        return
+    ok, msg = manual_positions.set_exit(pos_id, new_price)
+    _manual_log(msg, "trade" if ok else "error")
+    push_state()
+
+
+@socketio.on("manual_dismiss")
+def on_manual_dismiss(data):
+    """Drop a finished position from the table."""
+    pos_id = (data or {}).get("id", "")
+    ok, msg = manual_positions.dismiss(pos_id)
+    if not ok:
+        _manual_log(msg, "warn")
+    push_state()
 
 
 @socketio.on("clear_afterhours")
@@ -3553,6 +4085,10 @@ def on_clear_afterhours():
 def on_toggle_auto_trade(data):
     """Toggle auto-trade on/off from dashboard."""
     val = data.get("enabled", False) if isinstance(data, dict) else False
+    if config.MANUAL_ONLY and val:
+        engine.add_log("Auto-trade refused: MANUAL_ONLY is on (set MANUAL_ONLY=false in .env)", "warn")
+        push_state()
+        return
     engine.auto_trade_enabled = bool(val)
     _save_settings()
     engine.add_log(f"Auto-trade {'ENABLED' if engine.auto_trade_enabled else 'DISABLED'}", "trade")
@@ -3603,6 +4139,14 @@ def on_arb_update_params(data):
 @socketio.on("arb_manual")
 def on_arb_manual(data):
     """Manually trigger an arb on a specific market from the dashboard."""
+    if config.MANUAL_ONLY:
+        engine.add_log(
+            "[ARB] Manual arb refused: MANUAL_ONLY is on. Use the scanner's BID "
+            "button, which tracks the position and rests an exit.",
+            "warn",
+        )
+        push_state()
+        return
     if not engine.arb:
         engine.add_log("[ARB] Engine not initialized", "error")
         return
@@ -4669,6 +5213,66 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
+<!-- Manual Trading Controls -->
+<div style="padding: 12px 24px 0 24px;">
+  <div class="scanner-autobid-section">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+      <div class="scanner-section-label" style="margin:0">Manual Bid Defaults</div>
+      <span id="manual-only-badge" class="scanner-status off" style="display:none;">MANUAL ONLY</span>
+    </div>
+    <div class="scanner-filter-group">
+      <div class="control-group">
+        <label>Default Exit $</label>
+        <input type="number" id="manual-exit-default" step="0.01" min="0" max="0.99"
+               value="{{ sv_manual_exit_default }}"
+               title="Pre-fills the Exit $ box on every scanned market. 0 = no exit.">
+      </div>
+      <div class="control-group">
+        <label>Sides to Bid</label>
+        <select id="manual-bid-side" class="scan-row-input" style="width:100%;">
+          <option value="both">Both (YES + NO)</option>
+          <option value="yes">YES only</option>
+          <option value="no">NO only</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:6px; font-size:11px; color:var(--dim); line-height:1.5;">
+      A bid with an exit price rests a GTC limit SELL as soon as the buy fills and the
+      conditional tokens settle &mdash; so the order is already in the book when a spike
+      comes. Tokens usually settle in a few seconds; the exit cannot be placed before then.
+    </div>
+  </div>
+</div>
+
+<!-- Manual Positions -->
+<div style="padding: 12px 24px 0 24px;">
+  <div class="card">
+    <div class="card-title">Manual Positions
+      <span id="mp-count-label" style="color:var(--dim);font-size:11px;margin-left:8px;">(0)</span>
+    </div>
+    <div class="card-body" style="padding:0; max-height:340px; overflow-y:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th style="text-align:center">Side</th>
+            <th style="text-align:right">Entry</th>
+            <th style="text-align:right">Filled</th>
+            <th style="text-align:right">Cost</th>
+            <th style="text-align:center">Exit $</th>
+            <th style="text-align:right">If Filled</th>
+            <th>Status</th>
+            <th style="text-align:center">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="mp-body">
+          <tr><td colspan="9" class="empty">No manual positions yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <!-- Scanner Results Table -->
 <div class="scanner-results-wrap">
   <div class="card">
@@ -4685,12 +5289,13 @@ DASHBOARD_HTML = r"""
             <th style="text-align:right">Ask NO</th>
             <th style="text-align:right">Combined</th>
             <th style="text-align:center">Bid $</th>
+            <th style="text-align:center">Exit $</th>
             <th style="text-align:center">Shares</th>
             <th style="text-align:center">Action</th>
           </tr>
         </thead>
         <tbody id="scan-results-body">
-          <tr><td colspan="10" class="empty">Scanner not started</td></tr>
+          <tr><td colspan="11" class="empty">Scanner not started</td></tr>
         </tbody>
       </table>
     </div>
@@ -5291,16 +5896,62 @@ function toggleScannerAutoBid() {
 function scannerManualBid(rowIdx, marketId, tokenYes, tokenNo, question) {
   const priceEl = document.getElementById('scan-row-price-' + rowIdx);
   const sizeEl = document.getElementById('scan-row-size-' + rowIdx);
+  const exitEl = document.getElementById('scan-row-exit-' + rowIdx);
+  const sideEl = document.getElementById('manual-bid-side');
   const price = priceEl ? parseFloat(priceEl.value) || 0.05 : 0.05;
   const size = sizeEl ? parseInt(sizeEl.value) || 100 : 100;
+  const exitPrice = exitEl ? parseFloat(exitEl.value) || 0 : 0;
+  const side = sideEl ? sideEl.value : 'both';
+
+  if (exitPrice && exitPrice <= price) {
+    alert('Exit price ($' + exitPrice.toFixed(2) + ') must be above the bid price ($' +
+          price.toFixed(2) + ').');
+    return;
+  }
+  const sideDesc = side === 'both' ? 'BOTH sides' : side.toUpperCase() + ' only';
+  const exitDesc = exitPrice
+    ? 'Exit will rest at $' + exitPrice.toFixed(2) + ' once filled.'
+    : 'NO exit will be queued.';
+  if (!confirm('Bid $' + price.toFixed(2) + ' x ' + size + ' shares on ' + sideDesc +
+               '.\n' + exitDesc + '\n\nPlace this order?')) {
+    return;
+  }
+
   socket.emit('scanner_manual_bid', {
     market_id: marketId,
     token_id_yes: tokenYes,
     token_id_no: tokenNo,
     question: question,
     bid_price: price,
-    tokens: size
+    tokens: size,
+    exit_price: exitPrice,
+    side: side
   });
+}
+
+// ── Manual position controls ──
+function manualCancelBuy(id) {
+  if (!confirm('Cancel this unfilled buy order?')) return;
+  socket.emit('manual_cancel_buy', {id: id});
+}
+
+function manualCancelExit(id) {
+  if (!confirm('Pull this resting exit out of the book?\nYou will still hold the shares.')) return;
+  socket.emit('manual_cancel_exit', {id: id});
+}
+
+function manualSetExit(id) {
+  const el = document.getElementById('mp-exit-' + id);
+  const price = el ? parseFloat(el.value) || 0 : 0;
+  if (!price || price <= 0 || price >= 1) {
+    alert('Enter an exit price between $0.01 and $0.99.');
+    return;
+  }
+  socket.emit('manual_set_exit', {id: id, exit_price: price});
+}
+
+function manualDismiss(id) {
+  socket.emit('manual_dismiss', {id: id});
 }
 
 // ── Cost preview live update ──
@@ -5698,6 +6349,95 @@ socket.on('state', (d) => {
     document.getElementById('scan-st-cats').textContent = catParts.length > 0 ? catParts.join(', ') : '--';
   }
 
+  // ── Manual positions table ──
+  if (d.manual_only !== undefined) {
+    const mob = document.getElementById('manual-only-badge');
+    if (mob) mob.style.display = d.manual_only ? 'inline-block' : 'none';
+  }
+  const mps = d.manual_positions || [];
+  const mpBody = document.getElementById('mp-body');
+  const mpCount = document.getElementById('mp-count-label');
+  if (mpCount) mpCount.textContent = '(' + mps.length + ')';
+  if (mpBody) {
+    if (mps.length === 0) {
+      mpBody.innerHTML = '<tr><td colspan="9" class="empty">No manual positions yet</td></tr>';
+    } else {
+      // Preserve any exit box the user is mid-edit on
+      const prevMpExits = {};
+      mpBody.querySelectorAll('input[id^="mp-exit-"]').forEach(el => {
+        if (document.activeElement === el || el.dataset.dirty === '1') {
+          prevMpExits[el.id.replace('mp-exit-', '')] = el.value;
+        }
+      });
+
+      // state -> [label, css colour var]
+      const stateInfo = {
+        pending_fill: ['BUY RESTING', 'var(--yellow)'],
+        settling:     ['SETTLING',    'var(--yellow)'],
+        exit_resting: ['EXIT RESTING','var(--green)'],
+        holding:      ['HOLDING',     'var(--orange)'],
+        exited:       ['EXITED',      'var(--green)'],
+        cancelled:    ['CANCELLED',   'var(--dim)'],
+        failed:       ['FAILED',      'var(--red)']
+      };
+
+      let mHtml = '';
+      mps.forEach(p => {
+        const info = stateInfo[p.state] || [p.state.toUpperCase(), 'var(--dim)'];
+        const q = (p.question || '').length > 44
+          ? p.question.substring(0, 41) + '...' : (p.question || '--');
+        const exitVal = (p.id in prevMpExits) ? prevMpExits[p.id]
+                                              : (p.exit_price > 0 ? p.exit_price : '');
+        const filled = p.filled_size > 0
+          ? p.filled_size + (p.filled_size < p.size ? '/' + p.size : '')
+          : '--';
+        const pot = p.potential_pnl !== 0
+          ? '<span style="color:' + (p.potential_pnl > 0 ? 'var(--green)' : 'var(--red)') + '">$' +
+            p.potential_pnl.toFixed(2) + '</span>'
+          : '--';
+
+        // Buttons depend on what is actually actionable in this state
+        let actions = '';
+        if (p.state === 'pending_fill') {
+          actions += '<button class="btn-sm" onclick="manualCancelBuy(\'' + p.id +
+                     '\')" title="Cancel the unfilled buy">CANCEL BUY</button> ';
+        }
+        if (p.state === 'exit_resting') {
+          actions += '<button class="btn-sm" onclick="manualCancelExit(\'' + p.id +
+                     '\')" title="Pull the resting exit">CANCEL EXIT</button> ';
+        }
+        if (p.state === 'holding' || p.state === 'exit_resting' || p.state === 'pending_fill') {
+          actions += '<button class="btn-sm" onclick="manualSetExit(\'' + p.id +
+                     '\')" title="Place or re-price the exit">SET EXIT</button> ';
+        }
+        if (p.state === 'exited' || p.state === 'cancelled' || p.state === 'holding') {
+          actions += '<button class="btn-sm" onclick="manualDismiss(\'' + p.id +
+                     '\')" title="Remove from this table">DISMISS</button>';
+        }
+
+        const note = (p.error ? p.error + ' — ' : '') + (p.note || '');
+        mHtml += '<tr>' +
+          '<td title="' + (p.question || '').replace(/"/g, '&quot;') + '">' + q + '</td>' +
+          '<td style="text-align:center">' + p.side + '</td>' +
+          '<td style="text-align:right">$' + p.entry_price.toFixed(3) + '</td>' +
+          '<td style="text-align:right">' + filled + '</td>' +
+          '<td style="text-align:right">$' + p.cost.toFixed(2) + '</td>' +
+          '<td style="text-align:center">' +
+            '<input type="number" class="scan-row-input" id="mp-exit-' + p.id + '" ' +
+            'step="0.01" min="0.01" max="0.99" value="' + exitVal + '" ' +
+            'oninput="this.dataset.dirty=1">' +
+          '</td>' +
+          '<td style="text-align:right">' + pot + '</td>' +
+          '<td><span style="color:' + info[1] + ';font-weight:700;font-size:11px;">' +
+            info[0] + '</span>' +
+            '<div style="color:var(--dim);font-size:10px;">' + note + '</div></td>' +
+          '<td style="text-align:center;white-space:nowrap">' + actions + '</td>' +
+          '</tr>';
+      });
+      mpBody.innerHTML = mHtml;
+    }
+  }
+
   // Scanner results table
   const scanResults = d.scanner_results || [];
   document.getElementById('scan-st-found').textContent = scanResults.length;
@@ -5705,7 +6445,7 @@ socket.on('state', (d) => {
 
   const scanBody = document.getElementById('scan-results-body');
   if (scanResults.length === 0) {
-    scanBody.innerHTML = '<tr><td colspan="10" class="empty">' +
+    scanBody.innerHTML = '<tr><td colspan="11" class="empty">' +
       (scannerRunning ? 'Scanning...' : 'Scanner not started') + '</td></tr>';
   } else {
     // Preserve per-row input values across state updates
@@ -5719,9 +6459,15 @@ socket.on('state', (d) => {
       const idx = el.id.replace('scan-row-size-', '');
       if (document.activeElement === el || el.dataset.dirty === '1') prevSizes[idx] = el.value;
     });
+    const prevExits = {};
+    scanBody.querySelectorAll('input[id^="scan-row-exit-"]').forEach(el => {
+      const idx = el.id.replace('scan-row-exit-', '');
+      if (document.activeElement === el || el.dataset.dirty === '1') prevExits[idx] = el.value;
+    });
 
     const defaultPrice = parseFloat(document.getElementById('scan-ab-price').value) || 0.05;
     const defaultSize = parseInt(document.getElementById('scan-ab-size').value) || 100;
+    const defaultExit = parseFloat(document.getElementById('manual-exit-default').value) || 0;
     let sHtml = '';
     scanResults.forEach((m, idx) => {
       const secsLeft = Math.max(0, Math.round((new Date(m.end_time).getTime() / 1000) - (Date.now() / 1000)));
@@ -5741,6 +6487,7 @@ socket.on('state', (d) => {
       // Use preserved value if user was editing, otherwise default
       const rowPrice = (idx in prevPrices) ? prevPrices[idx] : defaultPrice;
       const rowSize = (idx in prevSizes) ? prevSizes[idx] : defaultSize;
+      const rowExit = (idx in prevExits) ? prevExits[idx] : defaultExit;
       sHtml += '<tr>' +
         '<td title="' + (m.question || '').replace(/"/g, '&quot;') + '">' + question + '</td>' +
         '<td><span class="cat-badge ' + catCls + '">' + m.category + '</span></td>' +
@@ -5752,6 +6499,12 @@ socket.on('state', (d) => {
         '<td style="text-align:center">' +
           '<input type="number" class="scan-row-input" id="scan-row-price-' + idx + '" ' +
           'step="0.01" min="0.01" max="0.50" value="' + rowPrice + '" ' +
+          'oninput="this.dataset.dirty=1">' +
+        '</td>' +
+        '<td style="text-align:center">' +
+          '<input type="number" class="scan-row-input scan-row-exit" id="scan-row-exit-' + idx + '" ' +
+          'step="0.01" min="0" max="0.99" value="' + rowExit + '" ' +
+          'title="Resting sell placed once the buy fills. 0 = no exit." ' +
           'oninput="this.dataset.dirty=1">' +
         '</td>' +
         '<td style="text-align:center">' +
@@ -6873,6 +7626,21 @@ if __name__ == "__main__":
     |    Open http://localhost:5050 in your browser      |
     +===================================================+
     """)
+    if config.MANUAL_ONLY:
+        print(
+            "    MANUAL ONLY — nothing trades on its own.\n"
+            "    Auto-bid, arbitrage and scanner auto-bid are all disabled.\n"
+            "    Orders are placed only when you click BID.\n"
+            "    (set MANUAL_ONLY=false in .env to allow automation)\n"
+        )
+    else:
+        print(
+            "    !! AUTOMATION ALLOWED — MANUAL_ONLY is off.\n"
+            "    The arb engine is NOT covered by the auto-trade toggle and\n"
+            "    can place orders on its own once the bot is started.\n"
+        )
+    print(f"    Mode: {'PAPER (simulated)' if config.PAPER_TRADING else 'LIVE — REAL MONEY'}\n")
+
     # Suppress Flask's default request logs
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
@@ -6880,6 +7648,9 @@ if __name__ == "__main__":
     # ── Restore saved settings (bid prices, filters, scanner config) ──
     _load_settings()
     engine.add_log("Settings loaded from disk", "info")
+
+    # ── Start the manual position manager (rests exits behind manual bids) ──
+    manual_positions.start()
 
     # ── Start always-on PCM background monitor (tracks ALL markets) ──
     _pcm_thread = threading.Thread(target=pcm_background_loop, daemon=True, name="pcm-bg")

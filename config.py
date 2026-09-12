@@ -32,6 +32,17 @@ CHAIN_ID = 137
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
+# ── Manual-Only Mode ────────────────────────────────────────────────────────
+# When True, NO code path may place an order on its own. Every order must
+# originate from an explicit click in the dashboard. This disables:
+#   - the 5-min Up/Down auto-bid engine (post_bids)
+#   - the combined-ask arbitrage engine's automatic scanning
+#   - the scanner's auto-bid sweep
+# and refuses the dashboard toggles that would turn any of them back on.
+# Manual bids, manual exits and manual cancels are unaffected.
+# Defaults to True — automation is opt-in, not opt-out.
+MANUAL_ONLY = os.getenv("MANUAL_ONLY", "true").lower() == "true"
+
 # ── Limit Bid Strategy ─────────────────────────────────────────────────────
 BID_PRICE = float(os.getenv("BID_PRICE", "0.01"))       # Limit buy price per share (lowered from $0.02 to $0.01)
 TOKENS_PER_SIDE = int(os.getenv("TOKENS_PER_SIDE", "100"))  # Shares per side (locked at 100 for consistency)
@@ -63,6 +74,16 @@ ARB_MAX_POSITIONS = int(os.getenv("ARB_MAX_POSITIONS", "3"))   # Max concurrent 
 ARB_COOLDOWN = float(os.getenv("ARB_COOLDOWN", "30"))         # Seconds between arbs on same market
 ARB_FILL_TIMEOUT = float(os.getenv("ARB_FILL_TIMEOUT", "45")) # Cancel unfilled arb orders after Ns
 ARB_MAX_DAILY_SPEND = float(os.getenv("ARB_MAX_DAILY_SPEND", "25.00"))  # Daily spend cap for arb
+
+# ── Manual Exit Defaults ───────────────────────────────────────────────────
+# Default resting exit price for manually placed bids, in $ per share.
+# A buy that fills is followed by a GTC limit SELL at this price, placed as
+# soon as the conditional tokens settle into the wallet.
+MANUAL_EXIT_PRICE = float(os.getenv("MANUAL_EXIT_PRICE", "0.85"))
+MANUAL_EXIT_ENABLED = os.getenv("MANUAL_EXIT_ENABLED", "true").lower() == "true"
+# How long to keep polling for token settlement before giving up (seconds).
+MANUAL_SETTLE_TIMEOUT = float(os.getenv("MANUAL_SETTLE_TIMEOUT", "120"))
+
 
 # ── Scalper Defaults ───────────────────────────────────────────────────────
 SCALP_TRADE_SIZE = float(os.getenv("SCALP_TRADE_SIZE", "2.50"))      # $ per scalp trade
@@ -100,6 +121,7 @@ def print_config_summary():
     """Print a human-readable summary of the active configuration."""
     mode = "PAPER TRADING" if PAPER_TRADING else "LIVE TRADING"
     enabled = "ENABLED" if TRADING_ENABLED else "PAUSED"
+    manual = "MANUAL ONLY (no auto-trading)" if MANUAL_ONLY else "AUTOMATION ALLOWED"
     cost_per_market = BID_PRICE * TOKENS_PER_SIDE * 2
     profit_if_both = (TOKENS_PER_SIDE * 1.0) - cost_per_market
     profit_if_one = (TOKENS_PER_SIDE * 1.0) - (BID_PRICE * TOKENS_PER_SIDE)
@@ -110,6 +132,7 @@ def print_config_summary():
 +======================================================+
 |  Mode:              {mode:<35}|
 |  Trading:           {enabled:<35}|
+|  Orders:            {manual:<35}|
 |  CLOB URL:          {CLOB_URL:<35}|
 +------------------------------------------------------+
 |  LIMIT BID STRATEGY                                  |
