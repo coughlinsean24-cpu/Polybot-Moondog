@@ -715,6 +715,28 @@ def get_order_status(order_id: str) -> dict:
         return {"status": "unknown", "size_matched": 0.0, "original_size": 0.0}
 
 
+def get_trades_for_order(order_id: str) -> list[dict]:
+    """
+    Executed trades for one of our orders, straight from the CLOB.
+
+    This is the only source of the fee the exchange ACTUALLY charged — every
+    other number in the bot is a formula. Returns [] in paper mode or on any
+    error, and callers must then fall back to the estimate and say so.
+    """
+    if config.PAPER_TRADING or not order_id:
+        return []
+    try:
+        from py_clob_client.clob_types import TradeParams
+        client = get_clob_client()
+        result = client.get_trades(TradeParams(id=order_id))
+        if isinstance(result, dict):
+            result = result.get("data", []) or []
+        return [t for t in (result or []) if isinstance(t, dict)]
+    except Exception as e:
+        log.debug(f"get_trades_for_order({order_id}) failed: {e}")
+        return []
+
+
 def get_open_orders() -> list[dict]:
     """Fetch all currently open orders from the CLOB."""
     if config.PAPER_TRADING:

@@ -1,25 +1,40 @@
 """
 Polybot Snipez — Polymarket Fee Model
 
-Polymarket charges TAKERS only.  The fee is quoted in USDC and scales with
-the variance of the outcome, so it is largest at 50c and shrinks toward the
-extremes:
+Three different numbers get called "the fee". They are kept apart here,
+because conflating the first two overstated our costs by ~43%:
 
-    fee_usdc = shares * rate * price * (1 - price)
+  fee_rate_raw       The ORDER SIGNING parameter. The CLOB's
+                     GET /fee-rate returns {"base_fee": 1000} and Gamma
+                     reports makerBaseFee = takerBaseFee = 1000 on the same
+                     market. It is the feeRateBps field carried inside the
+                     signed order — a ceiling the order authorises, not a
+                     price. The giveaway is that the MAKER side reads 1000 on
+                     a market whose schedule says makers are never charged.
 
-`rate` is the market's base fee, published by the CLOB in basis points via
-GET /fee-rate?token_id=...  ("base_fee": 1000 == 0.10).  The docs quote 0.07
-for the crypto category, but the 5-minute Up/Down markets this bot trades
-report 1000 bps, so the rate is always read live per token and only falls
-back to the configured default when the endpoint cannot be reached.
+  economic_fee_rate  What actually costs money. Gamma's feeSchedule, which on
+                     every 5-minute crypto market (BTC/ETH/SOL/XRP, feeType
+                     crypto_fees_v2) reads:
+                         {rate: 0.07, exponent: 1, takerOnly: true,
+                          rebateRate: 0.2}
+                     matching the published crypto category rate of 0.07:
+                         fee = size * rate * (p * (1 - p)) ** exponent
+                     charged in USDC, takers only.
 
-Makers are not charged.  A resting sell that is never crossed by us costs
-nothing, which is the whole reason the take-profit leg is a resting limit.
+  actual_fee         What the exchange says it charged on our executed order.
+                     Read back from the CLOB trades endpoint in live mode and
+                     preferred over any formula. Unavailable in paper mode,
+                     where the estimate is all there is — and is labelled so.
 
-Worked example (entry at 90c, rate 0.10):
-    1 share  -> 0.10 * 0.90 * 0.10 = $0.009   (0.9c per share)
-    556 sh   -> $5.00 on a $500 entry
-That is ~10% of the 9c gross move, so it is never ignored in P&L.
+Worked example at the 0.07 economic rate (was 0.10 under the old reading):
+    27 shares @ $0.90 -> 27 * 0.07 * 0.9 * 0.1 = $0.17   (0.63c/share)
+    resting sell @ $0.99, maker                 = $0.00
+Still ~7% of a 9c gross move, so it is never ignored — just no longer
+inflated by half again.
+
+The maker rebateRate (0.2) is NOT modelled: a rebate would only improve our
+side, and assuming money we have not seen would be the same mistake in the
+other direction.
 """
 
 import threading
@@ -29,94 +44,211 @@ import requests
 
 import config
 
-# Fees are rounded to 5 decimal places by the exchange; anything smaller is
-# dropped entirely.
+# Fees are rounded to 5 decimal places by the exchange; smaller is dropped.
 FEE_DECIMALS = 5
 MIN_FEE = 0.00001
 
 _FEE_RATE_URL = "/fee-rate"
+_GAMMA_MARKETS = "/markets"
 
-# token_id -> (rate, fetched_at)
-_rate_cache: dict[str, tuple[float, float]] = {}
-_cache_lock = threading.Lock()
-_CACHE_TTL = 3600.0  # base fees do not move intraday
-
-
-def default_rate() -> float:
-    """Configured fallback fee coefficient (not bps)."""
-    return max(0.0, config.S9099_FEE_RATE_DEFAULT_BPS / 10_000.0)
+_lock = threading.Lock()
+_signing_cache: dict[str, tuple] = {}    # token_id -> (bps, ts)
+_schedule_cache: dict[str, tuple] = {}   # key -> (Schedule, ts)
+_CACHE_TTL = 3600.0
 
 
-def fee_rate_for_token(token_id: str, timeout: float = 4.0) -> float:
+class Schedule:
+    """A market's economic fee schedule."""
+
+    __slots__ = ("rate", "exponent", "taker_only", "rebate_rate", "source")
+
+    def __init__(self, rate: float, exponent: float = 1.0, taker_only: bool = True,
+                 rebate_rate: float = 0.0, source: str = "default"):
+        self.rate = rate
+        self.exponent = exponent
+        self.taker_only = taker_only
+        self.rebate_rate = rebate_rate
+        self.source = source     # "gamma" when read live, "default" when not
+
+    def as_dict(self) -> dict:
+        return {
+            "economic_fee_rate": self.rate,
+            "fee_exponent": self.exponent,
+            "fee_taker_only": self.taker_only,
+            "fee_rebate_rate": self.rebate_rate,
+            "fee_schedule_source": self.source,
+        }
+
+    def __repr__(self):
+        return (f"Schedule(rate={self.rate}, exponent={self.exponent}, "
+                f"taker_only={self.taker_only}, source={self.source})")
+
+
+def default_schedule() -> Schedule:
+    return Schedule(
+        rate=config.S9099_FEE_ECONOMIC_RATE_DEFAULT,
+        exponent=config.S9099_FEE_EXPONENT_DEFAULT,
+        taker_only=config.S9099_FEE_TAKER_ONLY_DEFAULT,
+        source="default",
+    )
+
+
+# ── the signing parameter (NOT a price) ──────────────────────────────────
+
+def signing_fee_rate_bps(token_id: str, timeout: float = 4.0) -> float:
     """
-    Return the market's fee coefficient for a token (e.g. 0.10).
+    The order's feeRateBps parameter, from GET /fee-rate.
 
-    Reads GET {CLOB_URL}/fee-rate?token_id=... and caches the answer.
-    Falls back to the configured default on any failure — never raises, and
-    never returns a rate lower than the default, so a dead endpoint cannot
-    make a trade look cheaper than it is.
+    Recorded for completeness and for signing; never used to price a fill.
     """
     if not token_id:
-        return default_rate()
-
+        return config.S9099_FEE_SIGNING_BPS_DEFAULT
     now = time.time()
-    with _cache_lock:
-        cached = _rate_cache.get(token_id)
-        if cached and now - cached[1] < _CACHE_TTL:
-            return cached[0]
+    with _lock:
+        hit = _signing_cache.get(token_id)
+        if hit and now - hit[1] < _CACHE_TTL:
+            return hit[0]
 
-    rate = default_rate()
+    bps = config.S9099_FEE_SIGNING_BPS_DEFAULT
     try:
-        resp = requests.get(
-            f"{config.CLOB_URL}{_FEE_RATE_URL}",
-            params={"token_id": token_id},
-            timeout=timeout,
-        )
+        resp = requests.get(f"{config.CLOB_URL}{_FEE_RATE_URL}",
+                            params={"token_id": token_id}, timeout=timeout)
         if resp.status_code == 200:
-            bps = float(resp.json().get("base_fee", 0) or 0)
-            if bps > 0:
-                rate = bps / 10_000.0
+            value = float(resp.json().get("base_fee", 0) or 0)
+            if value > 0:
+                bps = value
     except Exception:
-        pass  # keep the default — fee estimates must never block a decision
+        pass
+    with _lock:
+        _signing_cache[token_id] = (bps, now)
+    return bps
 
-    with _cache_lock:
-        _rate_cache[token_id] = (rate, now)
-    return rate
 
+# ── the economic schedule (what costs money) ─────────────────────────────
 
-def taker_fee(shares: float, price: float, rate: float | None = None) -> float:
+def schedule_for_market(condition_id: str = "", token_id: str = "",
+                        timeout: float = 5.0) -> Schedule:
     """
-    USDC fee for a TAKER fill of `shares` at `price`.
-
-        fee = shares * rate * price * (1 - price)
+    Read this market's feeSchedule from Gamma. Falls back to the configured
+    default — never to zero, so a lookup failure cannot make a trade look
+    cheaper than it is.
     """
-    if shares <= 0 or price <= 0 or price >= 1:
+    key = condition_id or token_id
+    if not key:
+        return default_schedule()
+    now = time.time()
+    with _lock:
+        hit = _schedule_cache.get(key)
+        if hit and now - hit[1] < _CACHE_TTL:
+            return hit[0]
+
+    schedule = default_schedule()
+    try:
+        params = ({"condition_ids": condition_id} if condition_id
+                  else {"clob_token_ids": token_id})
+        resp = requests.get(f"{config.GAMMA_URL}{_GAMMA_MARKETS}",
+                            params=params, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            market = data[0] if isinstance(data, list) and data else {}
+            raw = market.get("feeSchedule") or {}
+            if market.get("feesEnabled") is False:
+                schedule = Schedule(rate=0.0, source="gamma_fees_disabled")
+            elif raw.get("rate") is not None:
+                schedule = Schedule(
+                    rate=float(raw.get("rate", 0) or 0),
+                    exponent=float(raw.get("exponent", 1) or 1),
+                    taker_only=bool(raw.get("takerOnly", True)),
+                    rebate_rate=float(raw.get("rebateRate", 0) or 0),
+                    source="gamma",
+                )
+    except Exception:
+        pass
+    with _lock:
+        _schedule_cache[key] = (schedule, now)
+    return schedule
+
+
+# ── estimates ────────────────────────────────────────────────────────────
+
+def estimate_fee(shares: float, price: float, is_taker: bool,
+                 schedule: Schedule | None = None) -> float:
+    """
+    Estimated USDC fee for a fill:  size * rate * (p * (1 - p)) ** exponent
+
+    Makers pay nothing under `taker_only` (which every 5-min crypto market
+    currently sets), unless S9099_FEES_CHARGE_MAKER is turned on to model a
+    future change.
+    """
+    sched = schedule or default_schedule()
+    if shares <= 0 or price <= 0 or price >= 1 or sched.rate <= 0:
         return 0.0
-    r = default_rate() if rate is None else rate
-    fee = shares * r * price * (1.0 - price)
-    fee = round(fee, FEE_DECIMALS)
+    if not is_taker and sched.taker_only and not config.S9099_FEES_CHARGE_MAKER:
+        return 0.0
+    variance = price * (1.0 - price)
+    if sched.exponent != 1:
+        variance = variance ** sched.exponent
+    fee = round(shares * sched.rate * variance, FEE_DECIMALS)
     return fee if fee >= MIN_FEE else 0.0
 
 
-def maker_fee(shares: float, price: float, rate: float | None = None) -> float:
-    """
-    USDC fee for a MAKER fill.  Zero under the published fee schedule.
+# Kept so existing callers and tests keep working; both now take a Schedule.
+def taker_fee(shares: float, price: float, schedule: Schedule | None = None) -> float:
+    return estimate_fee(shares, price, True, schedule)
 
-    S9099_FEES_CHARGE_MAKER exists only so the bot keeps reporting honest
-    numbers if Polymarket ever starts charging makers; leave it false.
-    """
-    if not config.S9099_FEES_CHARGE_MAKER:
-        return 0.0
-    return taker_fee(shares, price, rate)
+
+def maker_fee(shares: float, price: float, schedule: Schedule | None = None) -> float:
+    return estimate_fee(shares, price, False, schedule)
 
 
 def fee_for_fill(shares: float, price: float, is_taker: bool,
-                 rate: float | None = None) -> float:
-    """Fee for one fill, picking the maker/taker schedule."""
-    return taker_fee(shares, price, rate) if is_taker else maker_fee(shares, price, rate)
+                 schedule: Schedule | None = None) -> float:
+    return estimate_fee(shares, price, is_taker, schedule)
+
+
+# ── actual fees, straight from the exchange ──────────────────────────────
+
+def actual_fee_for_order(order_id: str, trades_fn=None) -> tuple:
+    """
+    (fee, source) for one of our executed orders, from the CLOB trades feed.
+
+    Returns (None, reason) when the exchange cannot tell us — paper mode, no
+    credentials, no trades yet, or a response with no fee field. Callers must
+    fall back to the estimate and label it as such, never silently.
+    """
+    if not order_id:
+        return None, "no_order_id"
+    if config.PAPER_TRADING:
+        return None, "paper_mode"
+    if not config.S9099_USE_ACTUAL_FEES:
+        return None, "disabled"
+    try:
+        if trades_fn is None:
+            from polymarket_client import get_trades_for_order as trades_fn  # noqa: N813
+        trades = trades_fn(order_id) or []
+    except Exception as e:
+        return None, f"lookup_error:{type(e).__name__}"
+    if not trades:
+        return None, "no_trades_reported"
+
+    total = 0.0
+    found = False
+    for trade in trades:
+        for key in ("fee", "fee_amount", "taker_fee", "fee_paid", "fees"):
+            if key in trade and trade[key] not in (None, ""):
+                try:
+                    total += float(trade[key])
+                    found = True
+                except (TypeError, ValueError):
+                    continue
+                break
+    if not found:
+        return None, "no_fee_field_in_trades"
+    return round(total, FEE_DECIMALS), "clob_trades"
 
 
 def clear_cache():
-    """Drop cached fee rates (tests, or after a config change)."""
-    with _cache_lock:
-        _rate_cache.clear()
+    """Drop cached schedules and signing rates (tests, or after a config change)."""
+    with _lock:
+        _signing_cache.clear()
+        _schedule_cache.clear()

@@ -48,6 +48,7 @@ from datetime import datetime, timezone, timedelta
 
 import config
 import fees
+from settlement_ref import SettlementReference
 from logger import log
 from data_recorder import candidate_log, candidate_outcome_log, trade_9099_log
 
@@ -95,33 +96,146 @@ class OrderState:
     liquidity: str = "unknown"  # maker / taker
     created: float = 0.0
 
+    # ── queue bookkeeping (paper sells) ──
+    queue_ahead: float = 0.0        # shares that must trade before ours can
+    consumed: float = 0.0           # shares traded through our level since we joined
+    level_size_at_submit: float = 0.0
+    level_size_min: float = 0.0
+    level_size_last: float = 0.0
+    fill_evidence: str = ""         # marketable / queue_consumed / trade_through
+    # Maker or taker is decided by the book WHEN WE SUBMIT: an order that
+    # rested and was later hit is a maker fill (free) even though the bid
+    # reaches our price at the moment it trades.
+    marketable_at_submit: bool = False
+    # The old, optimistic answer, kept side by side so the two can be compared.
+    optimistic_filled: bool = False
+    optimistic_fill_ts: float = 0.0
+    queue_fill_ts: float = 0.0
+
     @property
     def done(self) -> bool:
         return self.status in ("matched", "cancelled")
+
+
+@dataclass
+class QueueFill:
+    """How much of a resting sell the executed tape can justify filling."""
+    consumed: float = 0.0
+    queue_ahead: float = 0.0
+    fillable: float = 0.0          # shares of OURS the tape has reached
+    optimistic: bool = False       # the market merely quoted/printed our price
+    evidence: str = ""             # why we believe we were executed
+
+
+def evaluate_queue_fill(px, price: float, submitted_ts: float,
+                        queue_ahead: float, qty: float,
+                        trade_through: bool = True,
+                        crossed_on_entry: bool = False) -> QueueFill:
+    """
+    Decide how much of a resting SELL at `price` the tape justifies filling.
+
+    The book only tells us a price EXISTS. Executed trade prints tell us
+    volume actually went through, and only volume ahead of us being consumed
+    gets us filled:
+
+        consumed  = taker BUY volume at or below our price since we joined
+                    (better-priced asks are lifted before ours)
+        fillable  = consumed - queue_ahead
+
+    Three things count as proof rather than inference:
+      crossed       the bid was already at/above our price when we SUBMITTED,
+                    so we were the aggressor and traded on arrival
+      level_cleared while we rested, the bid reached our price AND the ask
+                    side moved above it — every offer at our price, ours
+                    included, is gone
+      trade_through something printed ABOVE our offer while we rested, which
+                    cannot happen unless our offer was taken first
+
+    A bid at our price with the ask still sitting there is a crossed book,
+    which cannot persist on a real CLOB — it means the two sides of the feed
+    are momentarily out of step. That is not a fill, and treating it as one
+    would smuggle the old optimism back in.
+
+    Deliberately conservative: it ignores cancellations ahead of us in the
+    queue, which in reality would move us up. Better to under-report fills
+    than to build a strategy on ones we never got.
+    """
+    state = QueueFill(queue_ahead=max(0.0, queue_ahead))
+    if qty <= 0:
+        return state
+
+    best_bid = getattr(px, "best_bid", 0.0) or 0.0
+    best_ask = getattr(px, "best_ask", 0.0) or 0.0
+    bid_size = getattr(px, "best_bid_size", 0.0) or 0.0
+
+    if crossed_on_entry:
+        # We lifted a bid that was already there. Nothing to queue behind.
+        state.optimistic = True
+        state.fillable = min(qty, bid_size) if bid_size > 0 else qty
+        state.evidence = "marketable"
+        return state
+
+    if best_bid >= price - 1e-9:
+        state.optimistic = True
+        if best_ask > price + 1e-9 and not config.S9099_REQUIRE_TAPE_EVIDENCE:
+            # Our whole price level has been cleared from the ask side and
+            # there is still demand above it. Note this covers the level being
+            # CANCELLED as well as traded — either way we move to the front,
+            # but it is an inference, which S9099_REQUIRE_TAPE_EVIDENCE drops.
+            state.fillable = min(qty, bid_size) if bid_size > 0 else qty
+            state.evidence = "level_cleared"
+            return state
+        # Crossed/locked book — stale feed, not an execution. Fall through to
+        # the tape, which cannot be faked by an out-of-step quote.
+
+    state.optimistic = bool(getattr(px, "last_trade_price", 0.0) >= price - 1e-9)
+
+    volume_since = getattr(px, "volume_since", None)
+    if volume_since is None:
+        # No tape available: fall back to the optimistic read, but say so.
+        state.fillable = qty if state.optimistic else 0.0
+        state.evidence = "no_tape_optimistic" if state.optimistic else ""
+        return state
+
+    state.consumed = volume_since(submitted_ts, side="BUY", max_price=price)
+    state.fillable = max(0.0, state.consumed - state.queue_ahead)
+    if state.fillable > 0:
+        state.evidence = "queue_consumed"
+
+    if trade_through:
+        max_print = getattr(px, "max_trade_price_since", lambda _ts: 0.0)(submitted_ts)
+        if max_print > price + 1e-9:
+            state.fillable = qty
+            state.evidence = "trade_through"
+            state.optimistic = True
+    return state
 
 
 class PaperBroker:
     """
     Simulated execution against the real live order book.
 
-    Fill rules, deliberately literal about what the book shows:
+    Fill rules:
 
-      BUY  at P  fills while best_ask <= P, taking at most the size resting
-                 at the ask.  We crossed the spread, so it is a TAKER fill.
-      SELL at P  (resting above the market) fills only once best_bid >= P —
-                 i.e. a real buyer stepped up to our price — taking at most
-                 the size bid there.  We rested, so it is a MAKER fill.
-      SELL at/below the bid fills immediately as a TAKER (emergency exit).
+      BUY  at P   fills while best_ask <= P, taking at most the size resting
+                  at the ask. We crossed the spread, so it is a TAKER fill.
+      SELL at P   marketable (best_bid >= P) fills at once as a TAKER.
+      SELL at P   resting above the market is QUEUE-AWARE: it joins behind
+                  every ask at or below P and only fills once executed trade
+                  prints have eaten through that queue. See
+                  evaluate_queue_fill.
 
-    Known optimism: queue position is invisible from the public book, so a
-    resting sell here fills as if we were first in line at that price.  Every
-    trade row carries tp_queue_ahead (the size already resting at our price
-    when we joined) so the paper numbers can be discounted honestly later.
+    The resting-sell rule used to be "best_bid reached P, so we filled",
+    which on a level carrying thousands of shares is wishful thinking. Both
+    answers are now kept: `optimistic_filled` for comparison, and the
+    queue-adjusted one for the position and the P&L.
     """
 
     name = "PAPER"
 
-    def __init__(self, feed, starting_balance: float | None = None):
+    def __init__(self, feed, starting_balance: float | None = None,
+                 book_fn=None, queue_aware: bool | None = None,
+                 trade_through: bool | None = None):
         self.feed = feed
         self.balance = float(
             config.S9099_PAPER_BANKROLL if starting_balance is None else starting_balance
@@ -129,6 +243,14 @@ class PaperBroker:
         self.orders: dict[str, OrderState] = {}
         self._seq = 0
         self._lock = threading.Lock()
+        # Returns the full book for a token; used once per sell to measure the
+        # queue in front of us. Without it we cannot know the queue and fall
+        # back to the optimistic rule (and label it).
+        self.book_fn = book_fn
+        self.queue_aware = (config.S9099_QUEUE_AWARE_TP if queue_aware is None
+                            else queue_aware)
+        self.trade_through = (config.S9099_TRADE_THROUGH_FILLS if trade_through is None
+                              else trade_through)
 
     # ── placement ────────────────────────────────────────────────────────
     def _new_id(self, side: str) -> str:
@@ -149,12 +271,54 @@ class PaperBroker:
     def place_sell(self, token_id: str, price: float, size: float,
                    market_id: str = "") -> str | None:
         oid = self._new_id("sell")
-        self.orders[oid] = OrderState(
+        now = time.time()
+        px = self.feed.get_price(token_id)
+        order = OrderState(
             order_id=oid, side="SELL", token_id=token_id,
-            price=price, size=size, created=time.time(),
+            price=price, size=size, created=now,
+            marketable_at_submit=(getattr(px, "best_bid", 0.0) or 0.0) >= price - 1e-9,
         )
-        log.info(f"[9099][PAPER] SELL {size:.0f} @ ${price:.3f} ({market_id[:10]}) -> {oid}")
+        # Measure the queue the moment we join it: every ask at or below our
+        # price trades before ours does.
+        ahead, level = self.ask_queue_ahead(token_id, price)
+        order.queue_ahead = ahead
+        order.level_size_at_submit = level
+        order.level_size_min = level
+        order.level_size_last = level
+        self.orders[oid] = order
+        log.info(
+            f"[9099][PAPER] SELL {size:.0f} @ ${price:.3f} ({market_id[:10]}) -> {oid} "
+            f"| {ahead:.0f} sh ahead of us ({level:.0f} at our price)"
+        )
         return oid
+
+    def ask_queue_ahead(self, token_id: str, price: float) -> tuple:
+        """
+        (shares ahead of us, shares resting at our exact price).
+
+        Everything offered at or below our price is in front of a new order
+        at that price — cheaper offers get lifted first, and equal offers
+        already in the book have time priority.
+        """
+        if not self.book_fn:
+            return 0.0, 0.0
+        try:
+            book = self.book_fn(token_id) or {}
+        except Exception:
+            return 0.0, 0.0
+        ahead = 0.0
+        at_level = 0.0
+        for entry in book.get("asks", []):
+            try:
+                p = float(entry.get("price", 0))
+                sz = float(entry.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if p <= price + 1e-9:
+                ahead += sz
+                if abs(p - price) < 1e-9:
+                    at_level += sz
+        return ahead, at_level
 
     def cancel(self, order_id: str) -> bool:
         o = self.orders.get(order_id)
@@ -200,17 +364,51 @@ class PaperBroker:
                 return
             self._apply_fill(o, qty, ask, "taker")
             self.balance -= qty * ask
-        else:
+            return
+
+        # ── resting / marketable SELL ────────────────────────────────────
+        # Track how the level behaves while we sit on it.
+        _, level_now = self.ask_queue_ahead(o.token_id, o.price)
+        o.level_size_last = level_now
+        o.level_size_min = min(o.level_size_min or level_now, level_now)
+
+        if not self.queue_aware:
+            # Legacy optimistic rule, kept only so it can be switched on for
+            # a like-for-like comparison.
             bid, bid_size = px.best_bid, px.best_bid_size
             if bid <= 0 or bid < o.price:
                 return
             qty = min(remaining, max(0.0, bid_size))
             if qty <= 0:
                 return
-            # Crossing our own limit means we were the aggressor.
-            liq = "taker" if o.price <= bid and o.liquidity == "taker" else "maker"
-            self._apply_fill(o, qty, max(bid, o.price) if liq == "maker" else bid, liq)
+            o.optimistic_filled = True
+            o.fill_evidence = "optimistic_mode"
+            self._apply_fill(o, qty, o.price, "maker")
             self.balance += qty * o.price
+            return
+
+        state = evaluate_queue_fill(
+            px, o.price, o.created, o.queue_ahead, o.size,
+            trade_through=self.trade_through,
+            crossed_on_entry=o.marketable_at_submit,
+        )
+        o.consumed = state.consumed
+        if state.optimistic and not o.optimistic_filled:
+            o.optimistic_filled = True
+            o.optimistic_fill_ts = time.time()
+
+        already = o.filled
+        target = min(o.size, state.fillable)
+        qty = target - already
+        if qty <= 1e-9:
+            return
+        # Crossing on the way in makes us the taker; resting and being hit
+        # does not, whatever the book looks like at the moment it trades.
+        liq = "taker" if o.marketable_at_submit else "maker"
+        o.fill_evidence = state.evidence
+        o.queue_fill_ts = o.queue_fill_ts or time.time()
+        self._apply_fill(o, min(qty, remaining), o.price, liq)
+        self.balance += min(qty, remaining) * o.price
 
     def _apply_fill(self, o: OrderState, qty: float, price: float, liquidity: str):
         total = o.avg_price * o.filled + price * qty
@@ -277,7 +475,7 @@ class LiveBroker:
         return self._pmc.get_usdc_balance()
 
 
-def make_broker(feed) -> PaperBroker | LiveBroker:
+def make_broker(feed, book_fn=None) -> PaperBroker | LiveBroker:
     """
     Pick the broker for the current config. Fails closed: anything short of a
     fully-armed live configuration gets the simulator.
@@ -285,7 +483,7 @@ def make_broker(feed) -> PaperBroker | LiveBroker:
     if config.strategy_9099_is_live():
         log.warning("[9099] LIVE BROKER ARMED — real orders, real money")
         return LiveBroker()
-    return PaperBroker(feed)
+    return PaperBroker(feed, book_fn=book_fn)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -295,12 +493,18 @@ def make_broker(feed) -> PaperBroker | LiveBroker:
 @dataclass
 class Candidate:
     """
-    One observation of a side crossing the entry threshold, plus everything
-    that happened to it afterwards — traded or not.
+    One crossing of ONE observation threshold by one side of one market, plus
+    everything that happened to it afterwards — traded or not.
 
-    This is the file that answers the question the strategy actually rests on:
-    when a 5-min contract reaches 90c with X seconds left, how often does it
-    reach 99c *with someone there to buy* before it reverses?
+    There is a record per (market, side, level), so 85c / 88c / 90c / 92c /
+    95c are each measured on their own terms. The strategy still enters only
+    at the configured entry threshold; the rest are observation, and they are
+    what will tell us whether 90c was the right choice.
+
+    Each one also carries a SHADOW take-profit: if we had bought here and
+    rested a sell at the TP, would the tape have filled it? Both answers are
+    kept — the optimistic one (the market printed the price) and the
+    queue-adjusted one (enough volume actually went through to reach us).
     """
     candidate_id: str
     market_id: str
@@ -309,6 +513,7 @@ class Candidate:
     side: str
     token_id: str
     end_time: datetime
+    level: float = 0.0            # the observation threshold this record is for
 
     trigger_epoch: float = 0.0
     trigger_price: float = 0.0
@@ -350,6 +555,22 @@ class Candidate:
     targets: dict = field(default_factory=dict)   # price -> {"secs":, "depth":}
     max_tp_depth: float = 0.0
     our_tp_filled: bool = False
+
+    # ── shadow take-profit (what a TP placed at this crossing would have done)
+    shadow_qty: float = 0.0
+    shadow_queue_ahead: float = 0.0     # asks at/below the TP when we joined
+    shadow_level_size: float = 0.0      # asks exactly at the TP when we joined
+    shadow_level_size_min: float = 0.0
+    shadow_consumed: float = 0.0        # volume through the TP level since
+    shadow_optimistic_filled: bool = False
+    shadow_optimistic_secs: float = 0.0
+    shadow_queue_filled: bool = False
+    shadow_queue_secs: float = 0.0
+    shadow_evidence: str = ""
+
+    # ── settlement reference at the crossing (proxy vs official) ──
+    reference: dict = field(default_factory=dict)
+
     finalised: bool = False
     closed_reason: str = ""
     resolution: str = ""
@@ -359,10 +580,13 @@ class Candidate:
     def spread(self) -> float:
         return max(0.0, self.ask - self.bid) if self.ask and self.bid else 0.0
 
-    def observe(self, bid: float, ask: float, bid_size: float, now: float):
-        """Feed one book update into the tracker."""
+    def observe(self, px, now: float):
+        """Feed one book/tape update into the tracker."""
+        bid = getattr(px, "best_bid", 0.0) or 0.0
+        bid_size = getattr(px, "best_bid_size", 0.0) or 0.0
         if bid <= 0:
             return
+        self._observe_shadow_tp(px, now)
         self.ticks += 1
         self.last_price = bid
         dt = now - self.trigger_epoch
@@ -383,10 +607,36 @@ class Candidate:
             self.max_tp_depth = max(self.max_tp_depth, bid_size)
             self.targets.setdefault(tp_key, {"secs": round(dt, 2), "depth": round(bid_size, 1)})
 
+    def _observe_shadow_tp(self, px, now: float):
+        """
+        Advance the hypothetical take-profit this crossing would have rested.
+
+        Asked and answered separately:
+          shadow_optimistic_filled  did the market ever quote/print the TP
+          shadow_queue_filled       did enough volume go through the level to
+                                    consume the queue that was ahead of us
+        """
+        if self.shadow_qty <= 0 or self.shadow_queue_filled:
+            return
+        state = evaluate_queue_fill(
+            px, self.tp_target, self.trigger_epoch,
+            self.shadow_queue_ahead, self.shadow_qty,
+            trade_through=config.S9099_TRADE_THROUGH_FILLS,
+            crossed_on_entry=self.bid >= self.tp_target - 1e-9,
+        )
+        self.shadow_consumed = state.consumed
+        dt = round(now - self.trigger_epoch, 2)
+        if state.optimistic and not self.shadow_optimistic_filled:
+            self.shadow_optimistic_filled = True
+            self.shadow_optimistic_secs = dt
+        if state.fillable >= self.shadow_qty - 1e-9:
+            self.shadow_queue_filled = True
+            self.shadow_queue_secs = dt
+            self.shadow_evidence = state.evidence
+
     # ── CSV rows ─────────────────────────────────────────────────────────
     def observation_row(self, mode: str) -> dict:
         start = self.end_time - timedelta(seconds=WINDOW_SECONDS)
-        px = self.underlying_price or 0.0
         return {
             "candidate_id": self.candidate_id,
             "timestamp": datetime.fromtimestamp(self.trigger_epoch, timezone.utc).isoformat(),
@@ -398,6 +648,7 @@ class Candidate:
             "market_end_time": self.end_time.isoformat(),
             "secs_remaining": round(self.trigger_secs, 2),
             "side": self.side,
+            "observe_level": self.level,
             "token_id": self.token_id,
             "side_price": self.trigger_price,
             "opposite_price": self.opposite_price,
@@ -408,11 +659,9 @@ class Candidate:
             "ask_depth": self.ask_depth,
             "available_liquidity": self.ask_depth,
             "tp_depth": self.tp_depth,
-            "underlying_price": px,
-            "settlement_threshold": self.threshold,
-            "distance_from_threshold": round(self.distance, 6),
-            "distance_pct": round(abs(self.distance) / px * 100, 6) if px else 0,
             "data_age": round(self.data_age, 3),
+            # Settlement reference: proxy and official kept strictly apart.
+            **self.reference,
             "entry_threshold": self.entry_threshold,
             "tp_price": self.tp_target,
             "max_secs_remaining": self.max_secs_cfg,
@@ -438,6 +687,7 @@ class Candidate:
             "market_id": self.market_id,
             "asset": self.asset,
             "side": self.side,
+            "observe_level": self.level,
             "trigger_timestamp": datetime.fromtimestamp(self.trigger_epoch, timezone.utc).isoformat(),
             "trigger_epoch": round(self.trigger_epoch, 3),
             "trigger_price": self.trigger_price,
@@ -457,6 +707,17 @@ class Candidate:
             "secs_to_tp": tgt(tp, "secs"),
             "max_depth_at_tp": round(self.max_tp_depth, 1),
             "our_tp_filled": self.our_tp_filled,
+            # ── shadow TP: the same question asked two ways ──
+            "shadow_qty": round(self.shadow_qty, 1),
+            "shadow_queue_ahead": round(self.shadow_queue_ahead, 1),
+            "shadow_level_size": round(self.shadow_level_size, 1),
+            "shadow_level_size_min": round(self.shadow_level_size_min, 1),
+            "shadow_consumed": round(self.shadow_consumed, 1),
+            "tp_price_reached": self.shadow_optimistic_filled,
+            "secs_to_tp_price_reached": self.shadow_optimistic_secs or "",
+            "tp_queue_adjusted_fill": self.shadow_queue_filled,
+            "secs_to_queue_adjusted_fill": self.shadow_queue_secs or "",
+            "queue_fill_evidence": self.shadow_evidence,
             "ticks_observed": self.ticks,
             "final_price": self.last_price,
             "resolution": self.resolution or "unknown",
@@ -497,6 +758,7 @@ class Position:
     entry_filled_qty: float = 0.0
     entry_fee_est: float = 0.0
     entry_fee_actual: float = 0.0
+    entry_fee_source: str = "estimate"
 
     # take profit
     tp_submitted_at: float = 0.0
@@ -509,9 +771,20 @@ class Position:
     tp_filled_qty: float = 0.0
     tp_fee_actual: float = 0.0
     tp_fee_est: float = 0.0
-    tp_queue_ahead: float = 0.0
     tp_attempts: int = 0
     tp_next_attempt: float = 0.0
+    tp_fee_source: str = "estimate"
+    # ── queue state for the resting take-profit ──
+    tp_queue_ahead: float = 0.0        # asks at/below our price when we joined
+    tp_level_size: float = 0.0         # asks exactly at our price when we joined
+    tp_level_size_min: float = 0.0
+    tp_consumed: float = 0.0           # volume through our level since
+    tp_bid_depth_at_submit: float = 0.0
+    tp_secs_remaining_at_submit: float = 0.0
+    tp_fill_evidence: str = ""
+    tp_price_reached: bool = False     # the market quoted/printed our price
+    tp_price_reached_at: float = 0.0
+    tp_queue_adjusted_fill: bool = False
 
     # emergency exit
     stop_price: float = 0.0
@@ -537,7 +810,12 @@ class Position:
     market_result: str = ""
 
     # context
-    fee_rate: float = 0.0
+    fee_rate: float = 0.0              # economic rate (feeSchedule.rate)
+    fee_rate_raw_bps: float = 0.0      # order signing parameter, not a price
+    fee_exponent: float = 1.0
+    fee_taker_only: bool = True
+    fee_schedule_source: str = "default"
+    reference: dict = field(default_factory=dict)
     underlying_price: float = 0.0
     threshold: float = 0.0
     distance: float = 0.0
@@ -550,6 +828,10 @@ class Position:
     # post-entry behaviour
     max_price_after: float = 0.0
     min_price_after: float = 1.0
+
+    # ── proxy-only observations (recorded, never acted on) ──
+    proxy_cross_seen: bool = False
+    proxy_cross_at: float = 0.0
 
     # guards
     submitted: list = field(default_factory=list)   # intents already submitted
@@ -631,11 +913,15 @@ class Strategy9099:
                  state_file: str = STATE_FILE):
         self.feed = feed
         self.underlying = underlying
-        self.broker = broker if broker is not None else make_broker(feed)
+        self._depth_fn = depth_fn
+        self.broker = (broker if broker is not None
+                       else make_broker(feed, book_fn=self._full_book))
+        # What these markets actually resolve from (Chainlink TWAP-60s), and
+        # what we can see. Binance is a labelled proxy in here, never truth.
+        self.settlement = SettlementReference(binance_feed=underlying)
         self.clock = clock
         self.log_callback = log_callback
         self.state_file = state_file
-        self._depth_fn = depth_fn
         self._resolve_fn = resolve_fn
 
         # ── Live-editable parameters (seeded from config) ────────────────
@@ -681,6 +967,12 @@ class Strategy9099:
         self.track_candidates: bool = config.S9099_TRACK_CANDIDATES
         self.track_targets: list[float] = list(config.S9099_TRACK_TARGETS)
         self.track_after_close: float = config.S9099_TRACK_AFTER_CLOSE
+        # Thresholds observed independently. The entry level is always one of
+        # them, so the traded level is directly comparable with the rest.
+        self.observe_thresholds: list[float] = sorted(
+            set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min}
+        )
+        self.allow_proxy_threshold_stop: bool = config.S9099_ALLOW_PROXY_THRESHOLD_STOP
 
         # ── State ────────────────────────────────────────────────────────
         self.positions: dict[str, Position] = {}          # market_id -> Position
@@ -692,6 +984,8 @@ class Strategy9099:
         self._px_hist: dict[str, list] = {}               # trade_id -> [(ts, bid)]
         self._resolution_cache: dict[str, tuple] = {}     # market_id -> (winner, ts)
         self._depth_cache: dict[tuple, tuple] = {}        # (token, price) -> (depth, ts)
+        self._book_cache: dict[str, tuple] = {}           # token -> (book, ts)
+        self._schedules: dict[str, fees.Schedule] = {}    # market_id -> Schedule
         self._locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.RLock()
 
@@ -703,7 +997,8 @@ class Strategy9099:
         self.trades_today = 0
         self.wins = 0
         self.losses = 0
-        self.tp_fills = 0
+        self.tp_fills = 0               # queue-adjusted: our order really filled
+        self.tp_price_reached_count = 0  # the market merely got to our price
         self.emergency_exits = 0
         self.entry_timeouts = 0
         self.realized_pnl = 0.0
@@ -790,10 +1085,13 @@ class Strategy9099:
     def check_entry_conditions(self, price: float, secs_remaining: float,
                                spread: float, ask_depth: float,
                                tp_depth: float = 0.0,
-                               signed_distance: float = 0.0,
-                               underlying_price: float = 0.0,
+                               favourable_distance: float | None = None,
+                               reference_price: float = 0.0,
                                data_age: float = 0.0,
-                               side: str = "Up") -> tuple[bool, str]:
+                               side: str = "Up",
+                               signed_distance: float | None = None,
+                               underlying_price: float | None = None,
+                               ) -> tuple[bool, str]:
         """
         Does this snapshot qualify for an entry?
 
@@ -822,16 +1120,28 @@ class Strategy9099:
         if self.min_tp_depth > 0 and tp_depth < self.min_tp_depth:
             return False, f"thin_at_tp({tp_depth:.0f}<{self.min_tp_depth:.0f})"
 
-        # The underlying must sit on the winning side of the settlement
-        # threshold (the 5-min candle open) by at least the configured margin.
+        # The reference must sit on the winning side of the market's opening
+        # price by at least the configured margin.
+        #
+        # `favourable_distance` is signed for this side and comes from
+        # SettlementReference: the official Chainlink TWAP value when that is
+        # available, otherwise a Binance TWAP PROXY. It is a filter only — it
+        # can stop an entry, it never forces an exit (see _stop_reason).
+        #
+        # signed_distance/underlying_price are the older, side-agnostic
+        # spelling, still accepted so existing callers keep working.
         if self.min_margin_pct > 0:
-            if underlying_price <= 0:
-                return False, "no_underlying_price"
-            favourable = signed_distance if side == "Up" else -signed_distance
-            margin_pct = favourable / underlying_price * 100.0
+            price_ref = reference_price or (underlying_price or 0.0)
+            if favourable_distance is None:
+                if signed_distance is None:
+                    return False, "no_reference_distance"
+                favourable_distance = signed_distance if side == "Up" else -signed_distance
+            if price_ref <= 0:
+                return False, "no_reference_price"
+            margin_pct = favourable_distance / price_ref * 100.0
             if margin_pct < self.min_margin_pct:
                 return False, (
-                    f"underlying_margin({margin_pct:.4f}%<{self.min_margin_pct:.4f}%)"
+                    f"reference_margin({margin_pct:.4f}%<{self.min_margin_pct:.4f}%)"
                 )
         return True, "all_checks_passed"
 
@@ -872,7 +1182,7 @@ class Strategy9099:
 
     def calculate_position_size(self, balance: float, price: float,
                                 ask_depth: float | None = None,
-                                fee_rate: float | None = None) -> int:
+                                schedule=None) -> int:
         """
         Whole shares to buy at `price`.
 
@@ -892,8 +1202,9 @@ class Strategy9099:
         if budget <= 0:
             return 0
 
-        rate = fees.default_rate() if fee_rate is None else fee_rate
-        cost_per_share = price + (rate * price * (1.0 - price))
+        sched = schedule or fees.default_schedule()
+        fee_per_share = fees.estimate_fee(1.0, price, True, sched)
+        cost_per_share = price + fee_per_share
         shares = int(math.floor(budget / cost_per_share))
         if ask_depth is not None and ask_depth > 0:
             shares = min(shares, int(math.floor(ask_depth)))
@@ -932,6 +1243,12 @@ class Strategy9099:
         px_down = self.feed.get_price(market.token_id_down)
         sides = (("Up", px_up, px_down), ("Down", px_down, px_up))
 
+        # Sample the proxy into this market's 5-minute window so we can build
+        # a TWAP — which is the statistic the market actually resolves on,
+        # not the spot-vs-open comparison this used to make.
+        window_start = end_time.timestamp() - WINDOW_SECONDS
+        self.settlement.observe(getattr(market, "asset", ""), window_start, now)
+
         # 1. Tracking first, so a print that fills our take-profit on this very
         #    tick is in the candidate record before the trade row is written.
         if secs >= -self.track_after_close:
@@ -955,19 +1272,30 @@ class Strategy9099:
     # ── candidate observation ────────────────────────────────────────────
 
     def _track_side(self, market, side, px, opp, secs, now, end_time):
-        """Record what this side is doing. Never places an order."""
-        cand = self.candidates.get((market.market_id, side))
-        if cand is not None:
-            cand.observe(px.best_bid, px.best_ask, px.best_bid_size, now)
-        elif (self.track_candidates
-                and px.best_ask >= self.entry_price_min
-                and 0 < secs <= self.candidate_max_secs):
-            self._open_candidate(market, side, px, opp, secs, now, end_time)
+        """
+        Record what this side is doing, at every observation threshold it has
+        crossed. Never places an order.
+
+        A side at 0.93 has crossed 0.85, 0.88, 0.90 and 0.92, and each gets
+        its own record measured from its own moment — that is what makes the
+        entry levels comparable instead of assuming 90c is the right one.
+        """
+        for level in self.observe_thresholds:
+            key = (market.market_id, side, level)
+            cand = self.candidates.get(key)
+            if cand is not None:
+                cand.observe(px, now)
+            elif (self.track_candidates
+                    and px.best_ask >= level - 1e-9
+                    and 0 < secs <= self.candidate_max_secs):
+                self._open_candidate(market, side, px, opp, secs, now, end_time, level)
 
     # ── the entry decision ───────────────────────────────────────────────
 
     def _decide_side(self, market, side, px, opp, secs):
-        cand = self.candidates.get((market.market_id, side))
+        # Only the crossing at the configured entry threshold is tradeable;
+        # every other level is observation.
+        cand = self.candidates.get((market.market_id, side, self.entry_price_min))
         if cand is None or cand.decision_written:
             return
 
@@ -981,20 +1309,39 @@ class Strategy9099:
         if secs < self.min_secs_remaining or px.best_ask < self.entry_price_min:
             self._settle_decision(cand)
 
-    def _open_candidate(self, market, side, px, opp, secs, now, end_time) -> Candidate:
+    def _open_candidate(self, market, side, px, opp, secs, now, end_time,
+                        level: float) -> Candidate:
         ask = px.best_ask
-        ast = self._underlying_state(market.asset)
-        threshold = getattr(ast, "candle_open", 0.0) or 0.0
-        spot = getattr(ast, "price", 0.0) or 0.0
+        asset = getattr(market, "asset", "?")
         token_id = market.token_id_up if side == "Up" else market.token_id_down
+        window_start = end_time.timestamp() - WINDOW_SECONDS
+        reference = self.settlement.snapshot(asset, window_start)
+        favourable, ref_source, ref_official = self.settlement.distance_for_side(
+            asset, window_start, side
+        )
+        reference["favourable_distance"] = round(favourable, 6)
+        reference["distance_source"] = ref_source
+        reference["distance_is_official"] = ref_official
+        if ref_official:
+            reference["distance_from_official_reference"] = round(favourable, 6)
+
+        # The take-profit this crossing would have rested, and the queue it
+        # would have joined.
+        queue_ahead, level_size = self.ask_queue_ahead(token_id, self.tp_price)
+        shadow_qty = self.calculate_position_size(
+            self.available_balance(), ask, px.best_ask_size,
+            self.schedule_for(market.market_id, token_id),
+        )
+
         cand = Candidate(
             candidate_id=f"c{uuid.uuid4().hex[:12]}",
             market_id=market.market_id,
-            asset=getattr(market, "asset", "?"),
+            asset=asset,
             question=getattr(market, "question", ""),
             side=side,
             token_id=token_id,
             end_time=end_time,
+            level=level,
             trigger_epoch=now,
             trigger_price=ask,
             trigger_secs=secs,
@@ -1004,21 +1351,24 @@ class Strategy9099:
             ask_depth=px.best_ask_size,
             opposite_price=getattr(opp, "best_ask", 0.0),
             tp_depth=self._depth_at(token_id, self.tp_price),
-            underlying_price=spot,
-            threshold=threshold,
-            distance=(spot - threshold) if (spot and threshold) else 0.0,
             data_age=max(0.0, now - getattr(px, "timestamp", now)),
             tp_target=self.tp_price,
             entry_threshold=self.entry_price_min,
             max_secs_cfg=self.max_secs_remaining,
             track_targets=list(self.track_targets),
+            reference=reference,
+            shadow_qty=float(shadow_qty or self.min_shares),
+            shadow_queue_ahead=queue_ahead,
+            shadow_level_size=level_size,
+            shadow_level_size_min=level_size,
         )
-        cand.observe(px.best_bid, ask, px.best_bid_size, now)
-        self.candidates[(market.market_id, side)] = cand
+        cand.observe(px, now)
+        self.candidates[(market.market_id, side, level)] = cand
         self.candidates_seen += 1
         self._log(
-            f"CANDIDATE {cand.asset} {side} @ ${ask:.3f} with {secs:.0f}s left "
-            f"(bid ${px.best_bid:.3f}, depth {px.best_ask_size:.0f})"
+            f"CANDIDATE[{level:.2f}] {cand.asset} {side} @ ${ask:.3f} with {secs:.0f}s left "
+            f"(bid ${px.best_bid:.3f}, ask depth {px.best_ask_size:.0f}, "
+            f"{queue_ahead:.0f} sh ahead at ${self.tp_price:.2f})"
         )
         return cand
 
@@ -1030,8 +1380,11 @@ class Strategy9099:
             spread=max(0.0, px.best_ask - px.best_bid),
             ask_depth=px.best_ask_size,
             tp_depth=cand.tp_depth,
-            signed_distance=self._signed_distance(market.asset),
-            underlying_price=getattr(self._underlying_state(market.asset), "price", 0.0),
+            # Margin is measured against the settlement reference — the window
+            # TWAP, not spot-vs-candle-open — and `favourable` already has the
+            # side's sign applied.
+            favourable_distance=cand.reference.get("favourable_distance", 0.0),
+            reference_price=self.settlement.binance_price(market.asset),
             data_age=max(0.0, self.clock() - getattr(px, "timestamp", self.clock())),
             side=side,
         )
@@ -1042,11 +1395,22 @@ class Strategy9099:
             return False, reason
         shares = self.calculate_position_size(
             self.available_balance(), px.best_ask, px.best_ask_size,
-            fees.fee_rate_for_token(cand.token_id),
+            self.schedule_for(market.market_id, cand.token_id),
         )
         if shares <= 0:
             return False, f"size_too_small(min {self.min_shares} shares)"
         return True, "all_checks_passed"
+
+    def _schedule_of(self, pos: Position) -> fees.Schedule:
+        """Rebuild the fee schedule a position was opened under."""
+        return fees.Schedule(
+            rate=pos.fee_rate, exponent=pos.fee_exponent,
+            taker_only=pos.fee_taker_only, source=pos.fee_schedule_source,
+        )
+
+    def _entry_candidate(self, pos: Position) -> Candidate | None:
+        """The crossing record this position was opened from."""
+        return self.candidates.get((pos.market_id, pos.side, self.entry_price_min))
 
     def _settle_decision(self, cand: Candidate, traded: bool = False, trade_id: str = ""):
         """Write the one-per-candidate observation row, with the final verdict."""
@@ -1087,7 +1451,7 @@ class Strategy9099:
                 return
 
             token_id = market.token_id_up if side == "Up" else market.token_id_down
-            rate = fees.fee_rate_for_token(token_id)
+            schedule = self.schedule_for(market.market_id, token_id)
             balance = self.available_balance()
             limit_price = min(0.999, round(px.best_ask + self.entry_slippage, 3))
 
@@ -1101,12 +1465,11 @@ class Strategy9099:
                 return
 
             shares = self.calculate_position_size(balance, limit_price,
-                                                  px.best_ask_size, rate)
+                                                  px.best_ask_size, schedule)
             if shares <= 0:
                 cand.reason_rejected = f"size_too_small(min {self.min_shares} shares)"
                 return
 
-            ast = self._underlying_state(getattr(market, "asset", ""))
             pos = Position(
                 trade_id=f"t{uuid.uuid4().hex[:12]}",
                 candidate_id=cand.candidate_id,
@@ -1124,12 +1487,17 @@ class Strategy9099:
                 entry_qty_req=shares,
                 tp_price=self.tp_price,
                 stop_price=self.stop_price,
-                fee_rate=rate,
-                entry_fee_est=fees.taker_fee(shares, limit_price, rate),
-                tp_fee_est=fees.maker_fee(shares, self.tp_price, rate),
-                underlying_price=getattr(ast, "price", 0.0),
-                threshold=getattr(ast, "candle_open", 0.0),
-                distance=self._signed_distance(getattr(market, "asset", "")),
+                fee_rate=schedule.rate,
+                fee_rate_raw_bps=fees.signing_fee_rate_bps(token_id),
+                fee_exponent=schedule.exponent,
+                fee_taker_only=schedule.taker_only,
+                fee_schedule_source=schedule.source,
+                entry_fee_est=fees.estimate_fee(shares, limit_price, True, schedule),
+                tp_fee_est=fees.estimate_fee(shares, self.tp_price, False, schedule),
+                reference=dict(cand.reference),
+                underlying_price=cand.reference.get("binance_price", 0) or 0.0,
+                threshold=cand.reference.get("binance_window_open", 0) or 0.0,
+                distance=cand.reference.get("favourable_distance", 0) or 0.0,
                 spread_at_entry=max(0.0, px.best_ask - px.best_bid),
                 ask_depth_at_entry=px.best_ask_size,
                 tp_depth_at_entry=cand.tp_depth,
@@ -1276,11 +1644,16 @@ class Strategy9099:
 
     def _entry_done(self, pos: Position, partial: bool):
         pos.phase = Phase.POSITION_OPEN
-        pos.entry_fee_actual = fees.taker_fee(
-            pos.entry_filled_qty, pos.entry_fill_price, pos.fee_rate
-        ) if pos.entry_liquidity == "taker" else fees.maker_fee(
-            pos.entry_filled_qty, pos.entry_fill_price, pos.fee_rate
+        sched = self._schedule_of(pos)
+        pos.entry_fee_actual = fees.estimate_fee(
+            pos.entry_filled_qty, pos.entry_fill_price,
+            pos.entry_liquidity == "taker", sched,
         )
+        pos.entry_fee_source = "estimate"
+        actual, source = fees.actual_fee_for_order(pos.entry_order_id)
+        if actual is not None:
+            pos.entry_fee_actual = actual
+            pos.entry_fee_source = source
         tag = "PARTIAL " if partial else ""
         self._log(
             f"{tag}ENTRY FILLED {pos.asset} {pos.side} {pos.entry_filled_qty:.0f}/"
@@ -1321,7 +1694,15 @@ class Strategy9099:
             return
 
         pos.tp_attempts += 1
-        pos.tp_queue_ahead = self._depth_at(pos.token_id, pos.tp_price)
+        # What stands between us and a fill, measured as we join:
+        #   queue_ahead  every offer at or below our price (they trade first)
+        #   bid_depth    buyers already at/above our price (we would cross)
+        queue_ahead, level_size = self.ask_queue_ahead(pos.token_id, pos.tp_price)
+        pos.tp_queue_ahead = queue_ahead
+        pos.tp_level_size = level_size
+        pos.tp_level_size_min = level_size
+        pos.tp_bid_depth_at_submit = self._depth_at(pos.token_id, pos.tp_price)
+        pos.tp_secs_remaining_at_submit = self._secs_left(pos)
         order_id = self._submit_once(
             pos, f"tp:{pos.tp_attempts}",
             lambda: self.broker.place_sell(pos.token_id, pos.tp_price, qty, pos.market_id),
@@ -1333,30 +1714,42 @@ class Strategy9099:
         pos.tp_order_id = order_id
         pos.tp_qty = qty
         pos.tp_submitted_at = self.clock()
-        pos.tp_liquidity = "maker"
-        pos.tp_fee_est = fees.maker_fee(qty, pos.tp_price, pos.fee_rate)
+        # Maker unless the bid is already at our price, in which case we are
+        # crossing and will pay taker fees on the way out.
+        pos.tp_liquidity = (
+            "taker" if (getattr(px, "best_bid", 0.0) or 0.0) >= pos.tp_price - 1e-9
+            else "maker"
+        )
+        pos.tp_fee_est = fees.estimate_fee(qty, pos.tp_price, False, self._schedule_of(pos))
         pos.phase = Phase.TP_PENDING
         lag = pos.tp_submitted_at - (pos.entry_fill_epoch or pos.tp_submitted_at)
         self._log(
             f"TP RESTING {pos.asset} {pos.side} {qty:.0f} sh @ ${pos.tp_price:.2f} "
-            f"({lag:.1f}s after fill, {pos.tp_queue_ahead:.0f} sh ahead of us)",
+            f"({lag:.1f}s after fill | {pos.tp_queue_ahead:.0f} sh ahead of us, "
+            f"{pos.tp_level_size:.0f} at our price | {pos.tp_secs_remaining_at_submit:.0f}s left)",
             "trade",
         )
         self._save_state()
 
     def _advance_tp(self, pos: Position, px, secs: float):
         st = self._order_status(pos.tp_order_id)
+        self._record_tp_queue(pos, st, px)
         if st and st.filled > pos.tp_filled_qty:
             new_qty = st.filled - pos.tp_filled_qty
             pos.tp_filled_qty = st.filled
             pos.tp_fill_price = st.avg_price or pos.tp_price
             if not pos.tp_fill_epoch:
                 pos.tp_fill_epoch = self.clock()
-            pos.tp_fee_actual = fees.fee_for_fill(
+            pos.tp_fee_actual = fees.estimate_fee(
                 pos.tp_filled_qty, pos.tp_fill_price,
-                is_taker=(st.liquidity == "taker"), rate=pos.fee_rate,
+                st.liquidity == "taker", self._schedule_of(pos),
             )
-            cand = self.candidates.get((pos.market_id, pos.side))
+            pos.tp_fee_source = "estimate"
+            actual, source = fees.actual_fee_for_order(pos.tp_order_id)
+            if actual is not None:
+                pos.tp_fee_actual = actual
+                pos.tp_fee_source = source
+            cand = self._entry_candidate(pos)
             if cand:
                 cand.our_tp_filled = True
             self._log(
@@ -1383,17 +1776,73 @@ class Strategy9099:
 
     # ── emergency exit ───────────────────────────────────────────────────
 
+    def _record_tp_queue(self, pos: Position, st, px):
+        """
+        Keep the two answers side by side:
+
+          tp_price_reached         the market quoted or printed our price
+          tp_queue_adjusted_fill   enough volume went through to reach US
+
+        The gap between them is the whole question about this strategy, so it
+        is measured rather than assumed away.
+        """
+        if getattr(px, "best_bid", 0.0) >= pos.tp_price - 1e-9 or \
+                getattr(px, "last_trade_price", 0.0) >= pos.tp_price - 1e-9:
+            if not pos.tp_price_reached:
+                pos.tp_price_reached = True
+                pos.tp_price_reached_at = self.clock()
+                self.tp_price_reached_count += 1
+        if st is None:
+            return
+        pos.tp_consumed = max(pos.tp_consumed, getattr(st, "consumed", 0.0))
+        level_now = getattr(st, "level_size_last", 0.0)
+        if level_now:
+            pos.tp_level_size_min = min(pos.tp_level_size_min or level_now, level_now)
+        if getattr(st, "optimistic_filled", False) and not pos.tp_price_reached:
+            pos.tp_price_reached = True
+            pos.tp_price_reached_at = self.clock()
+        evidence = getattr(st, "fill_evidence", "")
+        if evidence:
+            pos.tp_fill_evidence = evidence
+        if st.filled > 0:
+            pos.tp_queue_adjusted_fill = True
+
+    def _secs_left(self, pos: Position) -> float:
+        try:
+            return seconds_until(_parse_dt(pos.end_time_iso))
+        except Exception:
+            return 0.0
+
     def _stop_reason(self, pos: Position, px, secs: float) -> str:
         """Why we should bail out now, or '' to keep waiting for the TP."""
         bid = getattr(px, "best_bid", 0.0)
         if bid > 0 and bid <= pos.stop_price:
             return f"stop_price(${bid:.3f}<=${pos.stop_price:.2f})"
 
+        # "The underlying crossed back through the strike" is only a fact if
+        # it is measured against the reference the market resolves from.
+        # Binance is a different series (measured +7 to +9 bps above the
+        # Chainlink feed) and the market settles on a TWAP, so a proxy
+        # crossing is a hint, not evidence. It is recorded either way, but it
+        # does not force an exit unless the reference is official — or unless
+        # S9099_ALLOW_PROXY_THRESHOLD_STOP is explicitly turned on.
         if self.stop_on_threshold_cross:
-            dist = self._signed_distance(pos.asset)
-            favourable = dist if pos.side == "Up" else -dist
+            favourable, source, is_official = self.settlement.distance_for_side(
+                pos.asset, self._window_start_of(pos), pos.side
+            )
             if favourable < 0:
-                return "underlying_crossed_threshold"
+                if is_official:
+                    return f"reference_crossed_threshold({source})"
+                if self.allow_proxy_threshold_stop:
+                    return f"proxy_crossed_threshold({source})"
+                if not pos.proxy_cross_seen:
+                    pos.proxy_cross_seen = True
+                    pos.proxy_cross_at = self.clock()
+                    self._log(
+                        f"{pos.asset} {pos.side}: PROXY reference crossed back "
+                        f"({source}) — recorded, not acted on (no official reference)",
+                        "warn",
+                    )
 
         if self.stop_velocity_drop > 0 and bid > 0:
             hist = self._px_hist.get(pos.trade_id, [])
@@ -1429,9 +1878,9 @@ class Strategy9099:
             if final and final.filled > pos.tp_filled_qty:
                 pos.tp_filled_qty = final.filled
                 pos.tp_fill_price = final.avg_price or pos.tp_price
-                pos.tp_fee_actual = fees.fee_for_fill(
+                pos.tp_fee_actual = fees.estimate_fee(
                     pos.tp_filled_qty, pos.tp_fill_price,
-                    is_taker=(final.liquidity == "taker"), rate=pos.fee_rate,
+                    final.liquidity == "taker", self._schedule_of(pos),
                 )
             pos.tp_order_id = ""
 
@@ -1482,10 +1931,13 @@ class Strategy9099:
             filled_now = st.filled
             pos.exit_price = st.avg_price or pos.exit_price
             pos.exit_qty = filled_now
-            pos.exit_fee_actual = fees.fee_for_fill(
+            pos.exit_fee_actual = fees.estimate_fee(
                 pos.exit_qty, pos.exit_price,
-                is_taker=(st.liquidity != "maker"), rate=pos.fee_rate,
+                st.liquidity != "maker", self._schedule_of(pos),
             )
+            actual, _src = fees.actual_fee_for_order(pos.exit_order_id)
+            if actual is not None:
+                pos.exit_fee_actual = actual
         if pos.open_qty <= 1e-9:
             self.emergency_exits += 1
             self._close(pos, pos.stop_reason or "emergency_exit")
@@ -1543,7 +1995,7 @@ class Strategy9099:
                 self.consecutive_losses += 1
                 self.daily_loss += -pos.realized_pnl
 
-        cand = self.candidates.get((pos.market_id, pos.side))
+        cand = self._entry_candidate(pos)
         if cand:
             cand.trade_id = pos.trade_id
             cand.traded = True
@@ -1570,7 +2022,7 @@ class Strategy9099:
         self._save_state()
 
     def _trade_row(self, pos: Position) -> dict:
-        cand = self.candidates.get((pos.market_id, pos.side))
+        cand = self._entry_candidate(pos)
         targets = cand.targets if cand else {}
 
         def tsecs(p: float):
@@ -1604,6 +2056,7 @@ class Strategy9099:
             "entry_partial": 0 < pos.entry_filled_qty < pos.entry_qty_req,
             "entry_fee_estimated": pos.entry_fee_est,
             "entry_fee_actual": pos.entry_fee_actual,
+            "entry_fee_source": pos.entry_fee_source,
             "entry_cost": round(pos.entry_filled_qty * pos.entry_fill_price, 4),
             "tp_submitted_at": _iso(pos.tp_submitted_at),
             "tp_price": pos.tp_price,
@@ -1616,7 +2069,18 @@ class Strategy9099:
             "tp_partial": 0 < pos.tp_filled_qty < pos.tp_qty,
             "tp_fee_estimated": pos.tp_fee_est,
             "tp_fee_actual": pos.tp_fee_actual,
+            "tp_fee_source": pos.tp_fee_source,
+            # ── queue evidence for the resting take-profit ──
             "tp_queue_ahead": pos.tp_queue_ahead,
+            "tp_level_size_at_submit": pos.tp_level_size,
+            "tp_level_size_min": pos.tp_level_size_min,
+            "tp_bid_depth_at_submit": pos.tp_bid_depth_at_submit,
+            "tp_secs_remaining_at_submit": round(pos.tp_secs_remaining_at_submit, 1),
+            "tp_consumed_volume": round(pos.tp_consumed, 1),
+            "tp_price_reached": pos.tp_price_reached,
+            "tp_price_reached_at": _iso(pos.tp_price_reached_at),
+            "tp_queue_adjusted_fill": pos.tp_queue_adjusted_fill,
+            "tp_fill_evidence": pos.tp_fill_evidence,
             "stop_price": pos.stop_price,
             "stop_triggered_at": _iso(pos.stop_epoch),
             "stop_reason": pos.stop_reason,
@@ -1650,7 +2114,14 @@ class Strategy9099:
             "spread_at_entry": round(pos.spread_at_entry, 4),
             "ask_depth_at_entry": pos.ask_depth_at_entry,
             "tp_depth_at_entry": pos.tp_depth_at_entry,
-            "fee_rate": pos.fee_rate,
+            "fee_rate_raw": pos.fee_rate_raw_bps,
+            "economic_fee_rate": pos.fee_rate,
+            "fee_exponent": pos.fee_exponent,
+            "fee_taker_only": pos.fee_taker_only,
+            "fee_schedule_source": pos.fee_schedule_source,
+            "proxy_cross_seen": pos.proxy_cross_seen,
+            "proxy_cross_at": _iso(pos.proxy_cross_at),
+            **{k: v for k, v in pos.reference.items()},
             "bankroll_before": round(pos.bankroll_before, 2),
             "bankroll_after": round(pos.bankroll_after, 2),
         }
@@ -1736,7 +2207,7 @@ class Strategy9099:
 
     def _write_candidate_outcome(self, cand: Candidate):
         candidate_outcome_log.write(cand.outcome_row())
-        self.candidates.pop((cand.market_id, cand.side), None)
+        self.candidates.pop((cand.market_id, cand.side, cand.level), None)
 
     # ══════════════════════════════════════════════════════════════════
     #  Market data helpers
@@ -1754,25 +2225,65 @@ class Strategy9099:
             self._log(f"order status failed for {order_id}: {e}", "warn")
             return None
 
-    def _underlying_state(self, asset: str):
-        if self.underlying is None:
-            return _EMPTY_UNDERLYING
+    def _window_start_of(self, pos: Position) -> float:
+        """Epoch of the start of this position's 5-minute market window."""
         try:
-            return self.underlying.get(asset)
+            return _parse_dt(pos.end_time_iso).timestamp() - WINDOW_SECONDS
         except Exception:
-            return _EMPTY_UNDERLYING
-
-    def _signed_distance(self, asset: str) -> float:
-        """
-        Underlying minus the 5-min candle open — the settlement threshold.
-        Positive means 'Up' is currently winning.
-        """
-        ast = self._underlying_state(asset)
-        spot = getattr(ast, "price", 0.0) or 0.0
-        open_px = getattr(ast, "candle_open", 0.0) or 0.0
-        if spot <= 0 or open_px <= 0:
             return 0.0
-        return spot - open_px
+
+    def _full_book(self, token_id: str) -> dict:
+        """
+        Full order book for a token, cached briefly.
+
+        The websocket feed keeps level 1 only, and the queue in front of a
+        resting sell lives in the deeper levels, so this is a REST call on a
+        hot path — hence the cache.
+        """
+        now = self.clock()
+        cached = self._book_cache.get(token_id)
+        if cached and now - cached[1] < DEPTH_CACHE_TTL:
+            return cached[0]
+        book = {"bids": [], "asks": []}
+        try:
+            fn = self._depth_fn
+            if fn is None:
+                from polymarket_client import fetch_full_orderbook as fn  # noqa: N813
+                self._depth_fn = fn
+            book = fn(token_id) or book
+        except Exception:
+            pass
+        self._book_cache[token_id] = (book, now)
+        return book
+
+    def ask_queue_ahead(self, token_id: str, price: float) -> tuple:
+        """
+        (shares offered at or below `price`, shares offered exactly at `price`).
+
+        Everything at or below our price trades before a sell we place there:
+        cheaper offers get lifted first, and equal offers already resting have
+        time priority. This is the number the old model ignored.
+        """
+        book = self._full_book(token_id)
+        ahead = at_level = 0.0
+        for entry in book.get("asks", []):
+            try:
+                p, sz = float(entry.get("price", 0)), float(entry.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if p <= price + 1e-9:
+                ahead += sz
+                if abs(p - price) < 1e-9:
+                    at_level += sz
+        return ahead, at_level
+
+    def schedule_for(self, market_id: str, token_id: str) -> fees.Schedule:
+        """This market's economic fee schedule (cached per market)."""
+        sched = self._schedules.get(market_id)
+        if sched is None:
+            sched = fees.schedule_for_market(condition_id=market_id, token_id=token_id)
+            self._schedules[market_id] = sched
+        return sched
 
     def _depth_at(self, token_id: str, price: float) -> float:
         """
@@ -1786,15 +2297,10 @@ class Strategy9099:
             return cached[0]
         total = 0.0
         try:
-            fn = self._depth_fn
-            if fn is None:
-                from polymarket_client import fetch_full_orderbook as fn  # noqa: N813
-                self._depth_fn = fn
-            book = fn(token_id) or {}
-            for level in book.get("bids", []):
+            for level in self._full_book(token_id).get("bids", []):
                 if float(level.get("price", 0)) >= price - 1e-9:
                     total += float(level.get("size", 0))
-        except Exception:
+        except (TypeError, ValueError):
             total = 0.0
         self._depth_cache[(token_id, round(price, 3))] = (total, now)
         return total
@@ -1837,7 +2343,16 @@ class Strategy9099:
             "hit_rate": round(self.wins / decided * 100, 1) if decided else 0.0,
             "avg_return": round(avg_return, 3),
             "tp_fills": self.tp_fills,
+            "tp_price_reached": self.tp_price_reached_count,
             "emergency_exits": self.emergency_exits,
+            "queue_aware": getattr(self.broker, "queue_aware", True),
+            "reference": {
+                "official_available": self.settlement.official_reading(
+                    self.assets[0] if self.assets else "BTC"
+                ).available,
+                "proxy_threshold_stop": self.allow_proxy_threshold_stop,
+                "observe_thresholds": list(self.observe_thresholds),
+            },
             "entry_timeouts": self.entry_timeouts,
             "trades_today": self.trades_today,
             "daily_loss": round(self.daily_loss, 2),
@@ -1937,6 +2452,7 @@ class Strategy9099:
                     "wins": self.wins,
                     "losses": self.losses,
                     "tp_fills": self.tp_fills,
+                    "tp_price_reached_count": self.tp_price_reached_count,
                     "emergency_exits": self.emergency_exits,
                     "realized_pnl": self.realized_pnl,
                     "daily_loss": self.daily_loss,
@@ -2061,21 +2577,6 @@ class Strategy9099:
 
 RESOLVE_MAX_WAIT = 600.0     # give up waiting for a market result after 10 min
 DEPTH_CACHE_TTL = 2.0        # seconds a full-book depth reading stays fresh
-
-
-class _EmptyUnderlying:
-    """Stand-in when no Binance feed is attached — every check sees zeros."""
-    price = 0.0
-    candle_open = 0.0
-    candle_high = 0.0
-    candle_low = 0.0
-    distance = 0.0
-
-    def price_age(self):
-        return -1.0
-
-
-_EMPTY_UNDERLYING = _EmptyUnderlying()
 
 
 def _iso(epoch: float) -> str:

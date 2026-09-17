@@ -28,6 +28,27 @@ class FakePrice:
     best_bid_size: float = 0.0
     timestamp: float = field(default_factory=time.time)
     valid: bool = True
+    # Executed tape — what the queue model actually reads.
+    trades: list = field(default_factory=list)   # (ts, price, size, side)
+    last_trade_price: float = 0.0
+
+    def volume_since(self, since_ts, side=None, max_price=None, min_price=None):
+        total = 0.0
+        for ts, price, size, tside in self.trades:
+            if ts < since_ts:
+                continue
+            if side and tside != side:
+                continue
+            if max_price is not None and price > max_price + 1e-9:
+                continue
+            if min_price is not None and price < min_price - 1e-9:
+                continue
+            total += size
+        return total
+
+    def max_trade_price_since(self, since_ts):
+        prices = [p for ts, p, _s, _sd in self.trades if ts >= since_ts]
+        return max(prices) if prices else 0.0
 
 
 class FakeFeed:
@@ -37,11 +58,23 @@ class FakeFeed:
         self.prices: dict[str, FakePrice] = {}
 
     def set(self, token_id, ask=0.0, ask_size=0.0, bid=0.0, bid_size=0.0, age=0.0):
+        prev = self.prices.get(token_id)
         self.prices[token_id] = FakePrice(
             best_ask=ask, best_ask_size=ask_size,
             best_bid=bid, best_bid_size=bid_size,
             timestamp=time.time() - age, valid=True,
+            trades=list(prev.trades) if prev else [],
+            last_trade_price=prev.last_trade_price if prev else 0.0,
         )
+
+    def trade(self, token_id, price, size, side="BUY", ts=None):
+        """Append an executed print — this is what consumes a resting queue."""
+        px = self.prices.get(token_id)
+        if px is None:
+            self.set(token_id)
+            px = self.prices[token_id]
+        px.trades.append((time.time() if ts is None else ts, price, size, side))
+        px.last_trade_price = price
 
     def get_price(self, token_id):
         return self.prices.get(token_id, FakePrice(valid=False))
@@ -85,11 +118,18 @@ def market_ending_in(secs: float, market_id: str = "0xmarket") -> FakeMarket:
 
 # ── Recording broker (for call-ordering and duplicate checks) ────────────
 
+# A book with nothing resting at the take-profit: the queue is empty, so
+# queue-aware and optimistic agree and the older tests still describe the
+# same behaviour. Tests about queueing set their own depth.
+EMPTY_TP_BOOK = {"bids": [{"price": 0.99, "size": 400}], "asks": []}
+
+
 class RecordingBroker(s9099.PaperBroker):
     """PaperBroker that also keeps an ordered log of every call."""
 
-    def __init__(self, feed, balance=500.0):
-        super().__init__(feed, starting_balance=balance)
+    def __init__(self, feed, balance=500.0, book_fn=None):
+        super().__init__(feed, starting_balance=balance,
+                         book_fn=book_fn or (lambda _t: EMPTY_TP_BOOK))
         self.calls: list[tuple] = []
         self.fail_sells = 0
 
@@ -154,10 +194,28 @@ def engine(feed, logs, tmp_path):
         feed=feed,
         underlying=FakeUnderlying(),
         broker=broker,
-        depth_fn=lambda token_id: {"bids": [{"price": 0.99, "size": 400}],
-                                   "asks": [{"price": 1.00, "size": 400}]},
+        depth_fn=lambda token_id: dict(EMPTY_TP_BOOK),
         resolve_fn=lambda market_id: {"resolved": True, "winner": "Up"},
         state_file=str(tmp_path / "state.json"),
     )
-    eng.min_margin_pct = 0.02
+    # The reference-margin filter is exercised by its own tests; the
+    # lifecycle tests are not about it.
+    eng.min_margin_pct = 0.0
     return eng
+
+
+def seed_reference(engine, market, prices, dt=1.0):
+    """
+    Feed a price path into a market's settlement window.
+
+    The margin filter now compares the window TWAP against the window's
+    opening price (the statistic the market actually resolves on), so a
+    single flat sample means zero distance — the path has to move.
+    """
+    window_start = market.end_time.timestamp() - 300
+    now = time.time() - dt * len(prices)
+    for price in prices:
+        engine.settlement.binance_feed.asset.price = price
+        engine.settlement.observe(market.asset, window_start, now)
+        now += dt
+    return window_start

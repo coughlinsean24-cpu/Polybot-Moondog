@@ -281,6 +281,7 @@ CANDIDATE_HEADERS = [
     "market_end_time",
     "secs_remaining",
     "side",                   # "Up" / "Down"
+    "observe_level",          # which threshold this crossing is for
     "token_id",
     "side_price",             # the price that crossed the threshold (ask)
     "opposite_price",
@@ -291,11 +292,31 @@ CANDIDATE_HEADERS = [
     "ask_depth",              # shares at best ask
     "available_liquidity",    # shares buyable at or under our entry limit
     "tp_depth",               # shares bid at/above the take-profit price
-    "underlying_price",
-    "settlement_threshold",   # 5-min candle open — the strike
-    "distance_from_threshold",
-    "distance_pct",
     "data_age",
+    # ── settlement reference ──
+    # These markets resolve on a Chainlink TWAP-60s stream. Binance is a
+    # labelled proxy; the official columns stay empty unless we really read
+    # the official source.
+    "binance_price",
+    "binance_window_open",
+    "binance_window_twap",
+    "binance_window_coverage",
+    "binance_window_samples",
+    "proxy_twap_distance",
+    "proxy_spot_distance",
+    "proxy_reference_source",
+    "chainlink_feed_price",
+    "chainlink_feed_age",
+    "chainlink_feed_available",
+    "official_resolution_reference",
+    "official_reference_source",
+    "official_reference_available",
+    "official_reference_reason",
+    "distance_from_official_reference",
+    "favourable_distance",
+    "distance_source",
+    "distance_is_official",
+    "reference_note",
     "entry_threshold",        # config in force at the time
     "tp_price",
     "max_secs_remaining",
@@ -312,6 +333,7 @@ CANDIDATE_OUTCOME_HEADERS = [
     "market_id",
     "asset",
     "side",
+    "observe_level",
     "trigger_timestamp",
     "trigger_epoch",
     "trigger_price",
@@ -331,6 +353,20 @@ CANDIDATE_OUTCOME_HEADERS = [
     "secs_to_tp",
     "max_depth_at_tp",        # best depth seen bid at/above TP
     "our_tp_filled",          # did OUR resting order actually fill
+    # ── shadow take-profit: would a sell rested HERE have filled? ──
+    # tp_price_reached      the market got there
+    # tp_queue_adjusted_fill enough volume went through to reach us
+    # The difference between these two columns is the strategy's real edge.
+    "shadow_qty",
+    "shadow_queue_ahead",
+    "shadow_level_size",
+    "shadow_level_size_min",
+    "shadow_consumed",
+    "tp_price_reached",
+    "secs_to_tp_price_reached",
+    "tp_queue_adjusted_fill",
+    "secs_to_queue_adjusted_fill",
+    "queue_fill_evidence",
     "ticks_observed",
     "final_price",
     "resolution",             # "Up" / "Down" / "unknown"
@@ -363,6 +399,7 @@ TRADE_9099_HEADERS = [
     "entry_partial",
     "entry_fee_estimated",
     "entry_fee_actual",
+    "entry_fee_source",       # estimate | clob_trades
     "entry_cost",
     # ── take profit ──
     "tp_submitted_at",
@@ -376,6 +413,18 @@ TRADE_9099_HEADERS = [
     "tp_partial",
     "tp_fee_estimated",
     "tp_fee_actual",
+    "tp_fee_source",
+    # ── queue evidence ──
+    "tp_queue_ahead",
+    "tp_level_size_at_submit",
+    "tp_level_size_min",
+    "tp_bid_depth_at_submit",
+    "tp_secs_remaining_at_submit",
+    "tp_consumed_volume",
+    "tp_price_reached",
+    "tp_price_reached_at",
+    "tp_queue_adjusted_fill",
+    "tp_fill_evidence",
     # ── stop / emergency exit ──
     "stop_price",
     "stop_triggered_at",
@@ -411,7 +460,35 @@ TRADE_9099_HEADERS = [
     "spread_at_entry",
     "ask_depth_at_entry",
     "tp_depth_at_entry",
-    "fee_rate",
+    # ── fees: the signing parameter and the economic rate are NOT the same ──
+    "fee_rate_raw",           # order feeRateBps (a ceiling, not a price)
+    "economic_fee_rate",      # feeSchedule.rate — what actually costs money
+    "fee_exponent",
+    "fee_taker_only",
+    "fee_schedule_source",
+    # ── settlement reference ──
+    "proxy_cross_seen",
+    "proxy_cross_at",
+    "binance_price",
+    "binance_window_open",
+    "binance_window_twap",
+    "binance_window_coverage",
+    "binance_window_samples",
+    "proxy_twap_distance",
+    "proxy_spot_distance",
+    "proxy_reference_source",
+    "chainlink_feed_price",
+    "chainlink_feed_age",
+    "chainlink_feed_available",
+    "official_resolution_reference",
+    "official_reference_source",
+    "official_reference_available",
+    "official_reference_reason",
+    "distance_from_official_reference",
+    "favourable_distance",
+    "distance_source",
+    "distance_is_official",
+    "reference_note",
     "bankroll_before",
     "bankroll_after",
 ]

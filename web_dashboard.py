@@ -5808,7 +5808,8 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">Wins / Losses</div><div class="stat-value" id="s9099-wl">0 / 0</div></div>
   <div class="stat-card"><div class="stat-label">Hit Rate</div><div class="stat-value" id="s9099-hitrate">--</div></div>
   <div class="stat-card"><div class="stat-label">Avg Return</div><div class="stat-value" id="s9099-avg">$0</div></div>
-  <div class="stat-card"><div class="stat-label">TP Fills</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
+  <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
+  <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
   <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
   <div class="stat-card"><div class="stat-label">Candidates Seen</div><div class="stat-value" id="s9099-seen">0</div></div>
   <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
@@ -7837,9 +7838,15 @@ function s9099UpdateUI(st, markets) {
   }
   const gates = document.getElementById('s9099-gates');
   if (gates) {
-    gates.textContent = st.mode === 'LIVE'
+    const ref = st.reference || {};
+    const refTxt = ref.official_available
+      ? 'settlement ref: Chainlink TWAP (official)'
+      : 'settlement ref: Binance PROXY (official unavailable)';
+    const queueTxt = st.queue_aware ? 'queue-aware TP' : 'OPTIMISTIC TP';
+    gates.textContent = (st.mode === 'LIVE'
       ? 'LIVE — real orders'
-      : 'paper because: ' + (st.live_blocked_by || []).join(', ');
+      : 'paper because: ' + (st.live_blocked_by || []).join(', '))
+      + '  |  ' + refTxt + '  |  ' + queueTxt;
   }
   const en = document.getElementById('s9099-enabled');
   if (en) en.checked = !!st.enabled;
@@ -7863,6 +7870,7 @@ function s9099UpdateUI(st, markets) {
   setTxt('s9099-hitrate', (st.wins + st.losses) ? st.hit_rate.toFixed(1) + '%' : '--');
   setTxt('s9099-avg', '$' + (st.avg_return || 0).toFixed(2));
   setTxt('s9099-tpfills', st.tp_fills || 0);
+  setTxt('s9099-reached', st.tp_price_reached || 0);
   setTxt('s9099-exits', st.emergency_exits || 0);
   setTxt('s9099-seen', st.candidates_seen || 0);
   setTxt('s9099-traded', st.candidates_traded || 0);

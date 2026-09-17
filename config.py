@@ -290,10 +290,76 @@ S9099_ENABLE_OPPOSITE_HEDGE = os.getenv("S9099_ENABLE_OPPOSITE_HEDGE", "false").
 S9099_HEDGE_MAX_PRICE = float(os.getenv("S9099_HEDGE_MAX_PRICE", "0.01"))
 
 # ── Fees ──────────────────────────────────────────────────────────────────
-# Fallback only — the live per-token rate is read from the CLOB's /fee-rate.
-# 1000 bps (0.10) is what the 5-min crypto markets currently report.
-S9099_FEE_RATE_DEFAULT_BPS = float(os.getenv("S9099_FEE_RATE_DEFAULT_BPS", "1000"))
+# Two different numbers, previously (wrongly) treated as one:
+#
+#   signing parameter   the CLOB's /fee-rate "base_fee", and Gamma's
+#                       makerBaseFee/takerBaseFee. Both read 1000 bps on these
+#                       markets — including the MAKER side, which is charged
+#                       nothing. It is the fee field carried in the signed
+#                       order, i.e. a ceiling, not a price.
+#   economic rate       Gamma's feeSchedule, which for every 5-min crypto
+#                       market reads {rate: 0.07, exponent: 1, takerOnly: true}.
+#                       This is the one that costs money:
+#                           fee = size * rate * (p * (1 - p)) ** exponent
+#
+# Both are read live per market; these are only the fallbacks.
+S9099_FEE_SIGNING_BPS_DEFAULT = float(os.getenv("S9099_FEE_SIGNING_BPS_DEFAULT", "1000"))
+S9099_FEE_ECONOMIC_RATE_DEFAULT = float(os.getenv("S9099_FEE_ECONOMIC_RATE_DEFAULT", "0.07"))
+S9099_FEE_EXPONENT_DEFAULT = float(os.getenv("S9099_FEE_EXPONENT_DEFAULT", "1"))
+S9099_FEE_TAKER_ONLY_DEFAULT = os.getenv("S9099_FEE_TAKER_ONLY_DEFAULT", "true").lower() == "true"
 S9099_FEES_CHARGE_MAKER = os.getenv("S9099_FEES_CHARGE_MAKER", "false").lower() == "true"
+# Prefer fees reported by the exchange for our own executed orders over any
+# formula. Live mode only — there is nothing to read in paper mode.
+S9099_USE_ACTUAL_FEES = os.getenv("S9099_USE_ACTUAL_FEES", "true").lower() == "true"
+
+
+# ── Settlement reference ──────────────────────────────────────────────────
+# These markets resolve on a Chainlink TWAP-60s data stream, NOT on Binance.
+# See settlement_ref.py. Binance stays as a fast, explicitly-labelled proxy.
+
+# Chainlink Data Streams — the actual resolution source. Without credentials
+# the official reference is reported as unavailable (never faked from Binance).
+CHAINLINK_STREAMS_URL = os.getenv("CHAINLINK_STREAMS_URL", "https://api.dataengine.chain.link")
+CHAINLINK_STREAMS_USER_ID = os.getenv("CHAINLINK_STREAMS_USER_ID", "")
+CHAINLINK_STREAMS_SECRET = os.getenv("CHAINLINK_STREAMS_SECRET", "")
+
+# On-chain Chainlink aggregator on Polygon — a closer proxy than Binance
+# (same oracle family, USD quote) but a SPOT feed with a 15-35s update lag,
+# not the TWAP-60s stream. Off by default; it costs an RPC call per sample.
+POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+S9099_CHAINLINK_FEED_ENABLED = os.getenv("S9099_CHAINLINK_FEED_ENABLED", "false").lower() == "true"
+
+# Let a PROXY reference arm the hard "underlying crossed back" emergency exit.
+# Off: measured Binance-vs-Chainlink bias is +7 to +9 bps and the market
+# resolves on a TWAP, so a proxy crossing is not evidence the market flipped.
+# The signal is still recorded either way.
+S9099_ALLOW_PROXY_THRESHOLD_STOP = os.getenv("S9099_ALLOW_PROXY_THRESHOLD_STOP", "false").lower() == "true"
+
+
+# ── Queue-aware take-profit simulation ────────────────────────────────────
+# A resting sell at 99c does not fill because the market touched 99c — it
+# fills when the queue in front of it is eaten. Executed trade prints from
+# the CLOB websocket drive that; the optimistic answer is kept alongside for
+# comparison, never as the P&L.
+S9099_QUEUE_AWARE_TP = os.getenv("S9099_QUEUE_AWARE_TP", "true").lower() == "true"
+# Treat a print ABOVE our resting sell price as proof we were executed.
+S9099_TRADE_THROUGH_FILLS = os.getenv("S9099_TRADE_THROUGH_FILLS", "true").lower() == "true"
+# Strictest reading: count a fill ONLY when executed trade prints account for
+# it. Observation shows most of the 99c level disappears by cancellation
+# rather than execution (e.g. 5,255 shares resting, 122 shares printed), and
+# "the level cleared and a bid is still there" infers a fill from that. It is
+# sound — a cancelled queue moves us to the front — but it is an inference.
+# Turn this on to measure the pessimistic bound instead.
+S9099_REQUIRE_TAPE_EVIDENCE = os.getenv("S9099_REQUIRE_TAPE_EVIDENCE", "false").lower() == "true"
+
+# Entry thresholds to OBSERVE independently (the strategy still enters only at
+# S9099_ENTRY_PRICE_MIN). Each crossing gets its own record, so the data can
+# tell us which entry level is actually best instead of us assuming.
+S9099_OBSERVE_THRESHOLDS = [
+    float(x) for x in
+    os.getenv("S9099_OBSERVE_THRESHOLDS", "0.85,0.88,0.90,0.92,0.95").split(",")
+    if x.strip()
+]
 
 # ── Candidate tracking (data collection) ──────────────────────────────────
 # Keep following a candidate after the trigger — even one we did not trade —
