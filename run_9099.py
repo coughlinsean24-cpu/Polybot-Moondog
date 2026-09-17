@@ -84,7 +84,8 @@ class Runner:
         line = (
             f"[{datetime.now(timezone.utc):%H:%M:%S}] {s['mode']} | "
             f"markets {len(self.watch)} (next close {nearest:.0f}s) | "
-            f"candidates {s['candidates_seen']} "
+            f"crossings {s['candidates_seen']} | "
+            f"@{s['entry_level']:.2f} {s['entry_level_seen']} "
             f"(traded {s['candidates_traded']}, rejected {s['candidates_rejected']}) | "
             f"open {s['open_positions']} | "
             f"TP fills {s['tp_fills']} | exits {s['emergency_exits']} | "

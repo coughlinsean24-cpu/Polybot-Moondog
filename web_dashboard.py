@@ -51,7 +51,7 @@ from polymarket_client import (
 import polymarket_client as _pm
 from ws_feed import PriceFeed
 from binance_ws import BinanceFeed
-from data_recorder import recorder as data_rec
+from data_recorder import recorder as data_rec, DATA_DIR as DATA_DIR_9099
 from adaptive_learner import learner as ai_learner, extract_features
 from arb import ArbEngine
 from strategy_9099 import Strategy9099
@@ -3612,6 +3612,62 @@ def export_afterhours():
     )
 
 
+@app.route("/export-9099")
+def export_9099():
+    """
+    Download the 90c->99c data as CSV.
+
+    ?file=candidates | outcomes | trades   (default: candidates)
+    ?date=YYYY-MM-DD                        (default: every day on disk)
+
+    Files are written continuously by the strategy, so this just concatenates
+    what is already in data/ — no state is held in memory that could be lost.
+    """
+    import glob as _glob
+
+    which = (request.args.get("file") or "candidates").lower()
+    prefixes = {
+        "candidates": "candidates",
+        "outcomes": "candidate_outcomes",
+        "trades": "trades_9099",
+    }
+    prefix = prefixes.get(which)
+    if not prefix:
+        return (f"Unknown file '{which}'. Use one of: "
+                f"{', '.join(prefixes)}"), 400
+
+    date = request.args.get("date", "")
+    pattern = f"{prefix}_{date}.csv" if date else f"{prefix}_*.csv"
+    paths = sorted(_glob.glob(os.path.join(DATA_DIR_9099, pattern)))
+    if not paths:
+        return (f"No {which} data yet. The strategy writes these as markets "
+                f"close — check back after a few 5-minute windows."), 404
+
+    output = io.StringIO()
+    header_written = False
+    for path in paths:
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header and not header_written:
+                    csv.writer(output).writerow(header)
+                    header_written = True
+                writer = csv.writer(output)
+                for row in reader:
+                    writer.writerow(row)
+        except Exception as e:
+            log.error(f"[9099] export read failed for {path}: {e}")
+
+    stamp = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":
+                 f"attachment; filename=9099_{which}_{stamp}.csv"},
+    )
+
+
 # ── SocketIO Events ─────────────────────────────────────────────────────────
 
 @socketio.on("connect")
@@ -5867,7 +5923,13 @@ DASHBOARD_HTML = r"""
           style="background:var(--red);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">KILL SWITCH</button>
   <span id="s9099-kill-state" style="font-size:11px;color:var(--dim);"></span>
   <div style="flex:1;"></div>
-  <span id="s9099-gates" style="font-size:11px;color:var(--dim);"></span>
+  <span style="font-size:11px;color:var(--dim);">Export:</span>
+  <a href="/export-9099?file=candidates" style="background:var(--card);border:1px solid var(--yellow);color:var(--yellow);padding:4px 10px;border-radius:6px;font-size:11px;text-decoration:none;">Candidates</a>
+  <a href="/export-9099?file=outcomes" style="background:var(--card);border:1px solid var(--yellow);color:var(--yellow);padding:4px 10px;border-radius:6px;font-size:11px;text-decoration:none;">Outcomes</a>
+  <a href="/export-9099?file=trades" style="background:var(--card);border:1px solid var(--yellow);color:var(--yellow);padding:4px 10px;border-radius:6px;font-size:11px;text-decoration:none;">Trades</a>
+</div>
+<div style="padding:0 16px 10px;font-size:11px;color:var(--dim);">
+  <span id="s9099-gates"></span>
 </div>
 
 <!-- ── Headline numbers ── -->
@@ -5882,9 +5944,11 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
   <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
   <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
-  <div class="stat-card"><div class="stat-label">Candidates Seen</div><div class="stat-value" id="s9099-seen">0</div></div>
+  <div class="stat-card"><div class="stat-label">Crossings (all levels)</div><div class="stat-value" id="s9099-seen">0</div></div>
+  <div class="stat-card"><div class="stat-label" id="s9099-entry-label">At Entry Level</div><div class="stat-value" id="s9099-entry-seen">0</div></div>
   <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
-  <div class="stat-card"><div class="stat-label">Rejected</div><div class="stat-value" id="s9099-rejected">0</div></div>
+  <div class="stat-card"><div class="stat-label">Rejected (entry level)</div><div class="stat-value" id="s9099-rejected">0</div></div>
+  <div class="stat-card"><div class="stat-label">Observed Only</div><div class="stat-value" id="s9099-observed">0</div></div>
 </div>
 
 <!-- ── Parameters ── -->
@@ -8064,8 +8128,14 @@ function s9099UpdateUI(st, markets) {
   setTxt('s9099-reached', st.tp_price_reached || 0);
   setTxt('s9099-exits', st.emergency_exits || 0);
   setTxt('s9099-seen', st.candidates_seen || 0);
+  setTxt('s9099-entry-seen', st.entry_level_seen || 0);
   setTxt('s9099-traded', st.candidates_traded || 0);
   setTxt('s9099-rejected', st.candidates_rejected || 0);
+  setTxt('s9099-observed', st.candidates_observed || 0);
+  const entryLabel = document.getElementById('s9099-entry-label');
+  if (entryLabel && st.entry_level) {
+    entryLabel.textContent = 'At Entry Level ($' + st.entry_level.toFixed(2) + ')';
+  }
   const rp = document.getElementById('s9099-realized');
   if (rp) rp.style.color = (st.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)';
 
