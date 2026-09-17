@@ -44,9 +44,24 @@ class PriceTick:
     bid_size: float = 0.0
 
 
+@dataclass
+class TradePrint:
+    """One executed trade reported by the CLOB (event_type=last_trade_price).
+
+    `side` is the TAKER's side: BUY means someone lifted an ask, which is what
+    consumes the queue in front of a resting sell order.
+    """
+    ts: float
+    price: float
+    size: float
+    side: str          # "BUY" or "SELL"
+
+
 # How many seconds of history to keep per token
 PRICE_HISTORY_WINDOW = 120.0   # 2 minutes of ticks
 PRICE_HISTORY_MAX = 600        # cap the deque length
+TRADE_HISTORY_WINDOW = 400.0   # a whole 5-min market plus slack
+TRADE_HISTORY_MAX = 4000       # cap the trade deque length
 
 
 @dataclass
@@ -65,6 +80,17 @@ class LivePrice:
     # Rolling price history (newest at right)
     history: deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_MAX))
 
+    # Executed trades (newest at right) — the only honest way to know whether
+    # a resting order's queue has actually been eaten through.
+    trades: deque = field(default_factory=lambda: deque(maxlen=TRADE_HISTORY_MAX))
+    last_trade_price: float = 0.0
+    last_trade_size: float = 0.0
+    last_trade_side: str = ""
+    last_trade_ts: float = 0.0
+    trade_count: int = 0
+    taker_buy_volume: float = 0.0    # cumulative shares lifted from the asks
+    taker_sell_volume: float = 0.0   # cumulative shares hit into the bids
+
     def record_tick(self, ts: float):
         """Append current best_ask/bid to history and prune old ticks."""
         if self.best_ask <= 0:
@@ -80,6 +106,57 @@ class LivePrice:
         cutoff = ts - PRICE_HISTORY_WINDOW
         while self.history and self.history[0].ts < cutoff:
             self.history.popleft()
+
+    def record_trade(self, price: float, size: float, side: str, ts: float):
+        """Store one executed trade print and prune anything too old."""
+        if price <= 0 or size <= 0:
+            return
+        side = (side or "").upper()
+        self.trades.append(TradePrint(ts=ts, price=price, size=size, side=side))
+        self.last_trade_price = price
+        self.last_trade_size = size
+        self.last_trade_side = side
+        self.last_trade_ts = ts
+        self.trade_count += 1
+        if side == "BUY":
+            self.taker_buy_volume += size
+        elif side == "SELL":
+            self.taker_sell_volume += size
+        cutoff = ts - TRADE_HISTORY_WINDOW
+        while self.trades and self.trades[0].ts < cutoff:
+            self.trades.popleft()
+
+    def volume_since(self, since_ts: float, side: str | None = None,
+                     max_price: float | None = None,
+                     min_price: float | None = None) -> float:
+        """
+        Shares traded since `since_ts`, optionally filtered.
+
+        For a resting SELL at price P, the queue in front of it is eaten by
+        taker BUYs at prices at or below P (better-priced asks fill first),
+        so that is volume_since(t0, side="BUY", max_price=P).
+        """
+        total = 0.0
+        for t in reversed(self.trades):
+            if t.ts < since_ts:
+                break
+            if side and t.side != side:
+                continue
+            if max_price is not None and t.price > max_price + 1e-9:
+                continue
+            if min_price is not None and t.price < min_price - 1e-9:
+                continue
+            total += t.size
+        return total
+
+    def max_trade_price_since(self, since_ts: float) -> float:
+        """Highest executed price since `since_ts` (0 if nothing traded)."""
+        best = 0.0
+        for t in reversed(self.trades):
+            if t.ts < since_ts:
+                break
+            best = max(best, t.price)
+        return best
 
     # ── Derived signals ─────────────────────────────────────────────
 
@@ -510,12 +587,22 @@ class PriceFeed:
                 price.record_tick(now)
 
         elif event_type == "last_trade_price":
-            # Trade price update — some markets send this instead
+            # An executed trade. Carries price, size and the taker's side, so
+            # it is what tells us whether a resting order's queue was consumed.
             asset_id = msg.get("asset_id", "")
             if asset_id in self._prices:
                 price = self._prices[asset_id]
                 price.timestamp = now
                 price.update_count += 1
+                try:
+                    price.record_trade(
+                        price=float(msg.get("price", 0) or 0),
+                        size=float(msg.get("size", 0) or 0),
+                        side=str(msg.get("side", "")),
+                        ts=now,
+                    )
+                except (TypeError, ValueError):
+                    pass
                 # We don't override ask/bid from trade price
 
         elif event_type == "tick_size_change":

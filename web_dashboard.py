@@ -54,6 +54,7 @@ from binance_ws import BinanceFeed
 from data_recorder import recorder as data_rec
 from adaptive_learner import learner as ai_learner, extract_features
 from arb import ArbEngine
+from strategy_9099 import Strategy9099
 
 
 # ── Settings Persistence ────────────────────────────────────────────────────
@@ -74,6 +75,12 @@ def _save_settings():
             "scanner": dict(engine.scanner_cfg),
             "scanner_auto_bid": engine.scanner_auto_bid,
             "auto_trade_enabled": engine.auto_trade_enabled,
+            "s9099": (
+                dict(engine.s9099.params(),
+                     enabled=engine.s9099.enabled,
+                     auto_trade=engine.s9099.auto_trade)
+                if engine.s9099 else (engine._s9099_saved_cfg or {})
+            ),
             "arb": {
                 "enabled": engine.arb.enabled if engine.arb else config.ARB_ENABLED,
                 "min_edge": engine.arb.min_edge if engine.arb else config.ARB_MIN_EDGE,
@@ -143,6 +150,13 @@ def _load_settings():
         else:
             engine.scanner_auto_bid = bool(data.get("scanner_auto_bid", False))
             engine.auto_trade_enabled = bool(data.get("auto_trade_enabled", False))
+        # 90/99 settings — applied once the strategy is initialized.
+        # Note: "enabled"/"auto_trade" restored here only ever affect PAPER
+        # behaviour unless the .env live gates are open.
+        s9099_cfg = data.get("s9099", {})
+        if s9099_cfg and isinstance(s9099_cfg, dict):
+            engine._s9099_saved_cfg = s9099_cfg
+
         # Arb settings — applied to engine.arb once it's initialized
         arb_cfg = data.get("arb", {})
         if arb_cfg and isinstance(arb_cfg, dict):
@@ -1741,6 +1755,11 @@ class Engine:
         # ── Combined-Ask Arbitrage Engine ──
         self.arb: ArbEngine | None = None  # Initialized after ws_feed.start()
 
+        # ── 90c -> 99c Late-Market Strategy ──
+        # Paper unless all four live gates in .env are open (see config.py).
+        self.s9099: Strategy9099 | None = None  # Initialized after ws_feed.start()
+        self._s9099_saved_cfg: dict | None = None
+
     def init_arb(self):
         """Initialize the arb engine (call after ws_feed is ready)."""
         self.arb = ArbEngine(self.ws_feed)
@@ -1762,6 +1781,29 @@ class Engine:
             self.arb.fill_timeout = float(cfg.get("fill_timeout", self.arb.fill_timeout))
             self.arb.max_daily_spend = float(cfg.get("max_daily_spend", self.arb.max_daily_spend))
             log.info(f"[ARB] Restored settings: enabled={self.arb.enabled}, edge={self.arb.min_edge}, size=${self.arb.trade_size}")
+
+    def init_9099(self):
+        """Initialise the 90/99 strategy (call after the feeds are ready)."""
+        if self.s9099 is not None:
+            return
+        self.s9099 = Strategy9099(
+            feed=self.ws_feed,
+            underlying=self.btc_feed,
+            log_callback=self.add_log,
+        )
+        cfg = self._s9099_saved_cfg
+        if cfg and isinstance(cfg, dict):
+            self.s9099.set_params(cfg)
+        restored = self.s9099.recover()
+        if restored:
+            self.add_log(f"[9099] Recovered {restored} open position(s)", "warn")
+        mode = self.s9099.mode
+        self.add_log(
+            f"[9099] 90c->99c strategy ready in {mode} mode "
+            f"(entry ${self.s9099.entry_price_min:.2f} -> TP ${self.s9099.tp_price:.2f}, "
+            f"stop ${self.s9099.stop_price:.2f})",
+            "warn" if mode == "LIVE" else "info",
+        )
 
     def reset_daily_counter(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2877,7 +2919,11 @@ def bot_loop():
     engine.ws_feed.start()
     engine.btc_feed.start()
     engine.init_arb()
-    engine.add_log("WebSocket feed + Binance WS + data recorder + ARB engine started", "info")
+    engine.init_9099()
+    engine.add_log(
+        "WebSocket feed + Binance WS + data recorder + ARB engine + 90/99 strategy started",
+        "info",
+    )
 
     # Bootstrap adaptive learner from historical trade logs
     try:
@@ -2993,6 +3039,17 @@ def bot_loop():
                 engine.arb.check_fills()
                 engine.arb.cancel_stale()
 
+            # ── 90c -> 99c strategy ─────────────────────────────────────
+            # Runs every cycle: it is time-critical in the last 60s of a
+            # market. Order placement is gated inside the engine (paper
+            # unless every live gate in .env is open), so this is safe to
+            # call whatever the dashboard's other toggles say.
+            if engine.s9099 and engine.s9099.enabled:
+                try:
+                    engine.s9099.on_tick(list(engine.watch_list.values()))
+                except Exception as _e9099:
+                    log_error("strategy_9099_tick", _e9099)
+
             # Monitor OB imbalance for active bids (log-only, every 2s)
             if now_ts - last_ob_monitor >= 2.0 and engine.bids_posted:
                 monitor_ob_imbalance()
@@ -3102,6 +3159,8 @@ def bot_loop():
     engine.add_log("Bot stopping...", "info")
     if engine.arb:
         engine.arb.shutdown()
+    if engine.s9099:
+        engine.s9099.shutdown()
     for timer in engine.cancel_timers.values():
         timer.cancel()
     for mid, bid in engine.bids_posted.items():
@@ -3319,6 +3378,7 @@ def push_state():
         "manual_exit_default": config.MANUAL_EXIT_PRICE,
         "arb": engine.arb.stats() if engine.arb else {},
         "arb_positions": engine.arb.get_positions_list() if engine.arb else [],
+        "s9099": engine.s9099.stats() if engine.s9099 else {},
     }
     socketio.emit("state", data)
 
@@ -4136,6 +4196,34 @@ def on_arb_update_params(data):
     push_state()
 
 
+# ── 90c -> 99c Strategy Socket Events ───────────────────────────────────
+
+@socketio.on("s9099_toggle")
+def on_s9099_toggle(data):
+    """Turn the strategy, its auto-trading, or its kill switch on/off."""
+    if not engine.s9099 or not isinstance(data, dict):
+        return
+    field = data.get("field", "")
+    value = bool(data.get("value", False))
+    if field not in ("enabled", "auto_trade", "kill_switch"):
+        return
+    setattr(engine.s9099, field, value)
+    _save_settings()
+    engine.add_log(f"[9099] {field} = {value} (mode {engine.s9099.mode})", "trade")
+    push_state()
+
+
+@socketio.on("s9099_update_params")
+def on_s9099_update_params(data):
+    """Apply parameter edits from the 90/99 tab."""
+    if not engine.s9099 or not isinstance(data, dict):
+        return
+    applied = engine.s9099.set_params(data)
+    _save_settings()
+    engine.add_log(f"[9099] Params updated: {applied}", "info")
+    push_state()
+
+
 @socketio.on("arb_manual")
 def on_arb_manual(data):
     """Manually trigger an arb on a specific market from the dashboard."""
@@ -4642,6 +4730,9 @@ DASHBOARD_HTML = r"""
     border-bottom: 2px solid var(--border);
     padding: 0 24px;
   }
+  .s9099-in { display:block; width:100%; margin-top:3px; background:var(--bg);
+    border:1px solid var(--border); color:var(--text); padding:5px 7px;
+    border-radius:6px; font-size:12px; }
   .tab-btn {
     padding: 10px 28px; border: none; background: transparent;
     color: var(--dim); font-size: 13px; font-weight: 700;
@@ -4925,6 +5016,7 @@ DASHBOARD_HTML = r"""
   <button class="tab-btn" onclick="switchTab('scanner')" id="tab-btn-scanner">Market Scanner</button>
   <button class="tab-btn" onclick="switchTab('afterhours')" id="tab-btn-afterhours">After-Hours Fills <span id="ah-tab-badge" style="background:#0c2d4a;color:var(--cyan);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
   <button class="tab-btn" onclick="switchTab('journal')" id="tab-btn-journal" style="background:linear-gradient(135deg,#0a1628,#0d2137);border:1px solid var(--green);">Trade Journal <span id="tj-tab-badge" style="background:#0c2d4a;color:var(--green);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
+  <button class="tab-btn" onclick="switchTab('s9099')" id="tab-btn-s9099" style="background:linear-gradient(135deg,#0a1628,#28200a);border:1px solid var(--yellow);">90&cent; &rarr; 99&cent; <span id="s9099-tab-badge" style="background:#2d240c;color:var(--yellow);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
   <button class="tab-btn" onclick="switchTab('arb')" id="tab-btn-arb" style="background:linear-gradient(135deg,#0a1628,#1a0a28);border:1px solid var(--purple);">Arb Engine <span id="arb-tab-badge" style="background:#1a0c2d;color:var(--purple);border-radius:10px;padding:0 6px;font-size:10px;margin-left:4px;">0</span></button>
 </div>
 
@@ -5684,6 +5776,100 @@ DASHBOARD_HTML = r"""
 </div><!-- /tab-journal -->
 
 <!-- ══════ TAB 5: ARB ENGINE ══════ -->
+<div class="tab-content" id="tab-s9099">
+
+<!-- ── Mode + master switches ── -->
+<div style="display:flex;align-items:center;gap:16px;padding:12px 16px;background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:12px;flex-wrap:wrap;">
+  <span style="color:var(--yellow);font-weight:700;">90&cent; &rarr; 99&cent; Late-Market Strategy</span>
+  <span id="s9099-mode-badge" style="padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700;background:var(--yellow);color:#000;">PAPER</span>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="s9099-enabled" onchange="s9099Toggle('enabled', this.checked)"
+           style="width:18px;height:18px;accent-color:var(--yellow);">
+    <span style="font-size:12px;color:var(--dim);">Watch &amp; record</span>
+  </label>
+  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="s9099-auto" onchange="s9099Toggle('auto_trade', this.checked)"
+           style="width:18px;height:18px;accent-color:var(--green);">
+    <span style="font-size:12px;color:var(--dim);">Trade candidates</span>
+  </label>
+  <button onclick="s9099Toggle('kill_switch', true)"
+          style="background:var(--red);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">KILL SWITCH</button>
+  <span id="s9099-kill-state" style="font-size:11px;color:var(--dim);"></span>
+  <div style="flex:1;"></div>
+  <span id="s9099-gates" style="font-size:11px;color:var(--dim);"></span>
+</div>
+
+<!-- ── Headline numbers ── -->
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:12px;">
+  <div class="stat-card"><div class="stat-label">Bankroll</div><div class="stat-value" id="s9099-bankroll">$0</div></div>
+  <div class="stat-card"><div class="stat-label">Available</div><div class="stat-value" id="s9099-available">$0</div></div>
+  <div class="stat-card"><div class="stat-label">Realized P&amp;L</div><div class="stat-value" id="s9099-realized">$0</div></div>
+  <div class="stat-card"><div class="stat-label">Unrealized</div><div class="stat-value" id="s9099-unrealized">$0</div></div>
+  <div class="stat-card"><div class="stat-label">Wins / Losses</div><div class="stat-value" id="s9099-wl">0 / 0</div></div>
+  <div class="stat-card"><div class="stat-label">Hit Rate</div><div class="stat-value" id="s9099-hitrate">--</div></div>
+  <div class="stat-card"><div class="stat-label">Avg Return</div><div class="stat-value" id="s9099-avg">$0</div></div>
+  <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
+  <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
+  <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
+  <div class="stat-card"><div class="stat-label">Candidates Seen</div><div class="stat-value" id="s9099-seen">0</div></div>
+  <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
+  <div class="stat-card"><div class="stat-label">Rejected</div><div class="stat-value" id="s9099-rejected">0</div></div>
+</div>
+
+<!-- ── Parameters ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters</span>
+    <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
+    <label>Entry min $<input type="number" id="s9099-entry-min" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Entry max $<input type="number" id="s9099-entry-max" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Take profit $<input type="number" id="s9099-tp" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
+    <label>Stop price $<input type="number" id="s9099-stop" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
+    <label>Max secs left<input type="number" id="s9099-max-secs" step="5" min="1" max="300" class="s9099-in"></label>
+    <label>Min secs left<input type="number" id="s9099-min-secs" step="1" min="0" max="120" class="s9099-in"></label>
+    <label>Max spread $<input type="number" id="s9099-max-spread" step="0.005" min="0.001" max="0.2" class="s9099-in"></label>
+    <label>Min liquidity (sh)<input type="number" id="s9099-min-liq" step="10" min="0" class="s9099-in"></label>
+    <label>Min margin %<input type="number" id="s9099-margin" step="0.005" min="0" class="s9099-in"></label>
+    <label>Sizing mode
+      <select id="s9099-size-mode" class="s9099-in">
+        <option value="fixed_dollars">fixed_dollars</option>
+        <option value="percent_bankroll">percent_bankroll</option>
+      </select>
+    </label>
+    <label>Fixed $/trade<input type="number" id="s9099-fixed" step="5" min="1" class="s9099-in"></label>
+    <label>Bankroll %<input type="number" id="s9099-pct" step="5" min="1" max="100" class="s9099-in"></label>
+    <label>Max $/position<input type="number" id="s9099-maxpos" step="10" min="1" class="s9099-in"></label>
+    <label>Exit before expiry (s)<input type="number" id="s9099-exit-before" step="1" min="0" max="60" class="s9099-in"></label>
+    <label>Max open<input type="number" id="s9099-max-open" step="1" min="1" max="10" class="s9099-in"></label>
+    <label>Max daily loss $<input type="number" id="s9099-max-loss" step="5" min="0" class="s9099-in"></label>
+  </div>
+</div>
+
+<!-- ── Open positions ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
+  <span style="font-weight:700;color:var(--yellow);font-size:13px;">Open Positions</span>
+  <table class="data-table" style="width:100%;font-size:11px;margin-top:8px;">
+    <thead><tr>
+      <th>Asset</th><th>Side</th><th>Phase</th><th>Shares</th><th>Entry</th>
+      <th>TP</th><th>TP Filled</th><th>Stop</th><th>Cost</th><th>Fees</th><th>Age</th>
+    </tr></thead>
+    <tbody id="s9099-positions-body"></tbody>
+  </table>
+</div>
+
+<!-- ── Live candidates in the watch list ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Live Markets &mdash; best side vs entry threshold</span>
+    <span id="s9099-rejections" style="font-size:11px;color:var(--dim);"></span>
+  </div>
+  <div id="s9099-live-markets" style="max-height:300px;overflow-y:auto;font-size:12px;"></div>
+</div>
+
+</div><!-- /tab-s9099 -->
+
 <div class="tab-content" id="tab-arb">
 
 <!-- ── Arb Controls ── -->
@@ -6549,6 +6735,7 @@ socket.on('state', (d) => {
   // ══════════ ARB ENGINE TAB ══════════
   if (d.arb) {
     arbUpdateUI(d.arb, d.arb_positions || [], d.markets || []);
+    s9099UpdateUI(d.s9099, d.markets || []);
   }
 });
 
@@ -7581,6 +7768,194 @@ function arbUpdateUI(arb, positions, markets) {
         '</tr>';
       });
       tbody.innerHTML = html;
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  90c -> 99c strategy tab
+// ══════════════════════════════════════════════════════════════════════
+
+let s9099Editing = false;
+document.addEventListener('focusin', (e) => {
+  if (e.target && e.target.classList && e.target.classList.contains('s9099-in')) s9099Editing = true;
+});
+document.addEventListener('focusout', (e) => {
+  if (e.target && e.target.classList && e.target.classList.contains('s9099-in')) {
+    setTimeout(() => { s9099Editing = false; }, 400);
+  }
+});
+
+function s9099Toggle(field, value) {
+  socket.emit('s9099_toggle', { field: field, value: value });
+}
+
+function s9099Num(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const v = parseFloat(el.value);
+  return isNaN(v) ? null : v;
+}
+
+function s9099SaveParams() {
+  const p = {
+    entry_price_min: s9099Num('s9099-entry-min'),
+    entry_price_max: s9099Num('s9099-entry-max'),
+    tp_price: s9099Num('s9099-tp'),
+    stop_price: s9099Num('s9099-stop'),
+    max_secs_remaining: s9099Num('s9099-max-secs'),
+    min_secs_remaining: s9099Num('s9099-min-secs'),
+    max_spread: s9099Num('s9099-max-spread'),
+    min_liquidity: s9099Num('s9099-min-liq'),
+    min_margin_pct: s9099Num('s9099-margin'),
+    size_mode: document.getElementById('s9099-size-mode').value,
+    fixed_dollars: s9099Num('s9099-fixed'),
+    max_position_percent: s9099Num('s9099-pct'),
+    max_position_dollars: s9099Num('s9099-maxpos'),
+    exit_before_expiry: s9099Num('s9099-exit-before'),
+    max_open_positions: s9099Num('s9099-max-open'),
+    max_daily_loss: s9099Num('s9099-max-loss'),
+  };
+  Object.keys(p).forEach(k => { if (p[k] === null) delete p[k]; });
+  socket.emit('s9099_update_params', p);
+}
+
+function s9099Set(id, value) {
+  const el = document.getElementById(id);
+  if (el && !s9099Editing) el.value = value;
+}
+
+function s9099UpdateUI(st, markets) {
+  if (!st || !st.params) return;
+  const p = st.params;
+
+  // Mode badge — PAPER must be impossible to mistake for LIVE.
+  const badge = document.getElementById('s9099-mode-badge');
+  if (badge) {
+    badge.textContent = st.mode;
+    badge.style.background = st.mode === 'LIVE' ? 'var(--red)' : 'var(--yellow)';
+    badge.style.color = st.mode === 'LIVE' ? '#fff' : '#000';
+  }
+  const gates = document.getElementById('s9099-gates');
+  if (gates) {
+    const ref = st.reference || {};
+    const refTxt = ref.official_available
+      ? 'settlement ref: Chainlink TWAP (official)'
+      : 'settlement ref: Binance PROXY (official unavailable)';
+    const queueTxt = st.queue_aware ? 'queue-aware TP' : 'OPTIMISTIC TP';
+    gates.textContent = (st.mode === 'LIVE'
+      ? 'LIVE — real orders'
+      : 'paper because: ' + (st.live_blocked_by || []).join(', '))
+      + '  |  ' + refTxt + '  |  ' + queueTxt;
+  }
+  const en = document.getElementById('s9099-enabled');
+  if (en) en.checked = !!st.enabled;
+  const au = document.getElementById('s9099-auto');
+  if (au) au.checked = !!st.auto_trade;
+  const ks = document.getElementById('s9099-kill-state');
+  if (ks) {
+    ks.textContent = st.kill_switch ? 'KILLED — click Trade candidates to re-arm' : '';
+    ks.style.color = st.kill_switch ? 'var(--red)' : 'var(--dim)';
+  }
+
+  const badge2 = document.getElementById('s9099-tab-badge');
+  if (badge2) badge2.textContent = st.open_positions || 0;
+
+  const setTxt = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  setTxt('s9099-bankroll', '$' + (st.bankroll || 0).toFixed(2));
+  setTxt('s9099-available', '$' + (st.available_balance || 0).toFixed(2));
+  setTxt('s9099-realized', '$' + (st.realized_pnl || 0).toFixed(2));
+  setTxt('s9099-unrealized', '$' + (st.unrealized_pnl || 0).toFixed(2));
+  setTxt('s9099-wl', (st.wins || 0) + ' / ' + (st.losses || 0));
+  setTxt('s9099-hitrate', (st.wins + st.losses) ? st.hit_rate.toFixed(1) + '%' : '--');
+  setTxt('s9099-avg', '$' + (st.avg_return || 0).toFixed(2));
+  setTxt('s9099-tpfills', st.tp_fills || 0);
+  setTxt('s9099-reached', st.tp_price_reached || 0);
+  setTxt('s9099-exits', st.emergency_exits || 0);
+  setTxt('s9099-seen', st.candidates_seen || 0);
+  setTxt('s9099-traded', st.candidates_traded || 0);
+  setTxt('s9099-rejected', st.candidates_rejected || 0);
+  const rp = document.getElementById('s9099-realized');
+  if (rp) rp.style.color = (st.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+
+  s9099Set('s9099-entry-min', p.entry_price_min);
+  s9099Set('s9099-entry-max', p.entry_price_max);
+  s9099Set('s9099-tp', p.tp_price);
+  s9099Set('s9099-stop', p.stop_price);
+  s9099Set('s9099-max-secs', p.max_secs_remaining);
+  s9099Set('s9099-min-secs', p.min_secs_remaining);
+  s9099Set('s9099-max-spread', p.max_spread);
+  s9099Set('s9099-min-liq', p.min_liquidity);
+  s9099Set('s9099-margin', p.min_margin_pct);
+  s9099Set('s9099-fixed', p.fixed_dollars);
+  s9099Set('s9099-pct', p.max_position_percent);
+  s9099Set('s9099-maxpos', p.max_position_dollars);
+  s9099Set('s9099-exit-before', p.exit_before_expiry);
+  s9099Set('s9099-max-open', p.max_open_positions);
+  s9099Set('s9099-max-loss', p.max_daily_loss);
+  const sm = document.getElementById('s9099-size-mode');
+  if (sm && !s9099Editing) sm.value = p.size_mode;
+
+  const rej = document.getElementById('s9099-rejections');
+  if (rej) {
+    const parts = Object.entries(st.rejection_reasons || {}).map(([k, v]) => k + ' ' + v);
+    rej.textContent = parts.length ? 'rejections: ' + parts.join(' | ') : '';
+  }
+
+  // ── Open positions ──
+  const tbody = document.getElementById('s9099-positions-body');
+  if (tbody) {
+    const pos = st.positions || [];
+    if (!pos.length) {
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--dim);padding:14px;">No open positions</td></tr>';
+    } else {
+      tbody.innerHTML = pos.map(q =>
+        '<tr style="border-bottom:1px solid var(--border);">' +
+        '<td style="padding:4px 6px;">' + q.asset + '</td>' +
+        '<td style="padding:4px 6px;">' + q.side + '</td>' +
+        '<td style="padding:4px 6px;color:var(--cyan);">' + q.phase + '</td>' +
+        '<td style="padding:4px 6px;">' + q.shares + '</td>' +
+        '<td style="padding:4px 6px;">$' + q.entry_price.toFixed(3) + '</td>' +
+        '<td style="padding:4px 6px;color:var(--green);">$' + q.tp_price.toFixed(2) + '</td>' +
+        '<td style="padding:4px 6px;">' + q.tp_filled + '</td>' +
+        '<td style="padding:4px 6px;color:var(--red);">$' + q.stop_price.toFixed(2) + '</td>' +
+        '<td style="padding:4px 6px;">$' + q.cost.toFixed(2) + '</td>' +
+        '<td style="padding:4px 6px;">$' + q.fees.toFixed(2) + '</td>' +
+        '<td style="padding:4px 6px;">' + q.age + 's</td></tr>'
+      ).join('');
+    }
+  }
+
+  // ── Live markets: how close is either side to the entry threshold ──
+  const lm = document.getElementById('s9099-live-markets');
+  if (lm) {
+    const rows = (markets || []).filter(m => m.secs > -5 && m.secs < 180);
+    if (!rows.length) {
+      lm.innerHTML = '<div style="color:var(--dim);padding:10px;">No markets near expiry</div>';
+    } else {
+      let html = '<table style="width:100%;font-size:11px;"><tr style="color:var(--dim);">' +
+        '<th align="left">Market</th><th align="left">Left</th><th align="left">Up</th>' +
+        '<th align="left">Down</th><th align="left">Best side</th><th align="left">Status</th></tr>';
+      rows.sort((a, b) => a.secs - b.secs).forEach(m => {
+        const up = m.up_ask || 0, dn = m.down_ask || 0;
+        const best = Math.max(up, dn);
+        const bestSide = up >= dn ? 'Up' : 'Down';
+        const inBand = best >= p.entry_price_min && best <= p.entry_price_max;
+        const inWindow = m.secs <= p.max_secs_remaining && m.secs >= p.min_secs_remaining;
+        let status = '', color = 'var(--dim)';
+        if (inBand && inWindow) { status = 'QUALIFIES'; color = 'var(--green)'; }
+        else if (inBand) { status = 'in band, wrong time'; color = 'var(--yellow)'; }
+        else if (best >= p.entry_price_min) { status = 'past entry band'; }
+        else { status = 'below threshold'; }
+        html += '<tr style="border-bottom:1px solid var(--border);">' +
+          '<td style="padding:3px 6px;">' + (m.name || '') + '</td>' +
+          '<td style="padding:3px 6px;">' + Math.floor(m.secs) + 's</td>' +
+          '<td style="padding:3px 6px;">$' + up.toFixed(2) + '</td>' +
+          '<td style="padding:3px 6px;">$' + dn.toFixed(2) + '</td>' +
+          '<td style="padding:3px 6px;">' + bestSide + ' $' + best.toFixed(2) + '</td>' +
+          '<td style="padding:3px 6px;color:' + color + ';">' + status + '</td></tr>';
+      });
+      lm.innerHTML = html + '</table>';
     }
   }
 }

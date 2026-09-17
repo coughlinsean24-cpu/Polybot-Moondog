@@ -469,6 +469,32 @@ def raw_balance_to_shares(raw_balance: int) -> int:
     return int(raw_balance / 1_000_000)
 
 
+def get_usdc_balance() -> float:
+    """
+    Available USDC collateral on the exchange, in dollars.
+
+    This is buying power — what the CLOB will let us spend right now — not
+    the wallet's total balance.  In paper mode it returns the configured
+    paper bankroll so sizing maths behaves identically in both modes.
+    Returns 0.0 on error, which every caller must treat as "cannot size".
+    """
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+    if config.PAPER_TRADING:
+        return float(config.S9099_PAPER_BANKROLL)
+
+    try:
+        client = get_clob_client()
+        result = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        # USDC is 6-decimal, same convention as conditional tokens.
+        return int(result.get("balance", 0)) / 1_000_000
+    except Exception as e:
+        log_error("get_usdc_balance", e)
+        return 0.0
+
+
 def place_limit_sell(token_id: str, price: float, size: int,
                      market_id: str = "") -> Optional[str]:
     """
@@ -687,6 +713,28 @@ def get_order_status(order_id: str) -> dict:
     except Exception as e:
         log_error(f"get_order_status({order_id})", e)
         return {"status": "unknown", "size_matched": 0.0, "original_size": 0.0}
+
+
+def get_trades_for_order(order_id: str) -> list[dict]:
+    """
+    Executed trades for one of our orders, straight from the CLOB.
+
+    This is the only source of the fee the exchange ACTUALLY charged — every
+    other number in the bot is a formula. Returns [] in paper mode or on any
+    error, and callers must then fall back to the estimate and say so.
+    """
+    if config.PAPER_TRADING or not order_id:
+        return []
+    try:
+        from py_clob_client.clob_types import TradeParams
+        client = get_clob_client()
+        result = client.get_trades(TradeParams(id=order_id))
+        if isinstance(result, dict):
+            result = result.get("data", []) or []
+        return [t for t in (result or []) if isinstance(t, dict)]
+    except Exception as e:
+        log.debug(f"get_trades_for_order({order_id}) failed: {e}")
+        return []
 
 
 def get_open_orders() -> list[dict]:
