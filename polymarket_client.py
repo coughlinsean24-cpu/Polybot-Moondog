@@ -469,6 +469,32 @@ def raw_balance_to_shares(raw_balance: int) -> int:
     return int(raw_balance / 1_000_000)
 
 
+def get_usdc_balance() -> float:
+    """
+    Available USDC collateral on the exchange, in dollars.
+
+    This is buying power — what the CLOB will let us spend right now — not
+    the wallet's total balance.  In paper mode it returns the configured
+    paper bankroll so sizing maths behaves identically in both modes.
+    Returns 0.0 on error, which every caller must treat as "cannot size".
+    """
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+    if config.PAPER_TRADING:
+        return float(config.S9099_PAPER_BANKROLL)
+
+    try:
+        client = get_clob_client()
+        result = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        # USDC is 6-decimal, same convention as conditional tokens.
+        return int(result.get("balance", 0)) / 1_000_000
+    except Exception as e:
+        log_error("get_usdc_balance", e)
+        return 0.0
+
+
 def place_limit_sell(token_id: str, price: float, size: int,
                      market_id: str = "") -> Optional[str]:
     """
