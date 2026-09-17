@@ -5899,7 +5899,8 @@ DASHBOARD_HTML = r"""
     <label>Take profit $<input type="number" id="s9099-tp" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
     <label>Stop price $<input type="number" id="s9099-stop" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
     <label>Max secs left<input type="number" id="s9099-max-secs" step="5" min="1" max="300" class="s9099-in"></label>
-    <label>Min secs left<input type="number" id="s9099-min-secs" step="1" min="0" max="120" class="s9099-in"></label>
+    <label>Min secs left<input type="number" id="s9099-min-secs" step="1" min="0" max="300" class="s9099-in"></label>
+    <label title="Start recording a crossing this early, even outside the entry window. Cannot be lower than Max secs left.">Track from (s)<input type="number" id="s9099-track-secs" step="10" min="1" max="300" class="s9099-in"></label>
     <label>Max spread $<input type="number" id="s9099-max-spread" step="0.005" min="0.001" max="0.2" class="s9099-in"></label>
     <label>Min liquidity (sh)<input type="number" id="s9099-min-liq" step="10" min="0" class="s9099-in"></label>
     <label>Min margin %<input type="number" id="s9099-margin" step="0.005" min="0" class="s9099-in"></label>
@@ -7994,6 +7995,7 @@ function s9099SaveParams() {
     stop_price: s9099Num('s9099-stop'),
     max_secs_remaining: s9099Num('s9099-max-secs'),
     min_secs_remaining: s9099Num('s9099-min-secs'),
+    candidate_max_secs: s9099Num('s9099-track-secs'),
     max_spread: s9099Num('s9099-max-spread'),
     min_liquidity: s9099Num('s9099-min-liq'),
     min_margin_pct: s9099Num('s9099-margin'),
@@ -8073,6 +8075,7 @@ function s9099UpdateUI(st, markets) {
   s9099Set('s9099-stop', p.stop_price);
   s9099Set('s9099-max-secs', p.max_secs_remaining);
   s9099Set('s9099-min-secs', p.min_secs_remaining);
+  s9099Set('s9099-track-secs', p.candidate_max_secs);
   s9099Set('s9099-max-spread', p.max_spread);
   s9099Set('s9099-min-liq', p.min_liquidity);
   s9099Set('s9099-margin', p.min_margin_pct);
