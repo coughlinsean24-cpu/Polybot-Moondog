@@ -998,9 +998,11 @@ class Strategy9099:
         self._global_lock = threading.RLock()
 
         # ── Counters ─────────────────────────────────────────────────────
-        self.candidates_seen = 0
+        self.candidates_seen = 0          # every crossing, every level
+        self.entry_level_seen = 0         # crossings at the TRADEABLE level
         self.candidates_traded = 0
-        self.candidates_rejected = 0
+        self.candidates_rejected = 0      # entry-level only
+        self.candidates_observed = 0      # other levels — never up for a trade
         self.rejection_reasons: dict[str, int] = {}
         self.trades_today = 0
         self.wins = 0
@@ -1373,6 +1375,8 @@ class Strategy9099:
         cand.observe(px, now)
         self.candidates[(market.market_id, side, level)] = cand
         self.candidates_seen += 1
+        if abs(level - self.entry_price_min) < 1e-9:
+            self.entry_level_seen += 1
         self._log(
             f"CANDIDATE[{level:.2f}] {cand.asset} {side} @ ${ask:.3f} with {secs:.0f}s left "
             f"(bid ${px.best_bid:.3f}, ask depth {px.best_ask_size:.0f}, "
@@ -1428,14 +1432,22 @@ class Strategy9099:
         cand.qualified = traded
         cand.traded = traded
         cand.trade_id = trade_id
+        # Only the crossing at the entry threshold was ever up for a trade.
+        # The other observation levels are data, not rejections — counting
+        # them as "rejected (unknown)" buried the real reasons under noise.
+        is_tradeable = abs(cand.level - self.entry_price_min) < 1e-9
         if traded:
             cand.reason_qualified = "all_checks_passed"
             cand.reason_rejected = ""
             self.candidates_traded += 1
-        else:
+        elif is_tradeable:
             self.candidates_rejected += 1
-            bucket = (cand.reason_rejected or "unknown").split("(")[0]
+            bucket = (cand.reason_rejected or "no_evaluation").split("(")[0]
             self.rejection_reasons[bucket] = self.rejection_reasons.get(bucket, 0) + 1
+        else:
+            self.candidates_observed += 1
+            if not cand.reason_rejected:
+                cand.reason_rejected = f"observation_only(level={cand.level:.2f})"
         candidate_log.write(cand.observation_row(self.mode))
 
     # ══════════════════════════════════════════════════════════════════
@@ -2366,9 +2378,12 @@ class Strategy9099:
             "daily_loss": round(self.daily_loss, 2),
             "consecutive_losses": self.consecutive_losses,
             "candidates_seen": self.candidates_seen,
+            "entry_level_seen": self.entry_level_seen,
             "candidates_traded": self.candidates_traded,
             "candidates_rejected": self.candidates_rejected,
+            "candidates_observed": self.candidates_observed,
             "candidates_tracking": len(self.candidates),
+            "entry_level": self.entry_price_min,
             "rejection_reasons": dict(sorted(
                 self.rejection_reasons.items(), key=lambda kv: -kv[1]
             )[:8]),
@@ -2476,8 +2491,10 @@ class Strategy9099:
                     "daily_loss": self.daily_loss,
                     "consecutive_losses": self.consecutive_losses,
                     "candidates_seen": self.candidates_seen,
+                    "entry_level_seen": self.entry_level_seen,
                     "candidates_traded": self.candidates_traded,
                     "candidates_rejected": self.candidates_rejected,
+                    "candidates_observed": self.candidates_observed,
                 },
                 "positions": [p.to_dict() for p in self.positions.values()],
                 "traded_markets": sorted(self.traded_markets),
