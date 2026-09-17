@@ -973,6 +973,14 @@ class Strategy9099:
             set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min}
         )
         self.allow_proxy_threshold_stop: bool = config.S9099_ALLOW_PROXY_THRESHOLD_STOP
+        if self.candidate_max_secs < self.max_secs_remaining:
+            log.warning(
+                f"[9099] S9099_CANDIDATE_MAX_SECS ({self.candidate_max_secs:.0f}s) is "
+                f"below S9099_MAX_SECS_REMAINING ({self.max_secs_remaining:.0f}s) — "
+                f"raising it, or entries above {self.candidate_max_secs:.0f}s could "
+                f"never happen"
+            )
+            self.candidate_max_secs = self.max_secs_remaining
 
         # ── State ────────────────────────────────────────────────────────
         self.positions: dict[str, Position] = {}          # market_id -> Position
@@ -2377,6 +2385,7 @@ class Strategy9099:
             "stop_price": self.stop_price,
             "max_secs_remaining": self.max_secs_remaining,
             "min_secs_remaining": self.min_secs_remaining,
+            "candidate_max_secs": self.candidate_max_secs,
             "max_spread": self.max_spread,
             "min_liquidity": self.min_liquidity,
             "min_tp_depth": self.min_tp_depth,
@@ -2397,7 +2406,8 @@ class Strategy9099:
 
     _NUMERIC_PARAMS = {
         "entry_price_min", "entry_price_max", "tp_price", "stop_price",
-        "max_secs_remaining", "min_secs_remaining", "max_spread",
+        "max_secs_remaining", "min_secs_remaining", "candidate_max_secs",
+        "max_spread",
         "min_liquidity", "min_tp_depth", "min_margin_pct", "fixed_dollars",
         "max_position_percent", "max_position_dollars", "exit_before_expiry",
         "max_daily_loss", "min_balance", "entry_timeout", "partial_fill_grace",
@@ -2431,6 +2441,14 @@ class Strategy9099:
         self.tp_price = max(self.tp_price, self.entry_price_min + 0.01)
         self.stop_price = min(self.stop_price, self.entry_price_min - 0.01)
         self.min_secs_remaining = min(self.min_secs_remaining, self.max_secs_remaining)
+        # A crossing that never becomes a candidate can never be traded, so
+        # the tracking window has to cover the entry window.
+        if self.candidate_max_secs < self.max_secs_remaining:
+            self.candidate_max_secs = self.max_secs_remaining
+            self._log(
+                f"tracking window raised to {self.candidate_max_secs:.0f}s to cover "
+                f"the {self.max_secs_remaining:.0f}s entry window"
+            )
         if applied:
             self._log(f"params updated: {applied}")
         return applied

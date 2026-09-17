@@ -95,6 +95,35 @@ def test_time_to_expiry_window(engine):
 #  3. Liquidity / market-quality requirements
 # ══════════════════════════════════════════════════════════════════════
 
+def test_tracking_window_cannot_be_smaller_than_the_entry_window(engine):
+    """
+    A crossing that never becomes a candidate can never be traded, so a
+    tracking window below the entry window would silently cap entries.
+    """
+    engine.candidate_max_secs = 120
+    engine.set_params({"max_secs_remaining": 150})
+    assert engine.max_secs_remaining == 150
+    assert engine.candidate_max_secs >= 150, "tracking must cover the entry window"
+
+    # Raising tracking alone is fine — observing wider than we trade is the point.
+    engine.set_params({"candidate_max_secs": 300})
+    assert engine.candidate_max_secs == 300
+    assert engine.max_secs_remaining == 150
+
+
+def test_entries_are_possible_across_the_whole_window(engine, feed):
+    """A 150s entry window really does take a crossing at 140s."""
+    engine.set_params({"max_secs_remaining": 150, "min_secs_remaining": 10})
+    market = market_ending_in(140)
+    prime(feed, market)
+    engine.on_tick([market])
+
+    assert market.market_id in engine.positions, \
+        "a crossing at 140s must be tradeable with a 150s window"
+    pos = engine.positions[market.market_id]
+    assert 130 < pos.signal_secs <= 150
+
+
 def test_liquidity_and_quality_filters(engine):
     base = dict(price=0.90, secs_remaining=30,
                 signed_distance=50.0, underlying_price=100_000.0)
@@ -1148,7 +1177,8 @@ def test_trade_row_has_the_full_lifecycle(engine, feed, logs):
 
 
 def test_rejected_candidates_are_recorded_with_a_reason(engine, feed, logs):
-    market = market_ending_in(100)     # outside the 60s entry window
+    engine.max_secs_remaining = 60     # explicit: this test is about rejections
+    market = market_ending_in(100)     # outside that entry window
     prime(feed, market)
 
     engine.on_tick([market])
@@ -1184,7 +1214,8 @@ def test_rejected_candidates_are_recorded_with_a_reason(engine, feed, logs):
 
 def test_candidate_tracks_what_happened_after_the_trigger(engine, feed, logs):
     """The whole point: what a 90c contract did next, whether we traded it or not."""
-    market = market_ending_in(100)     # deliberately not tradeable
+    engine.max_secs_remaining = 60     # keep this one purely observational
+    market = market_ending_in(100)     # deliberately outside the entry window
     prime(feed, market)
     engine.on_tick([market])
     cand = engine.candidates[(market.market_id, "Up", 0.90)]
@@ -1219,6 +1250,7 @@ def test_every_observed_threshold_gets_its_own_record(engine, feed, logs):
     85 / 88 / 90 / 92 / 95 are measured independently, each from its own
     moment, so the data can say which entry level is actually best.
     """
+    engine.auto_trade = False          # observation only
     market = market_ending_in(100)
     feed.set(market.token_id_down, ask=0.11, ask_size=500, bid=0.10, bid_size=500)
 

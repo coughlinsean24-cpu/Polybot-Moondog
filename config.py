@@ -233,7 +233,7 @@ S9099_TAKE_PROFIT_PRICE = float(os.getenv("S9099_TAKE_PROFIT_PRICE", "0.99"))
 # ── Time-to-expiry filter ─────────────────────────────────────────────────
 # Enter only inside [MIN, MAX] seconds remaining.  MIN keeps us from buying
 # with too little time for the 99c sell to be hit.
-S9099_MAX_SECS_REMAINING = float(os.getenv("S9099_MAX_SECS_REMAINING", "60"))
+S9099_MAX_SECS_REMAINING = float(os.getenv("S9099_MAX_SECS_REMAINING", "150"))
 S9099_MIN_SECS_REMAINING = float(os.getenv("S9099_MIN_SECS_REMAINING", "10"))
 
 # ── Confirmation / market-quality filters ─────────────────────────────────
@@ -367,8 +367,13 @@ S9099_OBSERVE_THRESHOLDS = [
 S9099_TRACK_CANDIDATES = os.getenv("S9099_TRACK_CANDIDATES", "true").lower() == "true"
 # Start tracking a candidate as soon as it crosses the threshold with this
 # many seconds left, even when that is outside the (narrower) entry window —
-# that is what makes the 90s/60s/45s/30s/20s/15s/10s buckets comparable.
-S9099_CANDIDATE_MAX_SECS = float(os.getenv("S9099_CANDIDATE_MAX_SECS", "120"))
+# that is what makes the 150s/90s/60s/45s/30s/20s/15s/10s buckets comparable.
+#
+# This MUST be >= S9099_MAX_SECS_REMAINING: a crossing that never became a
+# candidate can never be traded, so a smaller value silently caps the entry
+# window. The engine raises it to match if you set them inconsistently.
+# 300 = the whole 5-minute window.
+S9099_CANDIDATE_MAX_SECS = float(os.getenv("S9099_CANDIDATE_MAX_SECS", "300"))
 # Price levels whose first-touch time we record.
 S9099_TRACK_TARGETS = [
     float(x) for x in os.getenv("S9099_TRACK_TARGETS", "0.95,0.97,0.98,0.99").split(",") if x.strip()
