@@ -1349,6 +1349,52 @@ def test_max_open_positions_is_enforced(engine, feed):
     assert "0xtwo" not in engine.positions
 
 
+def test_prices_must_be_per_share_not_cents(engine):
+    """
+    Typing 87 for 87 cents puts the entry threshold at $87 — unreachable, so
+    the strategy would go silently dead. It is rejected with a reason instead.
+    """
+    before = engine.entry_price_min
+    applied = engine.set_params({"entry_price_min": 87, "entry_price_max": 97,
+                                 "tp_price": 99})
+    assert applied == {}, "none of those are per-share prices"
+    assert engine.entry_price_min == before, "the old value stands"
+    assert len(engine.last_param_errors) == 3
+    assert "between 0 and 1" in engine.last_param_errors[0]
+    assert engine.stats()["param_errors"], "the UI can see what was wrong"
+
+    # The decimal form is accepted.
+    applied = engine.set_params({"entry_price_min": 0.87})
+    assert applied["entry_price_min"] == 0.87
+    assert engine.last_param_errors == []
+
+    # So are the other ends of the range.
+    assert engine.set_params({"stop_price": 0}) == {}
+    assert engine.set_params({"tp_price": 1.0}) == {}
+
+
+def test_changing_the_entry_level_keeps_it_tradeable(engine, feed):
+    """
+    Only crossings recorded AT the entry threshold can be traded. Moving the
+    entry price to a level we were not recording used to kill trading with no
+    error and no rejection reason.
+    """
+    engine.set_params({"entry_price_min": 0.91})
+    assert 0.91 in engine.observe_thresholds, \
+        "the entry level must be one of the levels we record"
+
+    market = market_ending_in(30)
+    prime(feed, market, ask=0.91, ask_size=500, bid=0.90)
+    engine.on_tick([market])
+
+    assert (market.market_id, "Up", 0.91) in engine.candidates
+    assert market.market_id in engine.positions, "a 0.91 entry must actually trade"
+
+    # The standard observation levels are still recorded alongside it.
+    for level in (0.85, 0.88, 0.90):
+        assert level in engine.observe_thresholds
+
+
 def test_set_params_keeps_the_price_ladder_coherent(engine):
     engine.set_params({"entry_price_min": 0.94, "tp_price": 0.90, "stop_price": 0.96})
     assert engine.tp_price > engine.entry_price_min

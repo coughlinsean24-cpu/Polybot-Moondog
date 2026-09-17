@@ -973,6 +973,14 @@ class Strategy9099:
             set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min}
         )
         self.allow_proxy_threshold_stop: bool = config.S9099_ALLOW_PROXY_THRESHOLD_STOP
+        self.last_param_errors: list[str] = []
+        for name in ("entry_price_min", "entry_price_max", "tp_price", "stop_price"):
+            value = getattr(self, name)
+            if not (0.0 < value < 1.0):
+                log.error(
+                    f"[9099] {name}={value} is not a per-share price (must be between "
+                    f"0 and 1). Nothing will trade until this is fixed."
+                )
         if self.candidate_max_secs < self.max_secs_remaining:
             log.warning(
                 f"[9099] S9099_CANDIDATE_MAX_SECS ({self.candidate_max_secs:.0f}s) is "
@@ -2366,6 +2374,7 @@ class Strategy9099:
             "tp_price_reached": self.tp_price_reached_count,
             "emergency_exits": self.emergency_exits,
             "queue_aware": getattr(self.broker, "queue_aware", True),
+            "param_errors": list(self.last_param_errors),
             "reference": {
                 "official_available": self.settlement.official_reading(
                     self.assets[0] if self.assets else "BTC"
@@ -2429,16 +2438,37 @@ class Strategy9099:
     }
     _INT_PARAMS = {"max_open_positions", "max_consecutive_losses", "max_trades_per_day"}
 
+    # Prices are per-share probabilities: strictly between $0 and $1.
+    # Typing "87" for 87 cents puts the entry threshold at $87, which no
+    # contract can ever reach, so the strategy goes silently dead.
+    _PRICE_PARAMS = {"entry_price_min", "entry_price_max", "tp_price", "stop_price"}
+
     def set_params(self, updates: dict) -> dict:
         """
-        Apply dashboard edits. Unknown keys are ignored and the sanity
-        relationships (tp > entry > stop) are enforced, so a fat-fingered box
-        cannot create a strategy that sells below its own stop.
+        Apply dashboard edits.
+
+        Unknown keys are ignored, prices must be a real per-share price, and
+        the sanity relationships (tp > entry > stop) are enforced — a
+        fat-fingered box cannot create a strategy that sells below its own
+        stop, or one that can never trigger at all.
+
+        Rejected values are reported back in `self.last_param_errors` so the
+        UI can say what was wrong instead of quietly doing nothing.
         """
         applied = {}
+        errors = []
         for key, value in (updates or {}).items():
             try:
-                if key in self._NUMERIC_PARAMS:
+                if key in self._PRICE_PARAMS:
+                    price = float(value)
+                    if not (0.0 < price < 1.0):
+                        errors.append(
+                            f"{key}={value} is not a per-share price — it must be "
+                            f"between 0 and 1 (90 cents is 0.90, not 90)"
+                        )
+                        continue
+                    setattr(self, key, price)
+                elif key in self._NUMERIC_PARAMS:
                     setattr(self, key, float(value))
                 elif key in self._INT_PARAMS:
                     setattr(self, key, int(value))
@@ -2450,7 +2480,13 @@ class Strategy9099:
                     continue
                 applied[key] = getattr(self, key)
             except (TypeError, ValueError):
+                errors.append(f"{key}={value!r} is not a number")
                 continue
+
+        self.last_param_errors = errors
+        for problem in errors:
+            self._log(f"rejected parameter: {problem}", "error")
+
         # Keep the ladder coherent.
         self.entry_price_max = max(self.entry_price_max, self.entry_price_min)
         self.tp_price = max(self.tp_price, self.entry_price_min + 0.01)
@@ -2464,9 +2500,28 @@ class Strategy9099:
                 f"tracking window raised to {self.candidate_max_secs:.0f}s to cover "
                 f"the {self.max_secs_remaining:.0f}s entry window"
             )
+
+        # Only the crossing recorded AT the entry threshold is tradeable, and
+        # crossings are only recorded at levels in observe_thresholds. Moving
+        # the entry price without adding it to that set would leave nothing to
+        # trade, with no error and no rejection reason to explain it.
+        self._sync_observe_thresholds()
+
         if applied:
             self._log(f"params updated: {applied}")
         return applied
+
+    def _sync_observe_thresholds(self):
+        """Make sure the entry threshold is one of the levels we record."""
+        wanted = sorted(set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min})
+        if wanted != self.observe_thresholds:
+            added = [lv for lv in wanted if lv not in self.observe_thresholds]
+            self.observe_thresholds = wanted
+            if added:
+                self._log(
+                    f"now recording crossings at {', '.join(f'${x:.2f}' for x in added)} "
+                    f"(entry level must be observed to be tradeable)"
+                )
 
     # ══════════════════════════════════════════════════════════════════
     #  Restart recovery

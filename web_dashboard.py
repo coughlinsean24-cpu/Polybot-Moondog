@@ -5883,14 +5883,17 @@ DASHBOARD_HTML = r"""
 <!-- ── Parameters ── -->
 <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters</span>
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters
+      <span style="font-weight:400;color:var(--dim);font-size:11px;">— prices are per share: 90&cent; is <b>0.90</b>, not 90</span>
+    </span>
     <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
   </div>
+  <div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
-    <label>Entry min $<input type="number" id="s9099-entry-min" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
-    <label>Entry max $<input type="number" id="s9099-entry-max" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
-    <label>Take profit $<input type="number" id="s9099-tp" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
-    <label>Stop price $<input type="number" id="s9099-stop" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
+    <label>Entry min $<input type="number" id="s9099-entry-min" placeholder="0.90" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Entry max $<input type="number" id="s9099-entry-max" placeholder="0.97" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Take profit $<input type="number" id="s9099-tp" placeholder="0.99" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
+    <label>Stop price $<input type="number" id="s9099-stop" placeholder="0.80" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
     <label>Max secs left<input type="number" id="s9099-max-secs" step="5" min="1" max="300" class="s9099-in"></label>
     <label>Min secs left<input type="number" id="s9099-min-secs" step="1" min="0" max="300" class="s9099-in"></label>
     <label title="Start recording a crossing this early, even outside the entry window. Cannot be lower than Max secs left.">Track from (s)<input type="number" id="s9099-track-secs" step="10" min="1" max="300" class="s9099-in"></label>
@@ -7968,6 +7971,18 @@ function s9099UpdateUI(st, markets) {
   s9099Set('s9099-max-loss', p.max_daily_loss);
   const sm = document.getElementById('s9099-size-mode');
   if (sm && !s9099Editing) sm.value = p.size_mode;
+
+  const errBox = document.getElementById('s9099-param-errors');
+  if (errBox) {
+    const errs = st.param_errors || [];
+    if (errs.length) {
+      errBox.style.display = 'block';
+      errBox.innerHTML = '<b>Not applied:</b><br>' + errs.join('<br>');
+    } else {
+      errBox.style.display = 'none';
+      errBox.innerHTML = '';
+    }
+  }
 
   const rej = document.getElementById('s9099-rejections');
   if (rej) {
