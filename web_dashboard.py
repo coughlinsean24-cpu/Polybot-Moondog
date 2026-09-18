@@ -5889,6 +5889,7 @@ DASHBOARD_HTML = r"""
     <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
   </div>
   <div id="s9099-not-trading" style="display:none;background:#2d1a00;border:1px solid var(--yellow);color:var(--yellow);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;"></div>
+<div id="s9099-size-preview" style="margin-top:10px;font-size:11px;color:var(--dim);"></div>
 <div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
     <label>Entry min $<input type="number" id="s9099-entry-min" placeholder="0.90" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
@@ -5913,6 +5914,7 @@ DASHBOARD_HTML = r"""
     <label>Exit before expiry (s)<input type="number" id="s9099-exit-before" step="1" min="0" max="60" class="s9099-in"></label>
     <label>Max open<input type="number" id="s9099-max-open" step="1" min="1" max="10" class="s9099-in"></label>
     <label>Max daily loss $<input type="number" id="s9099-max-loss" step="5" min="0" class="s9099-in"></label>
+    <label title="Which assets to trade. Comma separated, e.g. BTC. Blank means all.">Assets<input type="text" id="s9099-assets" placeholder="BTC" class="s9099-in"></label>
   </div>
 </div>
 
@@ -7880,6 +7882,7 @@ function s9099SaveParams() {
     min_liquidity: s9099Num('s9099-min-liq'),
     min_margin_pct: s9099Num('s9099-margin'),
     size_mode: document.getElementById('s9099-size-mode').value,
+    assets: document.getElementById('s9099-assets').value,
     fixed_dollars: s9099Num('s9099-fixed'),
     max_position_percent: s9099Num('s9099-pct'),
     max_position_dollars: s9099Num('s9099-maxpos'),
@@ -7973,6 +7976,18 @@ function s9099UpdateUI(st, markets) {
   s9099Set('s9099-max-loss', p.max_daily_loss);
   const sm = document.getElementById('s9099-size-mode');
   if (sm && !s9099Editing) sm.value = p.size_mode;
+  const assetsBox = document.getElementById('s9099-assets');
+  if (assetsBox && !s9099Editing) assetsBox.value = (p.assets || []).join(',');
+
+  // What the next entry would actually buy, and which cap decided it.
+  const sp = document.getElementById('s9099-size-preview');
+  if (sp && st.size_preview) {
+    const z = st.size_preview;
+    sp.innerHTML = '<b>Next entry at $' + z.price.toFixed(2) + ':</b> '
+      + z.shares + ' shares &asymp; $' + z.cost.toFixed(2)
+      + ' (+$' + z.est_fee.toFixed(2) + ' fee) &mdash; limited by <b>'
+      + z.binding_cap + '</b>. ' + z.note;
+  }
 
   const errBox = document.getElementById('s9099-param-errors');
   if (errBox) {

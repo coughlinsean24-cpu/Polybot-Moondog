@@ -1447,6 +1447,55 @@ def test_changing_the_entry_level_keeps_it_tradeable(engine, feed):
         assert level in engine.observe_thresholds
 
 
+def test_assets_can_be_narrowed_to_one_market(engine, feed):
+    """Focusing on BTC alone should be a parameter, not a restart."""
+    applied = engine.set_params({"assets": "BTC"})
+    assert applied["assets"] == ["BTC"]
+
+    btc = market_ending_in(30, "0xbtc")
+    btc.asset = "BTC"
+    eth = market_ending_in(30, "0xeth")
+    eth.asset = "ETH"
+    prime(feed, btc)
+    prime(feed, eth)
+
+    engine.on_tick([btc, eth])
+    assert "0xbtc" in engine.positions
+    assert "0xeth" not in engine.positions
+    assert not any(key[0] == "0xeth" for key in engine.candidates), \
+        "a filtered-out asset is not even recorded"
+
+    # Case and spacing are forgiving; nonsense is refused with a reason.
+    assert engine.set_params({"assets": " btc , eth "})["assets"] == ["BTC", "ETH"]
+    assert engine.set_params({"assets": "DOGE"}) == {}
+    assert "unknown asset" in engine.last_param_errors[0]
+
+
+def test_size_preview_names_the_binding_cap(engine):
+    """Three caps can bind; when the smallest is not the one you changed,
+    the size does not move and it looks broken."""
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 100        # the real limit
+    preview = engine.explain_size(price=0.90)
+    assert "max $100.00/position" in preview["binding_cap"]
+    assert preview["shares"] == engine.calculate_position_size(
+        engine.available_balance(), 0.90)
+
+    # Lift the per-position cap and the bankroll percentage takes over.
+    engine.max_position_dollars = 1000
+    preview = engine.explain_size(price=0.90)
+    assert "100% of" in preview["binding_cap"]
+    assert preview["cost"] > 400, "the full bankroll is now usable"
+
+    # Too small to trade says so rather than reporting a silent zero.
+    engine.size_mode = "fixed_dollars"
+    engine.fixed_dollars = 1.0
+    preview = engine.explain_size(price=0.90)
+    assert preview["shares"] == 0
+    assert "no trade" in preview["note"]
+
+
 def test_set_params_keeps_the_price_ladder_coherent(engine):
     engine.set_params({"entry_price_min": 0.94, "tp_price": 0.90, "stop_price": 0.96})
     assert engine.tp_price > engine.entry_price_min

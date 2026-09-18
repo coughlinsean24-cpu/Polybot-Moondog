@@ -59,6 +59,9 @@ STATE_FILE = os.path.join(
 
 WINDOW_SECONDS = 300  # 5-minute markets
 
+# The 5-minute Up/Down universe (mirrors polymarket_client.MARKET_ASSETS).
+KNOWN_ASSETS = {"BTC", "ETH", "SOL", "XRP"}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Phases
@@ -1241,6 +1244,47 @@ class Strategy9099:
     # ══════════════════════════════════════════════════════════════════
     #  Position sizing
     # ══════════════════════════════════════════════════════════════════
+
+    def explain_size(self, price: float | None = None) -> dict:
+        """
+        What the next entry would actually buy, and which limit decided it.
+
+        Three separate caps can bind — the sizing mode, the hard per-position
+        dollar cap, and the balance itself — and when the smallest one is not
+        the one you were adjusting, the size does not move and it looks
+        broken. This names the one that is actually binding.
+        """
+        price = price or self.entry_price_min
+        balance = self.available_balance()
+        if self.size_mode == "percent_bankroll":
+            by_mode = balance * (self.max_position_percent / 100.0)
+            mode_label = f"{self.max_position_percent:.0f}% of ${balance:.2f}"
+        else:
+            by_mode = self.fixed_dollars
+            mode_label = f"fixed ${self.fixed_dollars:.2f}/trade"
+
+        caps = {
+            mode_label: by_mode,
+            f"max ${self.max_position_dollars:.2f}/position": self.max_position_dollars,
+            f"balance ${balance:.2f}": balance,
+        }
+        binding = min(caps, key=caps.get)
+        budget = caps[binding]
+        shares = self.calculate_position_size(balance, price)
+        fee = fees.estimate_fee(shares, price, True, fees.default_schedule())
+        return {
+            "price": round(price, 4),
+            "budget": round(budget, 2),
+            "binding_cap": binding,
+            "shares": shares,
+            "cost": round(shares * price, 2),
+            "est_fee": round(fee, 4),
+            "note": (
+                f"below the {self.min_shares}-share minimum — no trade"
+                if shares == 0 else
+                "depth at the ask can still cut this down on the day"
+            ),
+        }
 
     def calculate_position_size(self, balance: float, price: float,
                                 ask_depth: float | None = None,
@@ -2459,6 +2503,7 @@ class Strategy9099:
             "not_trading_because": self._not_trading_because(),
             "api_errors": self.api_errors,
             "params": self.params(),
+            "size_preview": self.explain_size(),
         }
 
     def params(self) -> dict:
@@ -2476,6 +2521,7 @@ class Strategy9099:
             "min_tp_depth": self.min_tp_depth,
             "min_margin_pct": self.min_margin_pct,
             "size_mode": self.size_mode,
+            "assets": list(self.assets),
             "fixed_dollars": self.fixed_dollars,
             "max_position_percent": self.max_position_percent,
             "max_position_dollars": self.max_position_dollars,
@@ -2535,6 +2581,24 @@ class Strategy9099:
                     setattr(self, key, int(value))
                 elif key == "size_mode" and value in ("fixed_dollars", "percent_bankroll"):
                     self.size_mode = value
+                elif key == "assets":
+                    # "BTC" or "BTC,ETH" or ["BTC"]. Empty means every asset,
+                    # which is the config default — not "none".
+                    if isinstance(value, str):
+                        wanted = [a.strip().upper() for a in value.split(",") if a.strip()]
+                    elif isinstance(value, (list, tuple)):
+                        wanted = [str(a).strip().upper() for a in value if str(a).strip()]
+                    else:
+                        errors.append(f"assets={value!r} is not a list or comma-separated string")
+                        continue
+                    unknown = [a for a in wanted if a not in KNOWN_ASSETS]
+                    if unknown:
+                        errors.append(
+                            f"unknown asset(s) {', '.join(unknown)} — "
+                            f"choose from {', '.join(sorted(KNOWN_ASSETS))}"
+                        )
+                        continue
+                    self.assets = wanted
                 elif key in ("enabled", "auto_trade", "kill_switch"):
                     setattr(self, key, bool(value))
                 else:
