@@ -860,6 +860,45 @@ class Position:
         known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 
+    def closed_dict(self) -> dict:
+        """One finished trade, as the dashboard shows it.
+
+        `tp_evidence` is the interesting column: it says WHY we believe the
+        take-profit filled — the queue was eaten, the level cleared, we
+        crossed on the way in, or something printed above us.
+        """
+        exit_price = (self.tp_fill_price or self.exit_price
+                      or (self.settled_value if self.market_result else 0.0))
+        return {
+            "trade_id": self.trade_id,
+            "closed_at": _iso(self.closed_at),
+            "closed_hhmm": (
+                datetime.fromtimestamp(self.closed_at, timezone.utc).strftime("%H:%M:%S")
+                if self.closed_at else ""
+            ),
+            "asset": self.asset,
+            "side": self.side,
+            "shares": round(self.entry_filled_qty, 1),
+            "entry_price": round(self.entry_fill_price, 4),
+            "exit_price": round(exit_price, 4),
+            "tp_price": round(self.tp_price, 4),
+            "tp_filled": round(self.tp_filled_qty, 1),
+            "tp_queue_ahead": round(self.tp_queue_ahead, 0),
+            "tp_price_reached": self.tp_price_reached,
+            "tp_evidence": self.tp_fill_evidence or "",
+            "exit_reason": self.exit_reason,
+            "fees": round(self.fees_total, 4),
+            "gross_pnl": round(self.gross_pnl, 2),
+            "pnl": round(self.realized_pnl, 2),
+            "pnl_pct": round(self.realized_pnl_pct, 2),
+            "hold_secs": (
+                round(self.closed_at - self.entry_fill_epoch, 1)
+                if self.entry_fill_epoch and self.closed_at else 0
+            ),
+            "market_result": self.market_result or "",
+            "mode": self.mode,
+        }
+
     def dashboard_dict(self) -> dict:
         return {
             "trade_id": self.trade_id,
@@ -2525,6 +2564,10 @@ class Strategy9099:
             "available_balance": round(balance, 2),
             "open_positions": len(open_positions),
             "positions": [p.dashboard_dict() for p in open_positions],
+            # Newest first. Entries that never filled are included — an
+            # unfilled entry is a result too, and its absence was confusing.
+            "closed_trades": [p.closed_dict() for p in reversed(self.closed[-50:])],
+            "closed_count": len(self.closed),
             "realized_pnl": round(self.realized_pnl, 2),
             "unrealized_pnl": self.unrealized_pnl(),
             "wins": self.wins,

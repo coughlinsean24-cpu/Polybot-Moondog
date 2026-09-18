@@ -5931,6 +5931,22 @@ DASHBOARD_HTML = r"""
   </table>
 </div>
 
+<!-- ── Closed trades ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Closed Trades</span>
+    <span id="s9099-closed-summary" style="font-size:11px;color:var(--dim);"></span>
+  </div>
+  <table class="data-table" style="width:100%;font-size:11px;">
+    <thead><tr>
+      <th>Time</th><th>Asset</th><th>Side</th><th>Shares</th><th>Entry</th>
+      <th>Exit</th><th>Why</th><th>TP evidence</th><th>Queue</th>
+      <th>Hold</th><th>Fees</th><th>P&amp;L</th>
+    </tr></thead>
+    <tbody id="s9099-closed-body"></tbody>
+  </table>
+</div>
+
 <!-- ── Live candidates in the watch list ── -->
 <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
@@ -8057,6 +8073,49 @@ function s9099UpdateUI(st, markets) {
         '<td style="padding:4px 6px;">$' + q.fees.toFixed(2) + '</td>' +
         '<td style="padding:4px 6px;">' + q.age + 's</td></tr>'
       ).join('');
+    }
+  }
+
+  // ── Closed trades ──
+  const cbody = document.getElementById('s9099-closed-body');
+  if (cbody) {
+    const trades = st.closed_trades || [];
+    if (!trades.length) {
+      cbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:14px;">No closed trades yet</td></tr>';
+    } else {
+      cbody.innerHTML = trades.map(t => {
+        const win = t.pnl > 0, flat = t.pnl === 0;
+        const col = flat ? 'var(--dim)' : (win ? 'var(--green)' : 'var(--red)');
+        // An entry that never filled is a result, not a loss — show it greyed.
+        const unfilled = t.shares === 0;
+        const reasonCol = t.exit_reason === 'tp_filled' ? 'var(--green)'
+                        : (unfilled ? 'var(--dim)' : 'var(--yellow)');
+        return '<tr style="border-bottom:1px solid var(--border);">' +
+          '<td style="padding:4px 6px;">' + t.closed_hhmm + '</td>' +
+          '<td style="padding:4px 6px;">' + t.asset + '</td>' +
+          '<td style="padding:4px 6px;">' + t.side + '</td>' +
+          '<td style="padding:4px 6px;">' + (unfilled ? '--' : t.shares) + '</td>' +
+          '<td style="padding:4px 6px;">' + (unfilled ? '--' : '$' + t.entry_price.toFixed(3)) + '</td>' +
+          '<td style="padding:4px 6px;">' + (t.exit_price ? '$' + t.exit_price.toFixed(3) : '--') + '</td>' +
+          '<td style="padding:4px 6px;color:' + reasonCol + ';">' + t.exit_reason + '</td>' +
+          '<td style="padding:4px 6px;color:var(--dim);">' + (t.tp_evidence || '--') + '</td>' +
+          '<td style="padding:4px 6px;color:var(--dim);" title="Shares offered at the take-profit ahead of ours">' +
+            (t.tp_queue_ahead ? Math.round(t.tp_queue_ahead) : '--') + '</td>' +
+          '<td style="padding:4px 6px;">' + (t.hold_secs ? t.hold_secs + 's' : '--') + '</td>' +
+          '<td style="padding:4px 6px;">$' + t.fees.toFixed(2) + '</td>' +
+          '<td style="padding:4px 6px;color:' + col + ';font-weight:600;">' +
+            (unfilled ? '--' : (t.pnl >= 0 ? '+' : '') + '$' + t.pnl.toFixed(2) +
+             ' (' + t.pnl_pct.toFixed(1) + '%)') + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    const cs = document.getElementById('s9099-closed-summary');
+    if (cs) {
+      const filled = trades.filter(t => t.shares > 0);
+      const tpFills = filled.filter(t => t.exit_reason === 'tp_filled').length;
+      cs.textContent = (st.closed_count || 0) + ' total'
+        + (trades.length < (st.closed_count || 0) ? ' (showing last ' + trades.length + ')' : '')
+        + ' | ' + tpFills + ' of ' + filled.length + ' filled entries hit the take-profit';
     }
   }
 

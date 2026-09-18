@@ -1456,6 +1456,63 @@ def test_live_mode_never_refills_itself(engine, monkeypatch):
     assert not ok and "below_min_balance" in reason
 
 
+def test_closed_trades_are_reported_for_the_dashboard(engine, feed):
+    """A finished trade has to be visible somewhere, win or lose."""
+    assert engine.stats()["closed_trades"] == []
+
+    # A take-profit that fills.
+    m1 = market_ending_in(60, "0xwin")
+    prime(feed, m1)
+    engine.on_tick([m1])
+    engine.on_tick([m1])
+    won = engine.positions["0xwin"]
+    feed.set(m1.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=won.tp_qty)
+    engine.on_tick([m1])
+
+    # A stop-out.
+    m2 = market_ending_in(60, "0xloss")
+    prime(feed, m2)
+    engine.on_tick([m2])
+    engine.on_tick([m2])
+    feed.set(m2.token_id_up, ask=0.81, ask_size=500, bid=0.78, bid_size=500)
+    engine.on_tick([m2])
+    engine.on_tick([m2])
+
+    trades = engine.stats()["closed_trades"]
+    assert len(trades) == 2
+    assert engine.stats()["closed_count"] == 2
+    assert trades[0]["trade_id"] != trades[1]["trade_id"]
+    # Newest first.
+    assert trades[0]["closed_at"] >= trades[1]["closed_at"]
+
+    loss = [t for t in trades if t["pnl"] < 0][0]
+    win = [t for t in trades if t["pnl"] > 0][0]
+    assert win["exit_reason"] == "tp_filled"
+    assert win["tp_evidence"], "the dashboard shows WHY we believe it filled"
+    assert win["exit_price"] == pytest.approx(engine.tp_price)
+    assert "stop_price" in loss["exit_reason"]
+    assert loss["fees"] > 0
+    for field in ("closed_hhmm", "asset", "side", "shares", "entry_price",
+                  "exit_price", "tp_queue_ahead", "hold_secs", "pnl_pct", "mode"):
+        assert field in win, f"closed trade row is missing {field}"
+
+
+def test_an_unfilled_entry_still_appears(engine, feed):
+    """An entry that never filled is a result, and its absence was confusing."""
+    engine.entry_timeout = 0.0
+    market = market_ending_in(60)
+    prime(feed, market)
+    engine.on_tick([market])
+    feed.set(market.token_id_up, ask=0.95, ask_size=500, bid=0.94, bid_size=500)
+    engine.on_tick([market])
+
+    trades = engine.stats()["closed_trades"]
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "entry_never_filled"
+    assert trades[0]["shares"] == 0
+    assert trades[0]["pnl"] == 0
+
+
 def test_max_open_positions_is_enforced(engine, feed):
     engine.max_open_positions = 1
     m1, _ = _open_position(engine, feed, market_id="0xone")
