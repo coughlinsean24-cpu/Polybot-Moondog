@@ -5944,6 +5944,7 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
   <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
   <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
+  <div class="stat-card" title="How many times the paper bankroll was wiped out and refilled. Cumulative P&L is NOT reset."><div class="stat-label">Paper Wipeouts</div><div class="stat-value" id="s9099-resets">0</div></div>
   <div class="stat-card"><div class="stat-label">Crossings (all levels)</div><div class="stat-value" id="s9099-seen">0</div></div>
   <div class="stat-card"><div class="stat-label" id="s9099-entry-label">At Entry Level</div><div class="stat-value" id="s9099-entry-seen">0</div></div>
   <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
@@ -5954,14 +5955,19 @@ DASHBOARD_HTML = r"""
 <!-- ── Parameters ── -->
 <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters</span>
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters
+      <span style="font-weight:400;color:var(--dim);font-size:11px;">— prices are per share: 90&cent; is <b>0.90</b>, not 90</span>
+    </span>
     <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
   </div>
+  <div id="s9099-not-trading" style="display:none;background:#2d1a00;border:1px solid var(--yellow);color:var(--yellow);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;"></div>
+<div id="s9099-size-preview" style="margin-top:10px;font-size:11px;color:var(--dim);"></div>
+<div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
-    <label>Entry min $<input type="number" id="s9099-entry-min" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
-    <label>Entry max $<input type="number" id="s9099-entry-max" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
-    <label>Take profit $<input type="number" id="s9099-tp" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
-    <label>Stop price $<input type="number" id="s9099-stop" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
+    <label>Entry min $<input type="number" id="s9099-entry-min" placeholder="0.90" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Entry max $<input type="number" id="s9099-entry-max" placeholder="0.97" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
+    <label>Take profit $<input type="number" id="s9099-tp" placeholder="0.99" step="0.01" min="0.51" max="0.999" class="s9099-in"></label>
+    <label>Stop price $<input type="number" id="s9099-stop" placeholder="0.80" step="0.01" min="0.01" max="0.98" class="s9099-in"></label>
     <label>Max secs left<input type="number" id="s9099-max-secs" step="5" min="1" max="300" class="s9099-in"></label>
     <label>Min secs left<input type="number" id="s9099-min-secs" step="1" min="0" max="300" class="s9099-in"></label>
     <label title="Start recording a crossing this early, even outside the entry window. Cannot be lower than Max secs left.">Track from (s)<input type="number" id="s9099-track-secs" step="10" min="1" max="300" class="s9099-in"></label>
@@ -5980,6 +5986,7 @@ DASHBOARD_HTML = r"""
     <label>Exit before expiry (s)<input type="number" id="s9099-exit-before" step="1" min="0" max="60" class="s9099-in"></label>
     <label>Max open<input type="number" id="s9099-max-open" step="1" min="1" max="10" class="s9099-in"></label>
     <label>Max daily loss $<input type="number" id="s9099-max-loss" step="5" min="0" class="s9099-in"></label>
+    <label title="Which assets to trade. Comma separated, e.g. BTC. Blank means all.">Assets<input type="text" id="s9099-assets" placeholder="BTC" class="s9099-in"></label>
   </div>
 </div>
 
@@ -5995,12 +6002,29 @@ DASHBOARD_HTML = r"""
   </table>
 </div>
 
+<!-- ── Closed trades ── -->
+<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:12px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-weight:700;color:var(--yellow);font-size:13px;">Closed Trades</span>
+    <span id="s9099-closed-summary" style="font-size:11px;color:var(--dim);"></span>
+  </div>
+  <table class="data-table" style="width:100%;font-size:11px;">
+    <thead><tr>
+      <th>Time</th><th>Asset</th><th>Side</th><th>Shares</th><th>Entry</th>
+      <th>Exit</th><th>Why</th><th>TP evidence</th><th>Queue</th>
+      <th>Hold</th><th>Fees</th><th>P&amp;L</th>
+    </tr></thead>
+    <tbody id="s9099-closed-body"></tbody>
+  </table>
+</div>
+
 <!-- ── Live candidates in the watch list ── -->
 <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <span style="font-weight:700;color:var(--yellow);font-size:13px;">Live Markets &mdash; best side vs entry threshold</span>
     <span id="s9099-rejections" style="font-size:11px;color:var(--dim);"></span>
   </div>
+  <div id="s9099-blocks" style="font-size:11px;color:var(--dim);margin-bottom:8px;"></div>
   <div id="s9099-live-markets" style="max-height:300px;overflow-y:auto;font-size:12px;"></div>
 </div>
 
@@ -8064,6 +8088,7 @@ function s9099SaveParams() {
     min_liquidity: s9099Num('s9099-min-liq'),
     min_margin_pct: s9099Num('s9099-margin'),
     size_mode: document.getElementById('s9099-size-mode').value,
+    assets: document.getElementById('s9099-assets').value,
     fixed_dollars: s9099Num('s9099-fixed'),
     max_position_percent: s9099Num('s9099-pct'),
     max_position_dollars: s9099Num('s9099-maxpos'),
@@ -8127,6 +8152,9 @@ function s9099UpdateUI(st, markets) {
   setTxt('s9099-tpfills', st.tp_fills || 0);
   setTxt('s9099-reached', st.tp_price_reached || 0);
   setTxt('s9099-exits', st.emergency_exits || 0);
+  setTxt('s9099-resets', st.paper_resets || 0);
+  const resetCard = document.getElementById('s9099-resets');
+  if (resetCard) resetCard.style.color = (st.paper_resets || 0) > 0 ? 'var(--red)' : '';
   setTxt('s9099-seen', st.candidates_seen || 0);
   setTxt('s9099-entry-seen', st.entry_level_seen || 0);
   setTxt('s9099-traded', st.candidates_traded || 0);
@@ -8157,11 +8185,60 @@ function s9099UpdateUI(st, markets) {
   s9099Set('s9099-max-loss', p.max_daily_loss);
   const sm = document.getElementById('s9099-size-mode');
   if (sm && !s9099Editing) sm.value = p.size_mode;
+  const assetsBox = document.getElementById('s9099-assets');
+  if (assetsBox && !s9099Editing) assetsBox.value = (p.assets || []).join(',');
+
+  // What the next entry would actually buy, and which cap decided it.
+  const sp = document.getElementById('s9099-size-preview');
+  if (sp && st.size_preview) {
+    const z = st.size_preview;
+    sp.innerHTML = '<b>Next entry at $' + z.price.toFixed(2) + ':</b> '
+      + z.shares + ' shares &asymp; $' + z.cost.toFixed(2)
+      + ' (+$' + z.est_fee.toFixed(2) + ' fee) &mdash; limited by <b>'
+      + z.binding_cap + '</b>. ' + z.note;
+  }
+
+  const errBox = document.getElementById('s9099-param-errors');
+  if (errBox) {
+    const errs = st.param_errors || [];
+    if (errs.length) {
+      errBox.style.display = 'block';
+      errBox.innerHTML = '<b>Not applied:</b><br>' + errs.join('<br>');
+    } else {
+      errBox.style.display = 'none';
+      errBox.innerHTML = '';
+    }
+  }
 
   const rej = document.getElementById('s9099-rejections');
   if (rej) {
     const parts = Object.entries(st.rejection_reasons || {}).map(([k, v]) => k + ' ' + v);
-    rej.textContent = parts.length ? 'rejections: ' + parts.join(' | ') : '';
+    rej.textContent = parts.length ? 'final reason: ' + parts.join(' | ') : '';
+  }
+
+  // Every reason each candidate hit while it was live. The "final reason"
+  // above is nearly always price_below_threshold, because the price leaves
+  // the band before the window shuts — this is the list that explains a zero.
+  const blocks = document.getElementById('s9099-blocks');
+  if (blocks) {
+    const parts = Object.entries(st.block_reasons || {}).map(([k, v]) => k + ' ' + v);
+    blocks.innerHTML = parts.length
+      ? '<b>What blocked entries (all reasons seen, per candidate):</b> ' + parts.join(' &nbsp;|&nbsp; ')
+      : '';
+  }
+
+  // Blanket blockers: nothing can trade while any of these hold, however
+  // good a market looks in the table below.
+  const nt = document.getElementById('s9099-not-trading');
+  if (nt) {
+    const why = st.not_trading_because || [];
+    if (why.length) {
+      nt.style.display = 'block';
+      nt.innerHTML = '<b>&#9888; NOT TRADING &mdash; nothing can qualify while:</b><br>&bull; '
+        + why.join('<br>&bull; ');
+    } else {
+      nt.style.display = 'none';
+    }
   }
 
   // ── Open positions ──
@@ -8185,6 +8262,49 @@ function s9099UpdateUI(st, markets) {
         '<td style="padding:4px 6px;">$' + q.fees.toFixed(2) + '</td>' +
         '<td style="padding:4px 6px;">' + q.age + 's</td></tr>'
       ).join('');
+    }
+  }
+
+  // ── Closed trades ──
+  const cbody = document.getElementById('s9099-closed-body');
+  if (cbody) {
+    const trades = st.closed_trades || [];
+    if (!trades.length) {
+      cbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--dim);padding:14px;">No closed trades yet</td></tr>';
+    } else {
+      cbody.innerHTML = trades.map(t => {
+        const win = t.pnl > 0, flat = t.pnl === 0;
+        const col = flat ? 'var(--dim)' : (win ? 'var(--green)' : 'var(--red)');
+        // An entry that never filled is a result, not a loss — show it greyed.
+        const unfilled = t.shares === 0;
+        const reasonCol = t.exit_reason === 'tp_filled' ? 'var(--green)'
+                        : (unfilled ? 'var(--dim)' : 'var(--yellow)');
+        return '<tr style="border-bottom:1px solid var(--border);">' +
+          '<td style="padding:4px 6px;">' + t.closed_hhmm + '</td>' +
+          '<td style="padding:4px 6px;">' + t.asset + '</td>' +
+          '<td style="padding:4px 6px;">' + t.side + '</td>' +
+          '<td style="padding:4px 6px;">' + (unfilled ? '--' : t.shares) + '</td>' +
+          '<td style="padding:4px 6px;">' + (unfilled ? '--' : '$' + t.entry_price.toFixed(3)) + '</td>' +
+          '<td style="padding:4px 6px;">' + (t.exit_price ? '$' + t.exit_price.toFixed(3) : '--') + '</td>' +
+          '<td style="padding:4px 6px;color:' + reasonCol + ';">' + t.exit_reason + '</td>' +
+          '<td style="padding:4px 6px;color:var(--dim);">' + (t.tp_evidence || '--') + '</td>' +
+          '<td style="padding:4px 6px;color:var(--dim);" title="Shares offered at the take-profit ahead of ours">' +
+            (t.tp_queue_ahead ? Math.round(t.tp_queue_ahead) : '--') + '</td>' +
+          '<td style="padding:4px 6px;">' + (t.hold_secs ? t.hold_secs + 's' : '--') + '</td>' +
+          '<td style="padding:4px 6px;">$' + t.fees.toFixed(2) + '</td>' +
+          '<td style="padding:4px 6px;color:' + col + ';font-weight:600;">' +
+            (unfilled ? '--' : (t.pnl >= 0 ? '+' : '') + '$' + t.pnl.toFixed(2) +
+             ' (' + t.pnl_pct.toFixed(1) + '%)') + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    const cs = document.getElementById('s9099-closed-summary');
+    if (cs) {
+      const filled = trades.filter(t => t.shares > 0);
+      const tpFills = filled.filter(t => t.exit_reason === 'tp_filled').length;
+      cs.textContent = (st.closed_count || 0) + ' total'
+        + (trades.length < (st.closed_count || 0) ? ' (showing last ' + trades.length + ')' : '')
+        + ' | ' + tpFills + ' of ' + filled.length + ' filled entries hit the take-profit';
     }
   }
 

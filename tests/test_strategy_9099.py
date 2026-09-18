@@ -986,6 +986,7 @@ def test_loss_counters_and_daily_loss(engine, feed):
     assert engine.losses == 1
     assert engine.daily_loss == pytest.approx(-pos.realized_pnl, abs=1e-6)
 
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
     engine.max_daily_loss = 0.01
     ok, reason = engine.check_risk_gates()
     assert not ok and "max_daily_loss" in reason
@@ -1310,6 +1311,59 @@ def test_unresolvable_market_still_writes_its_row(engine, feed, logs, monkeypatc
 #  Safety rails
 # ══════════════════════════════════════════════════════════════════════
 
+def test_all_blocking_reasons_are_recorded_not_just_the_last(engine, feed, logs):
+    """
+    A candidate is re-evaluated every tick and the price usually leaves the
+    band before the window shuts, so the LAST reason is nearly always
+    price_below_threshold — which hid the real blocker.
+    """
+    engine.min_liquidity = 400          # the real blocker
+    market = market_ending_in(100)
+    prime(feed, market, ask=0.90, ask_size=100, bid=0.89)
+
+    engine.on_tick([market])            # in the band, but the book is thin
+    cand = engine.candidates[(market.market_id, "Up", 0.90)]
+    assert "thin_book" in cand.reason_first
+
+    # Price drops out of the band: the decision closes on price, as before.
+    feed.set(market.token_id_up, ask=0.85, ask_size=100, bid=0.84, bid_size=500)
+    engine.on_tick([market])
+
+    row = [r for r in logs["candidate"].rows if r["observe_level"] == 0.90][0]
+    assert "price_below_threshold" in row["reason_rejected"], "last reason, as before"
+    assert "thin_book" in row["reason_first_block"], "...but the real one is kept"
+    assert "thin_book" in row["reasons_all"]
+    assert "thin_book" in engine.stats()["block_reasons"]
+
+
+def test_not_trading_because_names_blanket_blockers(engine):
+    """A market can read QUALIFIES while one of these silently stops everything."""
+    assert engine._not_trading_because() == []
+
+    engine.auto_trade = False
+    assert any("Trade candidates" in r for r in engine._not_trading_because())
+
+    engine.auto_trade = True
+    engine.kill_switch = True
+    assert any("kill switch" in r for r in engine._not_trading_because())
+
+    engine.kill_switch = False
+    engine.entry_price_min = 87.0       # the cents mistake
+    assert any("not a per-share price" in r for r in engine._not_trading_because())
+
+    engine.entry_price_min = 0.90
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
+    engine.min_balance = 10_000
+    assert any("below minimum" in r for r in engine._not_trading_because())
+
+    # A dead underlying feed blocks every entry while a margin is required.
+    engine.min_balance = 0
+    engine.min_margin_pct = 0.02
+    engine.settlement.binance_feed = None
+    assert any("reference price" in r for r in engine._not_trading_because())
+    assert engine.stats()["not_trading_because"]
+
+
 def test_kill_switch_and_gates_block_new_entries(engine, feed):
     engine.kill_switch = True
     market = market_ending_in(30)
@@ -1329,6 +1383,7 @@ def test_kill_switch_and_gates_block_new_entries(engine, feed):
     assert not ok and "api_unhealthy" in reason
 
     engine.api_errors = 0
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
     engine.consecutive_losses = 5
     ok, reason = engine.check_risk_gates()
     assert not ok and "max_consecutive_losses" in reason
@@ -1339,6 +1394,125 @@ def test_kill_switch_and_gates_block_new_entries(engine, feed):
     assert not ok and "below_min_balance" in reason
 
 
+def test_paper_session_recovers_from_a_wipeout(engine, feed):
+    """
+    Paper is for collecting data. A drained bankroll or a tripped loss brake
+    used to end the session silently — and the consecutive-loss brake is a
+    genuine dead end, since it only clears on a win that can no longer happen.
+    """
+    engine.broker.balance = 1.0          # wiped out
+    engine.consecutive_losses = 9
+    engine.daily_loss = 9_999.0
+    engine.realized_pnl = -512.34        # the record so far
+    engine.wins, engine.losses = 3, 12
+    engine._balance_cache = (1.0, 0.0)
+
+    ok, reason = engine.check_risk_gates()
+    assert ok, f"paper should have recovered, got: {reason}"
+    assert engine.paper_resets == 1
+    assert engine.available_balance() == 500.0
+    assert engine.consecutive_losses == 0
+    assert engine.daily_loss == 0.0
+
+    # The record is kept — the reset count is itself the finding.
+    assert engine.realized_pnl == pytest.approx(-512.34)
+    assert (engine.wins, engine.losses) == (3, 12)
+    assert engine.stats()["paper_resets"] == 1
+
+
+def test_recovery_never_happens_mid_position(engine, feed):
+    """Refilling while a position is working would corrupt its accounting."""
+    market, pos = _open_position(engine, feed)
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+
+    engine.check_risk_gates()
+    assert engine.paper_resets == 0, "not while shares are still held"
+
+    # Once it closes, the next check recovers.
+    feed.set(market.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=pos.tp_qty)
+    engine.on_tick([market])
+    assert pos.phase == Phase.CLOSED
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+    engine.check_risk_gates()
+    assert engine.paper_resets == 1
+
+
+def test_live_mode_never_refills_itself(engine, monkeypatch):
+    """There is no topping up a real account."""
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+    monkeypatch.setattr(type(engine.broker), "name", "LIVE")
+    assert engine.is_live is True
+    assert engine._paper_recover() is False
+    assert engine.paper_resets == 0
+
+    # And with the switch off, paper behaves like live.
+    monkeypatch.setattr(type(engine.broker), "name", "PAPER")
+    engine.paper_auto_reset = False
+    assert engine._paper_recover() is False
+    ok, reason = engine.check_risk_gates()
+    assert not ok and "below_min_balance" in reason
+
+
+def test_closed_trades_are_reported_for_the_dashboard(engine, feed):
+    """A finished trade has to be visible somewhere, win or lose."""
+    assert engine.stats()["closed_trades"] == []
+
+    # A take-profit that fills.
+    m1 = market_ending_in(60, "0xwin")
+    prime(feed, m1)
+    engine.on_tick([m1])
+    engine.on_tick([m1])
+    won = engine.positions["0xwin"]
+    feed.set(m1.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=won.tp_qty)
+    engine.on_tick([m1])
+
+    # A stop-out.
+    m2 = market_ending_in(60, "0xloss")
+    prime(feed, m2)
+    engine.on_tick([m2])
+    engine.on_tick([m2])
+    feed.set(m2.token_id_up, ask=0.81, ask_size=500, bid=0.78, bid_size=500)
+    engine.on_tick([m2])
+    engine.on_tick([m2])
+
+    trades = engine.stats()["closed_trades"]
+    assert len(trades) == 2
+    assert engine.stats()["closed_count"] == 2
+    assert trades[0]["trade_id"] != trades[1]["trade_id"]
+    # Newest first.
+    assert trades[0]["closed_at"] >= trades[1]["closed_at"]
+
+    loss = [t for t in trades if t["pnl"] < 0][0]
+    win = [t for t in trades if t["pnl"] > 0][0]
+    assert win["exit_reason"] == "tp_filled"
+    assert win["tp_evidence"], "the dashboard shows WHY we believe it filled"
+    assert win["exit_price"] == pytest.approx(engine.tp_price)
+    assert "stop_price" in loss["exit_reason"]
+    assert loss["fees"] > 0
+    for field in ("closed_hhmm", "asset", "side", "shares", "entry_price",
+                  "exit_price", "tp_queue_ahead", "hold_secs", "pnl_pct", "mode"):
+        assert field in win, f"closed trade row is missing {field}"
+
+
+def test_an_unfilled_entry_still_appears(engine, feed):
+    """An entry that never filled is a result, and its absence was confusing."""
+    engine.entry_timeout = 0.0
+    market = market_ending_in(60)
+    prime(feed, market)
+    engine.on_tick([market])
+    feed.set(market.token_id_up, ask=0.95, ask_size=500, bid=0.94, bid_size=500)
+    engine.on_tick([market])
+
+    trades = engine.stats()["closed_trades"]
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "entry_never_filled"
+    assert trades[0]["shares"] == 0
+    assert trades[0]["pnl"] == 0
+
+
 def test_max_open_positions_is_enforced(engine, feed):
     engine.max_open_positions = 1
     m1, _ = _open_position(engine, feed, market_id="0xone")
@@ -1347,6 +1521,101 @@ def test_max_open_positions_is_enforced(engine, feed):
     prime(feed, m2)
     engine.on_tick([m2])
     assert "0xtwo" not in engine.positions
+
+
+def test_prices_must_be_per_share_not_cents(engine):
+    """
+    Typing 87 for 87 cents puts the entry threshold at $87 — unreachable, so
+    the strategy would go silently dead. It is rejected with a reason instead.
+    """
+    before = engine.entry_price_min
+    applied = engine.set_params({"entry_price_min": 87, "entry_price_max": 97,
+                                 "tp_price": 99})
+    assert applied == {}, "none of those are per-share prices"
+    assert engine.entry_price_min == before, "the old value stands"
+    assert len(engine.last_param_errors) == 3
+    assert "between 0 and 1" in engine.last_param_errors[0]
+    assert engine.stats()["param_errors"], "the UI can see what was wrong"
+
+    # The decimal form is accepted.
+    applied = engine.set_params({"entry_price_min": 0.87})
+    assert applied["entry_price_min"] == 0.87
+    assert engine.last_param_errors == []
+
+    # So are the other ends of the range.
+    assert engine.set_params({"stop_price": 0}) == {}
+    assert engine.set_params({"tp_price": 1.0}) == {}
+
+
+def test_changing_the_entry_level_keeps_it_tradeable(engine, feed):
+    """
+    Only crossings recorded AT the entry threshold can be traded. Moving the
+    entry price to a level we were not recording used to kill trading with no
+    error and no rejection reason.
+    """
+    engine.set_params({"entry_price_min": 0.91})
+    assert 0.91 in engine.observe_thresholds, \
+        "the entry level must be one of the levels we record"
+
+    market = market_ending_in(30)
+    prime(feed, market, ask=0.91, ask_size=500, bid=0.90)
+    engine.on_tick([market])
+
+    assert (market.market_id, "Up", 0.91) in engine.candidates
+    assert market.market_id in engine.positions, "a 0.91 entry must actually trade"
+
+    # The standard observation levels are still recorded alongside it.
+    for level in (0.85, 0.88, 0.90):
+        assert level in engine.observe_thresholds
+
+
+def test_assets_can_be_narrowed_to_one_market(engine, feed):
+    """Focusing on BTC alone should be a parameter, not a restart."""
+    applied = engine.set_params({"assets": "BTC"})
+    assert applied["assets"] == ["BTC"]
+
+    btc = market_ending_in(30, "0xbtc")
+    btc.asset = "BTC"
+    eth = market_ending_in(30, "0xeth")
+    eth.asset = "ETH"
+    prime(feed, btc)
+    prime(feed, eth)
+
+    engine.on_tick([btc, eth])
+    assert "0xbtc" in engine.positions
+    assert "0xeth" not in engine.positions
+    assert not any(key[0] == "0xeth" for key in engine.candidates), \
+        "a filtered-out asset is not even recorded"
+
+    # Case and spacing are forgiving; nonsense is refused with a reason.
+    assert engine.set_params({"assets": " btc , eth "})["assets"] == ["BTC", "ETH"]
+    assert engine.set_params({"assets": "DOGE"}) == {}
+    assert "unknown asset" in engine.last_param_errors[0]
+
+
+def test_size_preview_names_the_binding_cap(engine):
+    """Three caps can bind; when the smallest is not the one you changed,
+    the size does not move and it looks broken."""
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 100        # the real limit
+    preview = engine.explain_size(price=0.90)
+    assert "max $100.00/position" in preview["binding_cap"]
+    assert preview["shares"] == engine.calculate_position_size(
+        engine.available_balance(), 0.90)
+
+    # Lift the per-position cap and the bankroll percentage takes over.
+    engine.max_position_dollars = 1000
+    preview = engine.explain_size(price=0.90)
+    assert "100% of" in preview["binding_cap"]
+    assert preview["cost"] > 400, "the full bankroll is now usable"
+
+    # Too small to trade says so rather than reporting a silent zero.
+    engine.size_mode = "fixed_dollars"
+    engine.fixed_dollars = 1.0
+    preview = engine.explain_size(price=0.90)
+    assert preview["shares"] == 0
+    assert "no trade" in preview["note"]
 
 
 def test_set_params_keeps_the_price_ladder_coherent(engine):

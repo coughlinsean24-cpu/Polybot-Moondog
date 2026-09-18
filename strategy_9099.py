@@ -59,6 +59,9 @@ STATE_FILE = os.path.join(
 
 WINDOW_SECONDS = 300  # 5-minute markets
 
+# The 5-minute Up/Down universe (mirrors polymarket_client.MARKET_ASSETS).
+KNOWN_ASSETS = {"BTC", "ETH", "SOL", "XRP"}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Phases
@@ -540,7 +543,9 @@ class Candidate:
 
     qualified: bool = False
     reason_qualified: str = ""
-    reason_rejected: str = ""
+    reason_rejected: str = ""        # the LAST reason, at settlement
+    reason_first: str = ""           # what blocked it on the very first look
+    reasons_seen: list = field(default_factory=list)   # every distinct reason
     decision_written: bool = False
     traded: bool = False
     trade_id: str = ""
@@ -668,6 +673,8 @@ class Candidate:
             "qualified": self.qualified,
             "reason_qualified": self.reason_qualified,
             "reason_rejected": self.reason_rejected,
+            "reason_first_block": self.reason_first,
+            "reasons_all": "|".join(self.reasons_seen),
             "traded": self.traded,
             "trade_id": self.trade_id,
             "mode": mode,
@@ -853,6 +860,45 @@ class Position:
         known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 
+    def closed_dict(self) -> dict:
+        """One finished trade, as the dashboard shows it.
+
+        `tp_evidence` is the interesting column: it says WHY we believe the
+        take-profit filled — the queue was eaten, the level cleared, we
+        crossed on the way in, or something printed above us.
+        """
+        exit_price = (self.tp_fill_price or self.exit_price
+                      or (self.settled_value if self.market_result else 0.0))
+        return {
+            "trade_id": self.trade_id,
+            "closed_at": _iso(self.closed_at),
+            "closed_hhmm": (
+                datetime.fromtimestamp(self.closed_at, timezone.utc).strftime("%H:%M:%S")
+                if self.closed_at else ""
+            ),
+            "asset": self.asset,
+            "side": self.side,
+            "shares": round(self.entry_filled_qty, 1),
+            "entry_price": round(self.entry_fill_price, 4),
+            "exit_price": round(exit_price, 4),
+            "tp_price": round(self.tp_price, 4),
+            "tp_filled": round(self.tp_filled_qty, 1),
+            "tp_queue_ahead": round(self.tp_queue_ahead, 0),
+            "tp_price_reached": self.tp_price_reached,
+            "tp_evidence": self.tp_fill_evidence or "",
+            "exit_reason": self.exit_reason,
+            "fees": round(self.fees_total, 4),
+            "gross_pnl": round(self.gross_pnl, 2),
+            "pnl": round(self.realized_pnl, 2),
+            "pnl_pct": round(self.realized_pnl_pct, 2),
+            "hold_secs": (
+                round(self.closed_at - self.entry_fill_epoch, 1)
+                if self.entry_fill_epoch and self.closed_at else 0
+            ),
+            "market_result": self.market_result or "",
+            "mode": self.mode,
+        }
+
     def dashboard_dict(self) -> dict:
         return {
             "trade_id": self.trade_id,
@@ -963,6 +1009,7 @@ class Strategy9099:
         self.max_trades_per_day: int = config.S9099_MAX_TRADES_PER_DAY
         self.max_api_errors: int = config.S9099_MAX_API_ERRORS
         self.market_cooldown: float = config.S9099_MARKET_COOLDOWN
+        self.paper_auto_reset: bool = config.S9099_PAPER_AUTO_RESET
         self.candidate_max_secs: float = config.S9099_CANDIDATE_MAX_SECS
         self.track_candidates: bool = config.S9099_TRACK_CANDIDATES
         self.track_targets: list[float] = list(config.S9099_TRACK_TARGETS)
@@ -973,6 +1020,14 @@ class Strategy9099:
             set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min}
         )
         self.allow_proxy_threshold_stop: bool = config.S9099_ALLOW_PROXY_THRESHOLD_STOP
+        self.last_param_errors: list[str] = []
+        for name in ("entry_price_min", "entry_price_max", "tp_price", "stop_price"):
+            value = getattr(self, name)
+            if not (0.0 < value < 1.0):
+                log.error(
+                    f"[9099] {name}={value} is not a per-share price (must be between "
+                    f"0 and 1). Nothing will trade until this is fixed."
+                )
         if self.candidate_max_secs < self.max_secs_remaining:
             log.warning(
                 f"[9099] S9099_CANDIDATE_MAX_SECS ({self.candidate_max_secs:.0f}s) is "
@@ -1003,7 +1058,10 @@ class Strategy9099:
         self.candidates_traded = 0
         self.candidates_rejected = 0      # entry-level only
         self.candidates_observed = 0      # other levels — never up for a trade
-        self.rejection_reasons: dict[str, int] = {}
+        self.rejection_reasons: dict[str, int] = {}   # final reason at settlement
+        # Every distinct reason each candidate hit while it was live. This is
+        # the one that answers "why is nothing trading".
+        self.block_reasons: dict[str, int] = {}
         self.trades_today = 0
         self.wins = 0
         self.losses = 0
@@ -1015,6 +1073,7 @@ class Strategy9099:
         self.daily_loss = 0.0
         self.consecutive_losses = 0
         self.api_errors = 0
+        self.paper_resets = 0        # how many times a paper bankroll was wiped out
         self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         self._balance_cache = (0.0, 0.0)  # (value, fetched_at)
@@ -1155,9 +1214,105 @@ class Strategy9099:
                 )
         return True, "all_checks_passed"
 
+    def _not_trading_because(self) -> list[str]:
+        """
+        Blanket blockers — conditions under which NO market can ever qualify,
+        however good it looks. Surfaced separately from per-market rejections
+        because a market reading QUALIFIES while one of these is set is the
+        single most confusing state this thing can be in.
+        """
+        blockers = []
+        if not self.enabled:
+            blockers.append("'Watch & record' is off")
+        if not self.auto_trade:
+            blockers.append("'Trade candidates' is off")
+        if self.kill_switch:
+            blockers.append("kill switch is on")
+        for name in ("entry_price_min", "entry_price_max", "tp_price", "stop_price"):
+            value = getattr(self, name)
+            if not (0.0 < value < 1.0):
+                blockers.append(f"{name}={value} is not a per-share price")
+        if self.api_errors >= self.max_api_errors:
+            blockers.append(f"{self.api_errors} consecutive API errors")
+        if self.max_trades_per_day and self.trades_today >= self.max_trades_per_day:
+            blockers.append(f"daily trade cap reached ({self.trades_today})")
+        # In paper these three self-heal on the next evaluation, so they are
+        # not reported as blockers — they would clear before you finished
+        # reading them.
+        recoverable = self.paper_auto_reset and not self.is_live
+        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss and not recoverable:
+            blockers.append(f"daily loss cap reached (${self.daily_loss:.2f})")
+        if (self.max_consecutive_losses
+                and self.consecutive_losses >= self.max_consecutive_losses
+                and not recoverable):
+            blockers.append(f"{self.consecutive_losses} consecutive losses")
+        balance = self.available_balance()
+        if balance < self.min_balance and not recoverable:
+            blockers.append(f"balance ${balance:.2f} below minimum ${self.min_balance:.2f}")
+        if self.min_margin_pct > 0 and self.settlement.binance_price(
+                self.assets[0] if self.assets else "BTC") <= 0:
+            blockers.append(
+                "no reference price (underlying feed is down) while "
+                f"min margin is {self.min_margin_pct}% — every entry will be rejected"
+            )
+        return blockers
+
+    def _paper_recover(self) -> bool:
+        """
+        Put a wiped-out PAPER session back on its feet so it keeps collecting.
+
+        Three brakes can halt trading for good: a drained bankroll, the daily
+        loss cap, and the consecutive-loss cap. The last one is a genuine
+        dead end even in live — it only clears on a winning trade, which can
+        never happen while it is blocking trades.
+
+        In paper that just kills the data. Here the bankroll is topped back
+        up and the brakes released, while the cumulative P&L, the win/loss
+        record and the reset count are all kept: three resets in a day is a
+        damning result, and it should be visible rather than hidden behind a
+        session that quietly stopped.
+
+        Live mode never reaches this — a real account cannot be refilled.
+        """
+        if self.is_live or not self.paper_auto_reset:
+            return False
+        if not isinstance(self.broker, PaperBroker):
+            return False
+        # Never reset out from under a position that is still working.
+        if any(p.phase in ACTIVE_PHASES for p in self.positions.values()):
+            return False
+
+        balance = self.available_balance()
+        # Enough to clear the exchange minimum at the entry price, plus fees.
+        needed = max(self.min_balance, self.min_shares * self.entry_price_min * 1.05)
+        reasons = []
+        if balance < needed:
+            reasons.append(f"bankroll down to ${balance:.2f}")
+        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
+            reasons.append(f"daily loss cap (${self.daily_loss:.2f})")
+        if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
+            reasons.append(f"{self.consecutive_losses} consecutive losses")
+        if not reasons:
+            return False
+
+        self.paper_resets += 1
+        self.broker.balance = self._starting_bankroll
+        self._balance_cache = (self._starting_bankroll, self.clock())
+        self.daily_loss = 0.0
+        self.consecutive_losses = 0
+        self._log(
+            f"PAPER RESET #{self.paper_resets} — {'; '.join(reasons)}. "
+            f"Bankroll back to ${self._starting_bankroll:.2f}. "
+            f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
+            f"({self.wins}W/{self.losses}L).",
+            "warn",
+        )
+        return True
+
     def check_risk_gates(self, market_id: str = "") -> tuple[bool, str]:
         """Account-level guards, independent of any particular market."""
         self._reset_daily()
+        self._paper_recover()
         if not self.enabled:
             return False, "strategy_disabled"
         if self.kill_switch:
@@ -1189,6 +1344,47 @@ class Strategy9099:
     # ══════════════════════════════════════════════════════════════════
     #  Position sizing
     # ══════════════════════════════════════════════════════════════════
+
+    def explain_size(self, price: float | None = None) -> dict:
+        """
+        What the next entry would actually buy, and which limit decided it.
+
+        Three separate caps can bind — the sizing mode, the hard per-position
+        dollar cap, and the balance itself — and when the smallest one is not
+        the one you were adjusting, the size does not move and it looks
+        broken. This names the one that is actually binding.
+        """
+        price = price or self.entry_price_min
+        balance = self.available_balance()
+        if self.size_mode == "percent_bankroll":
+            by_mode = balance * (self.max_position_percent / 100.0)
+            mode_label = f"{self.max_position_percent:.0f}% of ${balance:.2f}"
+        else:
+            by_mode = self.fixed_dollars
+            mode_label = f"fixed ${self.fixed_dollars:.2f}/trade"
+
+        caps = {
+            mode_label: by_mode,
+            f"max ${self.max_position_dollars:.2f}/position": self.max_position_dollars,
+            f"balance ${balance:.2f}": balance,
+        }
+        binding = min(caps, key=caps.get)
+        budget = caps[binding]
+        shares = self.calculate_position_size(balance, price)
+        fee = fees.estimate_fee(shares, price, True, fees.default_schedule())
+        return {
+            "price": round(price, 4),
+            "budget": round(budget, 2),
+            "binding_cap": binding,
+            "shares": shares,
+            "cost": round(shares * price, 2),
+            "est_fee": round(fee, 4),
+            "note": (
+                f"below the {self.min_shares}-share minimum — no trade"
+                if shares == 0 else
+                "depth at the ask can still cut this down on the day"
+            ),
+        }
 
     def calculate_position_size(self, balance: float, price: float,
                                 ask_depth: float | None = None,
@@ -1314,7 +1510,19 @@ class Strategy9099:
         if ok:
             self._enter(market, cand, side, px, secs)
             return
+
+        # A candidate is re-evaluated every tick, and the price almost always
+        # leaves the band before the window shuts — so the LAST reason is
+        # nearly always "price_below_threshold", which hides whatever was
+        # really blocking it while it was in the band. Keep all of them.
         cand.reason_rejected = reason
+        bucket = reason.split("(")[0]
+        if not cand.reason_first:
+            cand.reason_first = reason
+        if bucket not in cand.reasons_seen:
+            cand.reasons_seen.append(bucket)
+            self.block_reasons[bucket] = self.block_reasons.get(bucket, 0) + 1
+
         # Once the entry window has passed, the decision is final.
         if secs < self.min_secs_remaining or px.best_ask < self.entry_price_min:
             self._settle_decision(cand)
@@ -2356,6 +2564,10 @@ class Strategy9099:
             "available_balance": round(balance, 2),
             "open_positions": len(open_positions),
             "positions": [p.dashboard_dict() for p in open_positions],
+            # Newest first. Entries that never filled are included — an
+            # unfilled entry is a result too, and its absence was confusing.
+            "closed_trades": [p.closed_dict() for p in reversed(self.closed[-50:])],
+            "closed_count": len(self.closed),
             "realized_pnl": round(self.realized_pnl, 2),
             "unrealized_pnl": self.unrealized_pnl(),
             "wins": self.wins,
@@ -2366,6 +2578,7 @@ class Strategy9099:
             "tp_price_reached": self.tp_price_reached_count,
             "emergency_exits": self.emergency_exits,
             "queue_aware": getattr(self.broker, "queue_aware", True),
+            "param_errors": list(self.last_param_errors),
             "reference": {
                 "official_available": self.settlement.official_reading(
                     self.assets[0] if self.assets else "BTC"
@@ -2387,8 +2600,16 @@ class Strategy9099:
             "rejection_reasons": dict(sorted(
                 self.rejection_reasons.items(), key=lambda kv: -kv[1]
             )[:8]),
+            "block_reasons": dict(sorted(
+                self.block_reasons.items(), key=lambda kv: -kv[1]
+            )[:10]),
+            # Anything here means no entry can happen, whatever the market does.
+            "not_trading_because": self._not_trading_because(),
             "api_errors": self.api_errors,
+            "paper_resets": self.paper_resets,
+            "paper_auto_reset": self.paper_auto_reset and not self.is_live,
             "params": self.params(),
+            "size_preview": self.explain_size(),
         }
 
     def params(self) -> dict:
@@ -2406,6 +2627,7 @@ class Strategy9099:
             "min_tp_depth": self.min_tp_depth,
             "min_margin_pct": self.min_margin_pct,
             "size_mode": self.size_mode,
+            "assets": list(self.assets),
             "fixed_dollars": self.fixed_dollars,
             "max_position_percent": self.max_position_percent,
             "max_position_dollars": self.max_position_dollars,
@@ -2429,28 +2651,73 @@ class Strategy9099:
     }
     _INT_PARAMS = {"max_open_positions", "max_consecutive_losses", "max_trades_per_day"}
 
+    # Prices are per-share probabilities: strictly between $0 and $1.
+    # Typing "87" for 87 cents puts the entry threshold at $87, which no
+    # contract can ever reach, so the strategy goes silently dead.
+    _PRICE_PARAMS = {"entry_price_min", "entry_price_max", "tp_price", "stop_price"}
+
     def set_params(self, updates: dict) -> dict:
         """
-        Apply dashboard edits. Unknown keys are ignored and the sanity
-        relationships (tp > entry > stop) are enforced, so a fat-fingered box
-        cannot create a strategy that sells below its own stop.
+        Apply dashboard edits.
+
+        Unknown keys are ignored, prices must be a real per-share price, and
+        the sanity relationships (tp > entry > stop) are enforced — a
+        fat-fingered box cannot create a strategy that sells below its own
+        stop, or one that can never trigger at all.
+
+        Rejected values are reported back in `self.last_param_errors` so the
+        UI can say what was wrong instead of quietly doing nothing.
         """
         applied = {}
+        errors = []
         for key, value in (updates or {}).items():
             try:
-                if key in self._NUMERIC_PARAMS:
+                if key in self._PRICE_PARAMS:
+                    price = float(value)
+                    if not (0.0 < price < 1.0):
+                        errors.append(
+                            f"{key}={value} is not a per-share price — it must be "
+                            f"between 0 and 1 (90 cents is 0.90, not 90)"
+                        )
+                        continue
+                    setattr(self, key, price)
+                elif key in self._NUMERIC_PARAMS:
                     setattr(self, key, float(value))
                 elif key in self._INT_PARAMS:
                     setattr(self, key, int(value))
                 elif key == "size_mode" and value in ("fixed_dollars", "percent_bankroll"):
                     self.size_mode = value
+                elif key == "assets":
+                    # "BTC" or "BTC,ETH" or ["BTC"]. Empty means every asset,
+                    # which is the config default — not "none".
+                    if isinstance(value, str):
+                        wanted = [a.strip().upper() for a in value.split(",") if a.strip()]
+                    elif isinstance(value, (list, tuple)):
+                        wanted = [str(a).strip().upper() for a in value if str(a).strip()]
+                    else:
+                        errors.append(f"assets={value!r} is not a list or comma-separated string")
+                        continue
+                    unknown = [a for a in wanted if a not in KNOWN_ASSETS]
+                    if unknown:
+                        errors.append(
+                            f"unknown asset(s) {', '.join(unknown)} — "
+                            f"choose from {', '.join(sorted(KNOWN_ASSETS))}"
+                        )
+                        continue
+                    self.assets = wanted
                 elif key in ("enabled", "auto_trade", "kill_switch"):
                     setattr(self, key, bool(value))
                 else:
                     continue
                 applied[key] = getattr(self, key)
             except (TypeError, ValueError):
+                errors.append(f"{key}={value!r} is not a number")
                 continue
+
+        self.last_param_errors = errors
+        for problem in errors:
+            self._log(f"rejected parameter: {problem}", "error")
+
         # Keep the ladder coherent.
         self.entry_price_max = max(self.entry_price_max, self.entry_price_min)
         self.tp_price = max(self.tp_price, self.entry_price_min + 0.01)
@@ -2464,9 +2731,28 @@ class Strategy9099:
                 f"tracking window raised to {self.candidate_max_secs:.0f}s to cover "
                 f"the {self.max_secs_remaining:.0f}s entry window"
             )
+
+        # Only the crossing recorded AT the entry threshold is tradeable, and
+        # crossings are only recorded at levels in observe_thresholds. Moving
+        # the entry price without adding it to that set would leave nothing to
+        # trade, with no error and no rejection reason to explain it.
+        self._sync_observe_thresholds()
+
         if applied:
             self._log(f"params updated: {applied}")
         return applied
+
+    def _sync_observe_thresholds(self):
+        """Make sure the entry threshold is one of the levels we record."""
+        wanted = sorted(set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min})
+        if wanted != self.observe_thresholds:
+            added = [lv for lv in wanted if lv not in self.observe_thresholds]
+            self.observe_thresholds = wanted
+            if added:
+                self._log(
+                    f"now recording crossings at {', '.join(f'${x:.2f}' for x in added)} "
+                    f"(entry level must be observed to be tradeable)"
+                )
 
     # ══════════════════════════════════════════════════════════════════
     #  Restart recovery
@@ -2495,6 +2781,7 @@ class Strategy9099:
                     "candidates_traded": self.candidates_traded,
                     "candidates_rejected": self.candidates_rejected,
                     "candidates_observed": self.candidates_observed,
+                    "paper_resets": self.paper_resets,
                 },
                 "positions": [p.to_dict() for p in self.positions.values()],
                 "traded_markets": sorted(self.traded_markets),
