@@ -836,6 +836,9 @@ class Position:
     max_price_after: float = 0.0
     min_price_after: float = 1.0
 
+    # Set when the position's market stopped being handed to us.
+    unwatched_since: float = 0.0
+
     # ── proxy-only observations (recorded, never acted on) ──
     proxy_cross_seen: bool = False
     proxy_cross_at: float = 0.0
@@ -1496,15 +1499,52 @@ class Strategy9099:
         """
         if not self.enabled:
             return
+        handled = set()
         for market in markets:
             try:
                 if self.assets and getattr(market, "asset", "").upper() not in self.assets:
                     continue
                 self._process_market(market)
+                handled.add(market.market_id)
             except Exception as e:
                 self.api_errors += 1
                 self._log(f"process error on {_short(getattr(market, 'market_id', ''))}: {e}", "error")
+        # An open position must be managed whether or not its market is still
+        # in the list we were handed.
+        self._advance_unwatched(handled)
         self._sweep_finished()
+
+    def _advance_unwatched(self, handled: set):
+        """
+        Advance positions whose market did not reach _process_market this tick.
+
+        Two ways that happens, both of which stranded a position permanently:
+        the caller prunes closed markets from its watch list about a minute
+        after expiry, and the asset filter skips markets we no longer trade —
+        including ones we still hold. Either way the position stopped being
+        advanced, so its stop, its expiry exit and its settlement never ran,
+        and it sat in TP_PENDING for as long as the process lived.
+
+        Everything needed is on the position itself, so the market list is not
+        required to finish what it started.
+        """
+        for pos in list(self.positions.values()):
+            if pos.phase not in ACTIVE_PHASES or pos.market_id in handled:
+                continue
+            try:
+                px = self.feed.get_price(pos.token_id)
+                secs = self._secs_left(pos)
+                if not pos.unwatched_since:
+                    pos.unwatched_since = self.clock()
+                    self._log(
+                        f"{pos.asset} {pos.side} is no longer in the watch list "
+                        f"({secs:.0f}s to close) — managing it to an exit anyway",
+                        "warn",
+                    )
+                self._advance(pos, px, secs)
+            except Exception as e:
+                self.api_errors += 1
+                self._log(f"unwatched advance failed for {pos.trade_id}: {e}", "error")
 
     def _process_market(self, market):
         market_id = market.market_id
@@ -2276,6 +2316,25 @@ class Strategy9099:
         pos.gross_pnl = round(proceeds - cost, 4)
         pos.realized_pnl = round(pos.gross_pnl - pos.fees_total, 4)
         pos.realized_pnl_pct = round(pos.realized_pnl / cost * 100, 3) if cost else 0.0
+        # Two things the simulated broker never saw, both of which left the
+        # paper balance disagreeing with the P&L:
+        #
+        #   settled shares  never went through a sell, so their proceeds were
+        #                   never credited. At 100%-of-bankroll sizing that
+        #                   left the cash permanently spent, which then read
+        #                   as a wipeout and got "refilled" — inventing the
+        #                   money a second time.
+        #   fees            were subtracted from realized P&L but never from
+        #                   the balance, so the bankroll ran exactly the
+        #                   cumulative fee total too high.
+        #
+        # With both applied, balance == starting bankroll + cumulative P&L.
+        if isinstance(self.broker, PaperBroker):
+            if held > 0:
+                self.broker.balance += held * pos.settled_value
+            self.broker.balance -= pos.fees_total
+            self._balance_cache = (0.0, 0.0)
+
         pos.closed_at = self.clock()
         pos.phase = Phase.CLOSED
         pos.bankroll_after = self.available_balance(max_age=0.0)
