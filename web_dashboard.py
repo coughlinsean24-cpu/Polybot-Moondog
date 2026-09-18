@@ -6058,7 +6058,8 @@ DASHBOARD_HTML = r"""
 
 <!-- ── Headline numbers ── -->
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:12px;">
-  <div class="stat-card"><div class="stat-label">Bankroll</div><div class="stat-value" id="s9099-bankroll">$0</div></div>
+  <div class="stat-card" title="Buying power available to the next trade."><div class="stat-label" id="s9099-bankroll-label">Bankroll</div><div class="stat-value" id="s9099-bankroll">$0</div></div>
+  <div class="stat-card" title="Starting bankroll plus cumulative realized P&L — what the bankroll would be with nothing topped up. This is the line to watch when buying power is pinned."><div class="stat-label">Equity</div><div class="stat-value" id="s9099-equity">$0</div></div>
   <div class="stat-card"><div class="stat-label">Available</div><div class="stat-value" id="s9099-available">$0</div></div>
   <div class="stat-card"><div class="stat-label">Realized P&amp;L</div><div class="stat-value" id="s9099-realized">$0</div></div>
   <div class="stat-card"><div class="stat-label">Unrealized</div><div class="stat-value" id="s9099-unrealized">$0</div></div>
@@ -6115,6 +6116,12 @@ DASHBOARD_HTML = r"""
     <label>Max open<input type="number" id="s9099-max-open" step="1" min="1" max="10" class="s9099-in"></label>
     <label>Max daily loss $<input type="number" id="s9099-max-loss" step="5" min="0" class="s9099-in"></label>
     <label title="Which assets to trade. Comma separated, e.g. BTC. Blank means all.">Assets<input type="text" id="s9099-assets" placeholder="BTC" class="s9099-in"></label>
+    <label title="PAPER ONLY. Put buying power back to the starting bankroll after every trade, so every trade is sized the same and a losing run cannot shrink the sample or stop collection. Cumulative P&L is unaffected — watch Equity. Ignored in live: a real account cannot be topped up.">Fixed buying power
+      <span style="display:flex;align-items:center;gap:6px;margin-top:5px;">
+        <input type="checkbox" id="s9099-fixed-bankroll" style="width:16px;height:16px;accent-color:var(--yellow);cursor:pointer;">
+        <span style="font-size:11px;color:var(--dim);" id="s9099-fixed-bankroll-note"></span>
+      </span>
+    </label>
   </div>
 </div>
 
@@ -8318,6 +8325,7 @@ function s9099SaveParams() {
     exit_before_expiry: s9099Num('s9099-exit-before'),
     max_open_positions: s9099Num('s9099-max-open'),
     max_daily_loss: s9099Num('s9099-max-loss'),
+    paper_fixed_bankroll: document.getElementById('s9099-fixed-bankroll').checked,
   };
   Object.keys(p).forEach(k => { if (p[k] === null) delete p[k]; });
   socket.emit('s9099_update_params', p);
@@ -8366,6 +8374,11 @@ function s9099UpdateUI(st, markets) {
 
   const setTxt = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
   setTxt('s9099-bankroll', '$' + (st.bankroll || 0).toFixed(2));
+  setTxt('s9099-equity', '$' + (st.equity || 0).toFixed(2));
+  // With buying power pinned the bankroll never moves, and a flat $500 beside
+  // a negative P&L reads like breaking even unless the card says otherwise.
+  const bl = document.getElementById('s9099-bankroll-label');
+  if (bl) bl.textContent = st.paper_fixed_bankroll ? 'Bankroll (pinned)' : 'Bankroll';
   setTxt('s9099-available', '$' + (st.available_balance || 0).toFixed(2));
   setTxt('s9099-realized', '$' + (st.realized_pnl || 0).toFixed(2));
   setTxt('s9099-unrealized', '$' + (st.unrealized_pnl || 0).toFixed(2));
@@ -8410,6 +8423,17 @@ function s9099UpdateUI(st, markets) {
   if (sm && !s9099Editing) sm.value = p.size_mode;
   const assetsBox = document.getElementById('s9099-assets');
   if (assetsBox && !s9099Editing) assetsBox.value = (p.assets || []).join(',');
+
+  const fbBox = document.getElementById('s9099-fixed-bankroll');
+  if (fbBox && !s9099Editing) fbBox.checked = !!p.paper_fixed_bankroll;
+  const fbNote = document.getElementById('s9099-fixed-bankroll-note');
+  if (fbNote) {
+    fbNote.textContent = st.paper_fixed_bankroll
+      ? 'pinned at $' + (st.bankroll_start || 0).toFixed(0)
+        + (st.paper_topped_up ? ' (' + (st.paper_topped_up >= 0 ? '+' : '')
+            + '$' + st.paper_topped_up.toFixed(2) + ' injected)' : '')
+      : (p.paper_fixed_bankroll ? 'ignored in live' : 'follows P&L');
+  }
 
   // What the next entry would actually buy, and which cap decided it.
   const sp = document.getElementById('s9099-size-preview');
