@@ -5888,7 +5888,8 @@ DASHBOARD_HTML = r"""
     </span>
     <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
   </div>
-  <div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
+  <div id="s9099-not-trading" style="display:none;background:#2d1a00;border:1px solid var(--yellow);color:var(--yellow);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;"></div>
+<div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
     <label>Entry min $<input type="number" id="s9099-entry-min" placeholder="0.90" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
     <label>Entry max $<input type="number" id="s9099-entry-max" placeholder="0.97" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
@@ -5933,6 +5934,7 @@ DASHBOARD_HTML = r"""
     <span style="font-weight:700;color:var(--yellow);font-size:13px;">Live Markets &mdash; best side vs entry threshold</span>
     <span id="s9099-rejections" style="font-size:11px;color:var(--dim);"></span>
   </div>
+  <div id="s9099-blocks" style="font-size:11px;color:var(--dim);margin-bottom:8px;"></div>
   <div id="s9099-live-markets" style="max-height:300px;overflow-y:auto;font-size:12px;"></div>
 </div>
 
@@ -7987,7 +7989,32 @@ function s9099UpdateUI(st, markets) {
   const rej = document.getElementById('s9099-rejections');
   if (rej) {
     const parts = Object.entries(st.rejection_reasons || {}).map(([k, v]) => k + ' ' + v);
-    rej.textContent = parts.length ? 'rejections: ' + parts.join(' | ') : '';
+    rej.textContent = parts.length ? 'final reason: ' + parts.join(' | ') : '';
+  }
+
+  // Every reason each candidate hit while it was live. The "final reason"
+  // above is nearly always price_below_threshold, because the price leaves
+  // the band before the window shuts — this is the list that explains a zero.
+  const blocks = document.getElementById('s9099-blocks');
+  if (blocks) {
+    const parts = Object.entries(st.block_reasons || {}).map(([k, v]) => k + ' ' + v);
+    blocks.innerHTML = parts.length
+      ? '<b>What blocked entries (all reasons seen, per candidate):</b> ' + parts.join(' &nbsp;|&nbsp; ')
+      : '';
+  }
+
+  // Blanket blockers: nothing can trade while any of these hold, however
+  // good a market looks in the table below.
+  const nt = document.getElementById('s9099-not-trading');
+  if (nt) {
+    const why = st.not_trading_because || [];
+    if (why.length) {
+      nt.style.display = 'block';
+      nt.innerHTML = '<b>&#9888; NOT TRADING &mdash; nothing can qualify while:</b><br>&bull; '
+        + why.join('<br>&bull; ');
+    } else {
+      nt.style.display = 'none';
+    }
   }
 
   // ── Open positions ──

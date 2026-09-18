@@ -540,7 +540,9 @@ class Candidate:
 
     qualified: bool = False
     reason_qualified: str = ""
-    reason_rejected: str = ""
+    reason_rejected: str = ""        # the LAST reason, at settlement
+    reason_first: str = ""           # what blocked it on the very first look
+    reasons_seen: list = field(default_factory=list)   # every distinct reason
     decision_written: bool = False
     traded: bool = False
     trade_id: str = ""
@@ -668,6 +670,8 @@ class Candidate:
             "qualified": self.qualified,
             "reason_qualified": self.reason_qualified,
             "reason_rejected": self.reason_rejected,
+            "reason_first_block": self.reason_first,
+            "reasons_all": "|".join(self.reasons_seen),
             "traded": self.traded,
             "trade_id": self.trade_id,
             "mode": mode,
@@ -1011,7 +1015,10 @@ class Strategy9099:
         self.candidates_traded = 0
         self.candidates_rejected = 0      # entry-level only
         self.candidates_observed = 0      # other levels — never up for a trade
-        self.rejection_reasons: dict[str, int] = {}
+        self.rejection_reasons: dict[str, int] = {}   # final reason at settlement
+        # Every distinct reason each candidate hit while it was live. This is
+        # the one that answers "why is nothing trading".
+        self.block_reasons: dict[str, int] = {}
         self.trades_today = 0
         self.wins = 0
         self.losses = 0
@@ -1162,6 +1169,43 @@ class Strategy9099:
                     f"reference_margin({margin_pct:.4f}%<{self.min_margin_pct:.4f}%)"
                 )
         return True, "all_checks_passed"
+
+    def _not_trading_because(self) -> list[str]:
+        """
+        Blanket blockers — conditions under which NO market can ever qualify,
+        however good it looks. Surfaced separately from per-market rejections
+        because a market reading QUALIFIES while one of these is set is the
+        single most confusing state this thing can be in.
+        """
+        blockers = []
+        if not self.enabled:
+            blockers.append("'Watch & record' is off")
+        if not self.auto_trade:
+            blockers.append("'Trade candidates' is off")
+        if self.kill_switch:
+            blockers.append("kill switch is on")
+        for name in ("entry_price_min", "entry_price_max", "tp_price", "stop_price"):
+            value = getattr(self, name)
+            if not (0.0 < value < 1.0):
+                blockers.append(f"{name}={value} is not a per-share price")
+        if self.api_errors >= self.max_api_errors:
+            blockers.append(f"{self.api_errors} consecutive API errors")
+        if self.max_trades_per_day and self.trades_today >= self.max_trades_per_day:
+            blockers.append(f"daily trade cap reached ({self.trades_today})")
+        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
+            blockers.append(f"daily loss cap reached (${self.daily_loss:.2f})")
+        if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
+            blockers.append(f"{self.consecutive_losses} consecutive losses")
+        balance = self.available_balance()
+        if balance < self.min_balance:
+            blockers.append(f"balance ${balance:.2f} below minimum ${self.min_balance:.2f}")
+        if self.min_margin_pct > 0 and self.settlement.binance_price(
+                self.assets[0] if self.assets else "BTC") <= 0:
+            blockers.append(
+                "no reference price (underlying feed is down) while "
+                f"min margin is {self.min_margin_pct}% — every entry will be rejected"
+            )
+        return blockers
 
     def check_risk_gates(self, market_id: str = "") -> tuple[bool, str]:
         """Account-level guards, independent of any particular market."""
@@ -1322,7 +1366,19 @@ class Strategy9099:
         if ok:
             self._enter(market, cand, side, px, secs)
             return
+
+        # A candidate is re-evaluated every tick, and the price almost always
+        # leaves the band before the window shuts — so the LAST reason is
+        # nearly always "price_below_threshold", which hides whatever was
+        # really blocking it while it was in the band. Keep all of them.
         cand.reason_rejected = reason
+        bucket = reason.split("(")[0]
+        if not cand.reason_first:
+            cand.reason_first = reason
+        if bucket not in cand.reasons_seen:
+            cand.reasons_seen.append(bucket)
+            self.block_reasons[bucket] = self.block_reasons.get(bucket, 0) + 1
+
         # Once the entry window has passed, the decision is final.
         if secs < self.min_secs_remaining or px.best_ask < self.entry_price_min:
             self._settle_decision(cand)
@@ -2396,6 +2452,11 @@ class Strategy9099:
             "rejection_reasons": dict(sorted(
                 self.rejection_reasons.items(), key=lambda kv: -kv[1]
             )[:8]),
+            "block_reasons": dict(sorted(
+                self.block_reasons.items(), key=lambda kv: -kv[1]
+            )[:10]),
+            # Anything here means no entry can happen, whatever the market does.
+            "not_trading_because": self._not_trading_because(),
             "api_errors": self.api_errors,
             "params": self.params(),
         }

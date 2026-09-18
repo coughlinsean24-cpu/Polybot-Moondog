@@ -322,7 +322,9 @@ CANDIDATE_HEADERS = [
     "max_secs_remaining",
     "qualified",              # True/False
     "reason_qualified",
-    "reason_rejected",
+    "reason_rejected",        # the last reason, as the candidate closed
+    "reason_first_block",     # what blocked it the FIRST time we looked
+    "reasons_all",            # every distinct reason it hit, pipe-separated
     "traded",
     "trade_id",
     "mode",                   # PAPER / LIVE

@@ -1310,6 +1310,58 @@ def test_unresolvable_market_still_writes_its_row(engine, feed, logs, monkeypatc
 #  Safety rails
 # ══════════════════════════════════════════════════════════════════════
 
+def test_all_blocking_reasons_are_recorded_not_just_the_last(engine, feed, logs):
+    """
+    A candidate is re-evaluated every tick and the price usually leaves the
+    band before the window shuts, so the LAST reason is nearly always
+    price_below_threshold — which hid the real blocker.
+    """
+    engine.min_liquidity = 400          # the real blocker
+    market = market_ending_in(100)
+    prime(feed, market, ask=0.90, ask_size=100, bid=0.89)
+
+    engine.on_tick([market])            # in the band, but the book is thin
+    cand = engine.candidates[(market.market_id, "Up", 0.90)]
+    assert "thin_book" in cand.reason_first
+
+    # Price drops out of the band: the decision closes on price, as before.
+    feed.set(market.token_id_up, ask=0.85, ask_size=100, bid=0.84, bid_size=500)
+    engine.on_tick([market])
+
+    row = [r for r in logs["candidate"].rows if r["observe_level"] == 0.90][0]
+    assert "price_below_threshold" in row["reason_rejected"], "last reason, as before"
+    assert "thin_book" in row["reason_first_block"], "...but the real one is kept"
+    assert "thin_book" in row["reasons_all"]
+    assert "thin_book" in engine.stats()["block_reasons"]
+
+
+def test_not_trading_because_names_blanket_blockers(engine):
+    """A market can read QUALIFIES while one of these silently stops everything."""
+    assert engine._not_trading_because() == []
+
+    engine.auto_trade = False
+    assert any("Trade candidates" in r for r in engine._not_trading_because())
+
+    engine.auto_trade = True
+    engine.kill_switch = True
+    assert any("kill switch" in r for r in engine._not_trading_because())
+
+    engine.kill_switch = False
+    engine.entry_price_min = 87.0       # the cents mistake
+    assert any("not a per-share price" in r for r in engine._not_trading_because())
+
+    engine.entry_price_min = 0.90
+    engine.min_balance = 10_000
+    assert any("below minimum" in r for r in engine._not_trading_because())
+
+    # A dead underlying feed blocks every entry while a margin is required.
+    engine.min_balance = 0
+    engine.min_margin_pct = 0.02
+    engine.settlement.binance_feed = None
+    assert any("reference price" in r for r in engine._not_trading_because())
+    assert engine.stats()["not_trading_because"]
+
+
 def test_kill_switch_and_gates_block_new_entries(engine, feed):
     engine.kill_switch = True
     market = market_ending_in(30)
