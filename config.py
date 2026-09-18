@@ -210,14 +210,14 @@ S9099_KILL_SWITCH = os.getenv("S9099_KILL_SWITCH", "false").lower() == "true"
 # Assets to watch (subset of the 5-min Up/Down universe)
 S9099_ASSETS = [
     a.strip().upper()
-    for a in os.getenv("S9099_ASSETS", "BTC,ETH,SOL,XRP").split(",")
+    for a in os.getenv("S9099_ASSETS", "BTC").split(",")
     if a.strip()
 ]
 
 # ── Entry ──────────────────────────────────────────────────────────────────
 S9099_ENTRY_PRICE_MIN = float(os.getenv("S9099_ENTRY_PRICE_MIN", "0.90"))
 # Do not chase a side that has already run past this — there is no move left.
-S9099_ENTRY_PRICE_MAX = float(os.getenv("S9099_ENTRY_PRICE_MAX", "0.96"))
+S9099_ENTRY_PRICE_MAX = float(os.getenv("S9099_ENTRY_PRICE_MAX", "0.97"))
 # Pay up to this many ticks above the ask to get filled (0 = ask exactly).
 S9099_ENTRY_SLIPPAGE = float(os.getenv("S9099_ENTRY_SLIPPAGE", "0.00"))
 # Cancel an entry that has not filled after N seconds.
@@ -245,16 +245,21 @@ S9099_MIN_LIQUIDITY = float(os.getenv("S9099_MIN_LIQUIDITY", "50"))
 S9099_MIN_TP_DEPTH = float(os.getenv("S9099_MIN_TP_DEPTH", "0"))
 # How far the underlying must sit on the winning side of the 5-min candle
 # open (the settlement threshold), as a % of spot.  0.02% of $100k BTC = $20.
-S9099_MIN_UNDERLYING_MARGIN_PCT = float(os.getenv("S9099_MIN_UNDERLYING_MARGIN_PCT", "0.02"))
+# 0 = off, which is the honest default while the OFFICIAL settlement
+# reference is unavailable: this can only be measured against a Binance TWAP
+# proxy today, it silently rejects everything when that feed is down, and
+# nothing in the data yet says what a good threshold would be. Turn it on
+# once the collected candidates show a margin that separates winners.
+S9099_MIN_UNDERLYING_MARGIN_PCT = float(os.getenv("S9099_MIN_UNDERLYING_MARGIN_PCT", "0"))
 # Reject if the WS price is older than this (seconds).
 S9099_MAX_DATA_AGE = float(os.getenv("S9099_MAX_DATA_AGE", "5"))
 
 # ── Position sizing ───────────────────────────────────────────────────────
 # "fixed_dollars" -> S9099_FIXED_DOLLARS per entry
 # "percent_bankroll" -> S9099_MAX_POSITION_PERCENT of available balance
-S9099_POSITION_SIZE_MODE = os.getenv("S9099_POSITION_SIZE_MODE", "fixed_dollars").strip().lower()
+S9099_POSITION_SIZE_MODE = os.getenv("S9099_POSITION_SIZE_MODE", "percent_bankroll").strip().lower()
 S9099_FIXED_DOLLARS = float(os.getenv("S9099_FIXED_DOLLARS", "25"))
-S9099_MAX_POSITION_PERCENT = float(os.getenv("S9099_MAX_POSITION_PERCENT", "10"))
+S9099_MAX_POSITION_PERCENT = float(os.getenv("S9099_MAX_POSITION_PERCENT", "100"))
 # Starting bankroll for paper mode (live mode reads the real USDC balance).
 S9099_PAPER_BANKROLL = float(os.getenv("S9099_PAPER_BANKROLL", "500"))
 # In PAPER mode, top the bankroll back up and clear the loss brakes when they
@@ -264,7 +269,10 @@ S9099_PAPER_BANKROLL = float(os.getenv("S9099_PAPER_BANKROLL", "500"))
 # Never applies in live mode: there is no refilling a real account.
 S9099_PAPER_AUTO_RESET = os.getenv("S9099_PAPER_AUTO_RESET", "true").lower() == "true"
 # Hard ceiling on any single entry, whatever the sizing maths says.
-S9099_MAX_POSITION_DOLLARS = float(os.getenv("S9099_MAX_POSITION_DOLLARS", "100"))
+# Hard ceiling per entry. 0 = no ceiling, so the sizing mode and the balance
+# decide. A non-zero value here overrides the sizing mode SILENTLY when it is
+# the smaller of the two, which is why the dashboard names the binding cap.
+S9099_MAX_POSITION_DOLLARS = float(os.getenv("S9099_MAX_POSITION_DOLLARS", "0"))
 # Polymarket rejects orders below 5 shares, so a smaller size is no size.
 S9099_MIN_SHARES = int(os.getenv("S9099_MIN_SHARES", "5"))
 
@@ -282,10 +290,16 @@ S9099_STOP_VELOCITY_WINDOW = float(os.getenv("S9099_STOP_VELOCITY_WINDOW", "5"))
 
 # ── Risk limits ───────────────────────────────────────────────────────────
 S9099_MAX_OPEN_POSITIONS = int(os.getenv("S9099_MAX_OPEN_POSITIONS", "1"))
-S9099_MAX_DAILY_LOSS = float(os.getenv("S9099_MAX_DAILY_LOSS", "50"))
-S9099_MAX_CONSECUTIVE_LOSSES = int(os.getenv("S9099_MAX_CONSECUTIVE_LOSSES", "3"))
+# Both 0 = off by default, because they contradict full-size paper testing:
+# at 100% sizing a single stop-out is ~11% of the bankroll, so a $50 cap
+# halts after one trade and a 3-loss limit halts after three. Set both before
+# going live — see the coherence warnings the dashboard prints.
+S9099_MAX_DAILY_LOSS = float(os.getenv("S9099_MAX_DAILY_LOSS", "0"))
+S9099_MAX_CONSECUTIVE_LOSSES = int(os.getenv("S9099_MAX_CONSECUTIVE_LOSSES", "0"))
 S9099_MIN_BALANCE = float(os.getenv("S9099_MIN_BALANCE", "50"))
-S9099_MAX_TRADES_PER_DAY = int(os.getenv("S9099_MAX_TRADES_PER_DAY", "40"))
+# 0 = unlimited. BTC alone offers 288 five-minute markets a day and we hold
+# one position at a time, so a cap here just truncates the sample.
+S9099_MAX_TRADES_PER_DAY = int(os.getenv("S9099_MAX_TRADES_PER_DAY", "0"))
 # Stop submitting if this many consecutive API calls fail.
 S9099_MAX_API_ERRORS = int(os.getenv("S9099_MAX_API_ERRORS", "5"))
 # Seconds before the same market may be re-evaluated after a trade closes.
@@ -410,8 +424,8 @@ def validate_strategy_9099() -> list[str]:
         )
     if not (0 < S9099_MAX_POSITION_PERCENT <= 100):
         errors.append(f"S9099_MAX_POSITION_PERCENT={S9099_MAX_POSITION_PERCENT} must be in (0, 100]")
-    if S9099_MAX_POSITION_DOLLARS <= 0:
-        errors.append("S9099_MAX_POSITION_DOLLARS must be > 0")
+    if S9099_MAX_POSITION_DOLLARS < 0:
+        errors.append("S9099_MAX_POSITION_DOLLARS must be >= 0 (0 = no cap)")
     if S9099_MIN_SHARES < 5:
         errors.append("S9099_MIN_SHARES must be >= 5 (Polymarket minimum order size)")
     return errors

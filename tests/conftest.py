@@ -198,9 +198,17 @@ def engine(feed, logs, tmp_path):
         resolve_fn=lambda market_id: {"resolved": True, "winner": "Up"},
         state_file=str(tmp_path / "state.json"),
     )
-    # The reference-margin filter is exercised by its own tests; the
-    # lifecycle tests are not about it.
+    # The lifecycle tests are about the lifecycle, not about whichever
+    # defaults happen to ship. Pin the ones they depend on so a deliberate
+    # default change shows up as a real failure, not a dozen false ones.
     eng.min_margin_pct = 0.0
+    eng.size_mode = "fixed_dollars"
+    eng.fixed_dollars = 25.0
+    eng.max_position_dollars = 100.0
+    eng.max_daily_loss = 50.0
+    eng.max_consecutive_losses = 3
+    eng.max_trades_per_day = 40
+    eng.entry_price_max = 0.96
     return eng
 
 

@@ -1671,6 +1671,74 @@ def test_size_preview_names_the_binding_cap(engine):
     assert "no trade" in preview["note"]
 
 
+def test_shipped_defaults_are_coherent_for_full_size_paper_testing():
+    """
+    The defaults have to agree with each other. A $50 daily loss cap beside
+    100%-of-bankroll sizing halts after one stop-out; that combination
+    shipped once and should not again.
+    """
+    assert config.S9099_ASSETS == ["BTC"]
+    assert config.S9099_POSITION_SIZE_MODE == "percent_bankroll"
+    assert config.S9099_MAX_POSITION_PERCENT == 100
+    assert config.S9099_MAX_POSITION_DOLLARS == 0, "0 = no ceiling"
+    assert config.validate_strategy_9099() == []
+
+    # At full size a single stop-out is far larger than the old $50 cap, so
+    # the loss brakes ship off rather than contradicting the sizing.
+    assert config.S9099_MAX_DAILY_LOSS == 0
+    assert config.S9099_MAX_CONSECUTIVE_LOSSES == 0
+    # One position at a time, or the "full bankroll" is not full.
+    assert config.S9099_MAX_OPEN_POSITIONS == 1
+    # Room between the entry ceiling and the take-profit for the move to pay.
+    assert config.S9099_TAKE_PROFIT_PRICE - config.S9099_ENTRY_PRICE_MAX >= 0.02
+
+
+def test_zero_position_cap_means_no_cap(engine):
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    preview = engine.explain_size(price=0.90)
+
+    assert "100% of" in preview["binding_cap"], "the sizing mode decides"
+    assert preview["cost"] > 490, "the whole bankroll is usable"
+    assert "max $" not in preview["binding_cap"]
+
+    # A non-zero cap still binds when it is the smaller.
+    engine.max_position_dollars = 100
+    assert "max $100.00/position" in engine.explain_size(price=0.90)["binding_cap"]
+
+
+def test_config_warnings_catch_settings_that_fight_each_other(engine):
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    engine.max_daily_loss = 0
+    engine.max_open_positions = 1
+    engine.min_liquidity = 50
+    engine.entry_price_max = 0.96
+    assert engine.config_warnings() == []
+
+    # A daily cap smaller than one stop-out at this size.
+    engine.max_daily_loss = 50
+    assert any("halts after a single losing trade" in w for w in engine.config_warnings())
+
+    # Full-size sizing with room for more than one position.
+    engine.max_daily_loss = 0
+    engine.max_open_positions = 3
+    assert any("Max open is 3" in w for w in engine.config_warnings())
+
+    # A depth floor above the size we would actually buy.
+    engine.max_open_positions = 1
+    engine.min_liquidity = 5000
+    assert any("Min liquidity" in w for w in engine.config_warnings())
+
+    # An entry ceiling that leaves nothing between it and the take-profit.
+    engine.min_liquidity = 50
+    engine.entry_price_max = 0.985
+    assert any("to the take-profit" in w for w in engine.config_warnings())
+    assert engine.stats()["config_warnings"]
+
+
 def test_set_params_keeps_the_price_ladder_coherent(engine):
     engine.set_params({"entry_price_min": 0.94, "tp_price": 0.90, "stop_price": 0.96})
     assert engine.tp_price > engine.entry_price_min
