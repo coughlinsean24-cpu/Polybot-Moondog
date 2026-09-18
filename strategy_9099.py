@@ -1065,6 +1065,9 @@ class Strategy9099:
         # Every distinct reason each candidate hit while it was live. This is
         # the one that answers "why is nothing trading".
         self.block_reasons: dict[str, int] = {}
+        # (market_id, side) already reported as in-band with no crossing on
+        # record — so the warning fires once per side, not every tick.
+        self._untracked_logged: set = set()
         self.trades_today = 0
         self.wins = 0
         self.losses = 0
@@ -1277,6 +1280,18 @@ class Strategy9099:
             blockers.append("'Trade candidates' is off")
         if self.kill_switch:
             blockers.append("kill switch is on")
+        # Entries are only ever taken against a tracked crossing, so with
+        # tracking off nothing can trade and no market would say why.
+        if not self.track_candidates:
+            blockers.append("candidate tracking is off — no crossing is recorded to trade")
+        # A tracking window narrower than the entry window leaves the early
+        # part of the entry window with no candidate to decide on.
+        if self.candidate_max_secs < self.max_secs_remaining:
+            blockers.append(
+                f"tracking starts at {self.candidate_max_secs:.0f}s but entries are "
+                f"allowed from {self.max_secs_remaining:.0f}s — nothing is tracked yet "
+                f"when the entry window opens"
+            )
         for name in ("entry_price_min", "entry_price_max", "tp_price", "stop_price"):
             value = getattr(self, name)
             if not (0.0 < value < 1.0):
@@ -1581,6 +1596,21 @@ class Strategy9099:
         for side, px, opp in sides:
             if getattr(px, "valid", False):
                 self._decide_side(market, side, px, opp, secs)
+            elif self.min_secs_remaining <= secs <= self.max_secs_remaining:
+                # No book for this side during the window it could have been
+                # entered in. Silently skipping it is how a market goes by
+                # looking fine on screen with nothing recorded against it.
+                key = (market.market_id, side)
+                if key not in self._untracked_logged:
+                    self._untracked_logged.add(key)
+                    self.block_reasons["no_price_feed"] = (
+                        self.block_reasons.get("no_price_feed", 0) + 1
+                    )
+                    self._log(
+                        f"{getattr(market, 'asset', '?')} {side} has no usable book "
+                        f"with {secs:.0f}s left — it cannot be evaluated at all",
+                        "warn",
+                    )
 
     # ── candidate observation ────────────────────────────────────────────
 
@@ -1609,7 +1639,28 @@ class Strategy9099:
         # Only the crossing at the configured entry threshold is tradeable;
         # every other level is observation.
         cand = self.candidates.get((market.market_id, side, self.entry_price_min))
-        if cand is None or cand.decision_written:
+        if cand is None:
+            # No crossing on record for this side. Normally that is correct —
+            # the price never reached the entry threshold. But if the snapshot
+            # in front of us would qualify, a tradeable market is going by with
+            # nothing anywhere saying so, which is the one outcome that must
+            # never be silent.
+            if (self.entry_price_min <= px.best_ask <= self.entry_price_max
+                    and self.min_secs_remaining <= secs <= self.max_secs_remaining):
+                key = (market.market_id, side)
+                if key not in self._untracked_logged:
+                    self._untracked_logged.add(key)
+                    self.block_reasons["no_candidate_tracked"] = (
+                        self.block_reasons.get("no_candidate_tracked", 0) + 1
+                    )
+                    self._log(
+                        f"{getattr(market, 'asset', '?')} {side} is in the entry band "
+                        f"at ${px.best_ask:.3f} with {secs:.0f}s left but no crossing was "
+                        f"tracked — check 'Track from (s)' against 'Max secs left'",
+                        "warn",
+                    )
+            return
+        if cand.decision_written:
             return
 
         # Still deciding. Re-check every tick until we act or the window shuts.
@@ -1630,8 +1681,24 @@ class Strategy9099:
             cand.reasons_seen.append(bucket)
             self.block_reasons[bucket] = self.block_reasons.get(bucket, 0) + 1
 
-        # Once the entry window has passed, the decision is final.
-        if secs < self.min_secs_remaining or px.best_ask < self.entry_price_min:
+        # The decision is final only once the entry window has actually shut.
+        #
+        # It used to also be final the moment the price fell back below the
+        # entry threshold, which is not the same thing at all: tracking starts
+        # at candidate_max_secs (300s) but entries are only allowed inside the
+        # entry window (150s by default), so a side that touched 0.90 at 240s
+        # and eased off had its candidate retired ~90 seconds before it was
+        # ever eligible.  When it climbed back into the band at 100s — in the
+        # window, in the band, every check passing — _decide_side returned at
+        # `decision_written` and said nothing, anywhere.  That is the silent
+        # miss: no order, no rejection reason, no row until market close.
+        #
+        # A dip out of the band is just a state the crossing passes through.
+        # The candidate keeps observing either way (Candidate.observe runs
+        # every tick regardless), so holding it open costs nothing and the row
+        # written at the end is the truthful final verdict rather than a
+        # verdict from before the market was allowed to trade.
+        if secs < self.min_secs_remaining:
             self._settle_decision(cand)
 
     def _open_candidate(self, market, side, px, opp, secs, now, end_time,
