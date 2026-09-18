@@ -1073,7 +1073,8 @@ class Strategy9099:
         self.daily_loss = 0.0
         self.consecutive_losses = 0
         self.api_errors = 0
-        self.paper_resets = 0        # how many times a paper bankroll was wiped out
+        self.paper_resets = 0        # genuine wipeouts: the bankroll was refilled
+        self.brake_releases = 0      # loss brakes cleared, no money invented
         self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         self._balance_cache = (0.0, 0.0)  # (value, fetched_at)
@@ -1214,6 +1215,51 @@ class Strategy9099:
                 )
         return True, "all_checks_passed"
 
+    def config_warnings(self) -> list[str]:
+        """
+        Settings that do not contradict each other outright, but will not do
+        what they look like they do. These are not errors — each is a legal
+        configuration — so they are surfaced rather than refused.
+        """
+        warnings = []
+        preview = self.explain_size()
+        stop_loss = (self.entry_price_min - self.stop_price) * max(preview["shares"], 0)
+
+        if self.max_daily_loss > 0 and stop_loss > 0:
+            trades_to_halt = self.max_daily_loss / stop_loss
+            if trades_to_halt < 2:
+                warnings.append(
+                    f"Max daily loss ${self.max_daily_loss:.0f} is under one "
+                    f"stop-out at this size (~${stop_loss:.0f}) — trading halts "
+                    f"after a single losing trade"
+                )
+        if self.max_position_percent >= 75 and self.max_open_positions > 1:
+            warnings.append(
+                f"Sizing is {self.max_position_percent:.0f}% of bankroll but Max open "
+                f"is {self.max_open_positions} — the first position takes the balance "
+                f"and the rest get whatever is left"
+            )
+        if self.min_liquidity > preview["shares"] > 0:
+            warnings.append(
+                f"Min liquidity {self.min_liquidity:.0f} shares is above the "
+                f"{preview['shares']} shares this would buy — entries are rejected "
+                f"for depth this size does not need"
+            )
+        if self.tp_price - self.entry_price_max < 0.02:
+            warnings.append(
+                f"Entry max ${self.entry_price_max:.2f} leaves only "
+                f"${self.tp_price - self.entry_price_max:.2f} to the take-profit — "
+                f"fees eat most of that"
+            )
+        if self.is_live and self.max_position_percent >= 50 and self.size_mode == "percent_bankroll":
+            warnings.append(
+                f"LIVE with {self.max_position_percent:.0f}% of the account per trade "
+                f"and no daily loss cap"
+                if self.max_daily_loss <= 0 else
+                f"LIVE with {self.max_position_percent:.0f}% of the account per trade"
+            )
+        return warnings
+
     def _not_trading_because(self) -> list[str]:
         """
         Blanket blockers — conditions under which NO market can ever qualify,
@@ -1285,28 +1331,44 @@ class Strategy9099:
         balance = self.available_balance()
         # Enough to clear the exchange minimum at the entry price, plus fees.
         needed = max(self.min_balance, self.min_shares * self.entry_price_min * 1.05)
-        reasons = []
-        if balance < needed:
-            reasons.append(f"bankroll down to ${balance:.2f}")
+
+        # Two different things, which must not be conflated. Releasing a loss
+        # brake lets trading continue; refilling the bankroll invents money.
+        # Doing both at once hid real losses: the balance read like a fresh
+        # $500 while realized P&L was negative, so the two disagreed with no
+        # way to tell which was right.
+        brakes = []
         if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
-            reasons.append(f"daily loss cap (${self.daily_loss:.2f})")
+            brakes.append(f"daily loss cap (${self.daily_loss:.2f})")
         if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
-            reasons.append(f"{self.consecutive_losses} consecutive losses")
-        if not reasons:
+            brakes.append(f"{self.consecutive_losses} consecutive losses")
+        depleted = balance < needed
+
+        if not brakes and not depleted:
             return False
 
-        self.paper_resets += 1
-        self.broker.balance = self._starting_bankroll
-        self._balance_cache = (self._starting_bankroll, self.clock())
-        self.daily_loss = 0.0
-        self.consecutive_losses = 0
-        self._log(
-            f"PAPER RESET #{self.paper_resets} — {'; '.join(reasons)}. "
-            f"Bankroll back to ${self._starting_bankroll:.2f}. "
-            f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
-            f"({self.wins}W/{self.losses}L).",
-            "warn",
-        )
+        if brakes:
+            self.brake_releases += 1
+            self.daily_loss = 0.0
+            self.consecutive_losses = 0
+            self._log(
+                f"paper brake released ({'; '.join(brakes)}) — counters cleared, "
+                f"bankroll untouched at ${balance:.2f}. "
+                f"Cumulative P&L ${self.realized_pnl:+.2f} ({self.wins}W/{self.losses}L).",
+                "warn",
+            )
+
+        if depleted:
+            self.paper_resets += 1
+            self.broker.balance = self._starting_bankroll
+            self._balance_cache = (self._starting_bankroll, self.clock())
+            self._log(
+                f"PAPER WIPEOUT #{self.paper_resets} — bankroll was ${balance:.2f}, "
+                f"refilled to ${self._starting_bankroll:.2f}. "
+                f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
+                f"({self.wins}W/{self.losses}L).",
+                "warn",
+            )
         return True
 
     def check_risk_gates(self, market_id: str = "") -> tuple[bool, str]:
@@ -1365,9 +1427,10 @@ class Strategy9099:
 
         caps = {
             mode_label: by_mode,
-            f"max ${self.max_position_dollars:.2f}/position": self.max_position_dollars,
             f"balance ${balance:.2f}": balance,
         }
+        if self.max_position_dollars > 0:
+            caps[f"max ${self.max_position_dollars:.2f}/position"] = self.max_position_dollars
         binding = min(caps, key=caps.get)
         budget = caps[binding]
         shares = self.calculate_position_size(balance, price)
@@ -1404,7 +1467,11 @@ class Strategy9099:
             budget = balance * (self.max_position_percent / 100.0)
         else:
             budget = self.fixed_dollars
-        budget = min(budget, self.max_position_dollars, balance)
+        # max_position_dollars of 0 means no ceiling — the sizing mode and the
+        # balance decide.
+        budget = min(budget, balance)
+        if self.max_position_dollars > 0:
+            budget = min(budget, self.max_position_dollars)
         if budget <= 0:
             return 0
 
@@ -2605,8 +2672,10 @@ class Strategy9099:
             )[:10]),
             # Anything here means no entry can happen, whatever the market does.
             "not_trading_because": self._not_trading_because(),
+            "config_warnings": self.config_warnings(),
             "api_errors": self.api_errors,
             "paper_resets": self.paper_resets,
+            "brake_releases": self.brake_releases,
             "paper_auto_reset": self.paper_auto_reset and not self.is_live,
             "params": self.params(),
             "size_preview": self.explain_size(),
@@ -2742,6 +2811,44 @@ class Strategy9099:
             self._log(f"params updated: {applied}")
         return applied
 
+    def reset_to_defaults(self) -> dict:
+        """
+        Put every tunable back to the shipped defaults.
+
+        Saved dashboard settings override config defaults by design, which
+        means a value edited once keeps winning after an upgrade that changed
+        it. This is the way back.
+        """
+        self.set_params({
+            "entry_price_min": config.S9099_ENTRY_PRICE_MIN,
+            "entry_price_max": config.S9099_ENTRY_PRICE_MAX,
+            "tp_price": config.S9099_TAKE_PROFIT_PRICE,
+            "stop_price": config.S9099_STOP_PRICE,
+            "max_secs_remaining": config.S9099_MAX_SECS_REMAINING,
+            "min_secs_remaining": config.S9099_MIN_SECS_REMAINING,
+            "candidate_max_secs": config.S9099_CANDIDATE_MAX_SECS,
+            "max_spread": config.S9099_MAX_SPREAD,
+            "min_liquidity": config.S9099_MIN_LIQUIDITY,
+            "min_tp_depth": config.S9099_MIN_TP_DEPTH,
+            "min_margin_pct": config.S9099_MIN_UNDERLYING_MARGIN_PCT,
+            "size_mode": config.S9099_POSITION_SIZE_MODE,
+            "fixed_dollars": config.S9099_FIXED_DOLLARS,
+            "max_position_percent": config.S9099_MAX_POSITION_PERCENT,
+            "max_position_dollars": config.S9099_MAX_POSITION_DOLLARS,
+            "exit_before_expiry": config.S9099_EXIT_BEFORE_EXPIRY,
+            "max_open_positions": config.S9099_MAX_OPEN_POSITIONS,
+            "max_daily_loss": config.S9099_MAX_DAILY_LOSS,
+            "min_balance": config.S9099_MIN_BALANCE,
+            "entry_timeout": config.S9099_ENTRY_TIMEOUT,
+            "partial_fill_grace": config.S9099_PARTIAL_FILL_GRACE,
+            "assets": list(config.S9099_ASSETS),
+        })
+        # Not in _NUMERIC_PARAMS/_INT_PARAMS, so set directly.
+        self.max_consecutive_losses = config.S9099_MAX_CONSECUTIVE_LOSSES
+        self.max_trades_per_day = config.S9099_MAX_TRADES_PER_DAY
+        self._log("parameters reset to the shipped defaults", "warn")
+        return self.params()
+
     def _sync_observe_thresholds(self):
         """Make sure the entry threshold is one of the levels we record."""
         wanted = sorted(set(config.S9099_OBSERVE_THRESHOLDS) | {self.entry_price_min})
@@ -2782,8 +2889,13 @@ class Strategy9099:
                     "candidates_rejected": self.candidates_rejected,
                     "candidates_observed": self.candidates_observed,
                     "paper_resets": self.paper_resets,
+                    "brake_releases": self.brake_releases,
                 },
                 "positions": [p.to_dict() for p in self.positions.values()],
+                # Persisted alongside the counters: restoring wins/losses but
+                # not the trades behind them made the dashboard contradict
+                # itself after every restart.
+                "closed": [p.to_dict() for p in self.closed[-200:]],
                 "traded_markets": sorted(self.traded_markets),
             }
             tmp = self.state_file + ".tmp"
@@ -2812,11 +2924,22 @@ class Strategy9099:
             self._log(f"could not read saved state: {e}", "warn")
             return 0
 
+        # Counters and the trades behind them are restored together or not at
+        # all, so the two can never disagree.
         if payload.get("day") == self.day:
             c = payload.get("counters", {})
             for key, value in c.items():
                 if hasattr(self, key):
                     setattr(self, key, value)
+            for raw in payload.get("closed", []):
+                try:
+                    done = Position.from_dict(raw)
+                except Exception:
+                    continue
+                if done.phase == Phase.CLOSED and done.mode == self.mode:
+                    self.closed.append(done)
+            if self.closed:
+                self._log(f"restored {len(self.closed)} closed trade(s) from today")
 
         restored = 0
         for raw in payload.get("positions", []):

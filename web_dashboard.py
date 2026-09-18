@@ -4316,6 +4316,17 @@ def on_s9099_update_params(data):
     push_state()
 
 
+@socketio.on("s9099_reset_defaults")
+def on_s9099_reset_defaults():
+    """Put the 90/99 parameters back to the shipped defaults."""
+    if not engine.s9099:
+        return
+    engine.s9099.reset_to_defaults()
+    _save_settings()
+    engine.add_log("[9099] Parameters reset to defaults", "warn")
+    push_state()
+
+
 @socketio.on("arb_manual")
 def on_arb_manual(data):
     """Manually trigger an arb on a specific market from the dashboard."""
@@ -5944,7 +5955,7 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
   <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
   <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
-  <div class="stat-card" title="How many times the paper bankroll was wiped out and refilled. Cumulative P&L is NOT reset."><div class="stat-label">Paper Wipeouts</div><div class="stat-value" id="s9099-resets">0</div></div>
+  <div class="stat-card" title="Bankroll actually depleted and refilled / loss brakes cleared without touching the balance. Cumulative P&L is never reset."><div class="stat-label">Wipeouts / Brakes</div><div class="stat-value" id="s9099-resets">0</div></div>
   <div class="stat-card"><div class="stat-label">Crossings (all levels)</div><div class="stat-value" id="s9099-seen">0</div></div>
   <div class="stat-card"><div class="stat-label" id="s9099-entry-label">At Entry Level</div><div class="stat-value" id="s9099-entry-seen">0</div></div>
   <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
@@ -5958,10 +5969,14 @@ DASHBOARD_HTML = r"""
     <span style="font-weight:700;color:var(--yellow);font-size:13px;">Parameters
       <span style="font-weight:400;color:var(--dim);font-size:11px;">— prices are per share: 90&cent; is <b>0.90</b>, not 90</span>
     </span>
-    <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
+    <span>
+      <button onclick="if(confirm('Reset all 90/99 parameters to the shipped defaults?')) socket.emit('s9099_reset_defaults')" style="background:var(--card);color:var(--dim);border:1px solid var(--border);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:11px;margin-right:6px;">Reset to defaults</button>
+      <button onclick="s9099SaveParams()" style="background:var(--yellow);color:#000;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:700;">Apply</button>
+    </span>
   </div>
   <div id="s9099-not-trading" style="display:none;background:#2d1a00;border:1px solid var(--yellow);color:var(--yellow);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;"></div>
 <div id="s9099-size-preview" style="margin-top:10px;font-size:11px;color:var(--dim);"></div>
+<div id="s9099-config-warnings" style="display:none;background:#2d2a00;border:1px solid var(--yellow);color:var(--yellow);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
 <div id="s9099-param-errors" style="display:none;background:#2d0d0d;border:1px solid var(--red);color:var(--red);border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;"></div>
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;font-size:11px;color:var(--dim);">
     <label>Entry min $<input type="number" id="s9099-entry-min" placeholder="0.90" step="0.01" min="0.50" max="0.99" class="s9099-in"></label>
@@ -8152,7 +8167,7 @@ function s9099UpdateUI(st, markets) {
   setTxt('s9099-tpfills', st.tp_fills || 0);
   setTxt('s9099-reached', st.tp_price_reached || 0);
   setTxt('s9099-exits', st.emergency_exits || 0);
-  setTxt('s9099-resets', st.paper_resets || 0);
+  setTxt('s9099-resets', (st.paper_resets || 0) + ' / ' + (st.brake_releases || 0));
   const resetCard = document.getElementById('s9099-resets');
   if (resetCard) resetCard.style.color = (st.paper_resets || 0) > 0 ? 'var(--red)' : '';
   setTxt('s9099-seen', st.candidates_seen || 0);
@@ -8196,6 +8211,18 @@ function s9099UpdateUI(st, markets) {
       + z.shares + ' shares &asymp; $' + z.cost.toFixed(2)
       + ' (+$' + z.est_fee.toFixed(2) + ' fee) &mdash; limited by <b>'
       + z.binding_cap + '</b>. ' + z.note;
+  }
+
+  // Settings that are legal but will not do what they look like they do.
+  const warnBox = document.getElementById('s9099-config-warnings');
+  if (warnBox) {
+    const w = st.config_warnings || [];
+    if (w.length) {
+      warnBox.style.display = 'block';
+      warnBox.innerHTML = '<b>These settings fight each other:</b><br>&bull; ' + w.join('<br>&bull; ');
+    } else {
+      warnBox.style.display = 'none';
+    }
   }
 
   const errBox = document.getElementById('s9099-param-errors');

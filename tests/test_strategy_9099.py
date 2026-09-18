@@ -846,6 +846,34 @@ def test_restart_recovers_open_position(engine, feed, logs, tmp_path):
     assert not [c for c in broker2.calls if c[0] == "buy"]
 
 
+def test_closed_trades_survive_a_restart(engine, feed, logs, tmp_path):
+    """
+    Restoring wins/losses but not the trades behind them made the dashboard
+    contradict itself: "1W/3L" beside "no closed trades yet".
+    """
+    market, pos = _open_position(engine, feed)
+    feed.set(market.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=pos.tp_qty)
+    engine.on_tick([market])
+    assert pos.phase == Phase.CLOSED
+    assert len(engine.stats()["closed_trades"]) == 1
+    wins, pnl = engine.wins, engine.realized_pnl
+
+    engine2 = Strategy9099(
+        feed=feed, underlying=FakeUnderlying(), broker=RecordingBroker(feed),
+        depth_fn=lambda t: {"bids": [], "asks": []},
+        resolve_fn=lambda m: {"resolved": False},
+        state_file=engine.state_file,
+    )
+    engine2.recover()
+
+    assert engine2.wins == wins
+    assert engine2.realized_pnl == pytest.approx(pnl)
+    restored = engine2.stats()["closed_trades"]
+    assert len(restored) == 1, "the counters and the trades come back together"
+    assert restored[0]["trade_id"] == pos.trade_id
+    assert restored[0]["exit_reason"] == "tp_filled"
+
+
 def test_recovery_refuses_a_position_from_the_other_mode(engine, feed):
     market, pos = _open_position(engine, feed)
     pos.mode = "LIVE"          # saved by a live run
@@ -1409,7 +1437,8 @@ def test_paper_session_recovers_from_a_wipeout(engine, feed):
 
     ok, reason = engine.check_risk_gates()
     assert ok, f"paper should have recovered, got: {reason}"
-    assert engine.paper_resets == 1
+    assert engine.paper_resets == 1, "the bankroll really was depleted"
+    assert engine.brake_releases == 1, "and the loss brakes were released"
     assert engine.available_balance() == 500.0
     assert engine.consecutive_losses == 0
     assert engine.daily_loss == 0.0
@@ -1418,6 +1447,30 @@ def test_paper_session_recovers_from_a_wipeout(engine, feed):
     assert engine.realized_pnl == pytest.approx(-512.34)
     assert (engine.wins, engine.losses) == (3, 12)
     assert engine.stats()["paper_resets"] == 1
+
+
+def test_releasing_a_brake_does_not_invent_money(engine, feed):
+    """
+    Clearing a loss brake lets trading continue. Refilling the bankroll
+    invents capital. Doing both at once made the balance read like a fresh
+    $500 while realized P&L was negative — the two disagreed and neither
+    was obviously wrong.
+    """
+    engine.broker.balance = 460.0        # down $40, nowhere near depleted
+    engine._balance_cache = (460.0, 0.0)
+    engine.consecutive_losses = 3        # but the brake has tripped
+    engine.realized_pnl = -40.0
+
+    ok, _ = engine.check_risk_gates()
+    assert ok, "trading continues"
+    assert engine.brake_releases == 1
+    assert engine.paper_resets == 0, "no wipeout happened"
+    assert engine.available_balance() == 460.0, \
+        "the bankroll still reflects the losses"
+    assert engine.consecutive_losses == 0
+
+    # The balance and the P&L agree.
+    assert engine.available_balance() == pytest.approx(500.0 + engine.realized_pnl)
 
 
 def test_recovery_never_happens_mid_position(engine, feed):
@@ -1616,6 +1669,74 @@ def test_size_preview_names_the_binding_cap(engine):
     preview = engine.explain_size(price=0.90)
     assert preview["shares"] == 0
     assert "no trade" in preview["note"]
+
+
+def test_shipped_defaults_are_coherent_for_full_size_paper_testing():
+    """
+    The defaults have to agree with each other. A $50 daily loss cap beside
+    100%-of-bankroll sizing halts after one stop-out; that combination
+    shipped once and should not again.
+    """
+    assert config.S9099_ASSETS == ["BTC"]
+    assert config.S9099_POSITION_SIZE_MODE == "percent_bankroll"
+    assert config.S9099_MAX_POSITION_PERCENT == 100
+    assert config.S9099_MAX_POSITION_DOLLARS == 0, "0 = no ceiling"
+    assert config.validate_strategy_9099() == []
+
+    # At full size a single stop-out is far larger than the old $50 cap, so
+    # the loss brakes ship off rather than contradicting the sizing.
+    assert config.S9099_MAX_DAILY_LOSS == 0
+    assert config.S9099_MAX_CONSECUTIVE_LOSSES == 0
+    # One position at a time, or the "full bankroll" is not full.
+    assert config.S9099_MAX_OPEN_POSITIONS == 1
+    # Room between the entry ceiling and the take-profit for the move to pay.
+    assert config.S9099_TAKE_PROFIT_PRICE - config.S9099_ENTRY_PRICE_MAX >= 0.02
+
+
+def test_zero_position_cap_means_no_cap(engine):
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    preview = engine.explain_size(price=0.90)
+
+    assert "100% of" in preview["binding_cap"], "the sizing mode decides"
+    assert preview["cost"] > 490, "the whole bankroll is usable"
+    assert "max $" not in preview["binding_cap"]
+
+    # A non-zero cap still binds when it is the smaller.
+    engine.max_position_dollars = 100
+    assert "max $100.00/position" in engine.explain_size(price=0.90)["binding_cap"]
+
+
+def test_config_warnings_catch_settings_that_fight_each_other(engine):
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    engine.max_daily_loss = 0
+    engine.max_open_positions = 1
+    engine.min_liquidity = 50
+    engine.entry_price_max = 0.96
+    assert engine.config_warnings() == []
+
+    # A daily cap smaller than one stop-out at this size.
+    engine.max_daily_loss = 50
+    assert any("halts after a single losing trade" in w for w in engine.config_warnings())
+
+    # Full-size sizing with room for more than one position.
+    engine.max_daily_loss = 0
+    engine.max_open_positions = 3
+    assert any("Max open is 3" in w for w in engine.config_warnings())
+
+    # A depth floor above the size we would actually buy.
+    engine.max_open_positions = 1
+    engine.min_liquidity = 5000
+    assert any("Min liquidity" in w for w in engine.config_warnings())
+
+    # An entry ceiling that leaves nothing between it and the take-profit.
+    engine.min_liquidity = 50
+    engine.entry_price_max = 0.985
+    assert any("to the take-profit" in w for w in engine.config_warnings())
+    assert engine.stats()["config_warnings"]
 
 
 def test_set_params_keeps_the_price_ladder_coherent(engine):
