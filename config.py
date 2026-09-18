@@ -262,6 +262,14 @@ S9099_FIXED_DOLLARS = float(os.getenv("S9099_FIXED_DOLLARS", "25"))
 S9099_MAX_POSITION_PERCENT = float(os.getenv("S9099_MAX_POSITION_PERCENT", "100"))
 # Starting bankroll for paper mode (live mode reads the real USDC balance).
 S9099_PAPER_BANKROLL = float(os.getenv("S9099_PAPER_BANKROLL", "500"))
+
+# Paper only, and hard-gated off in live: put buying power back to
+# S9099_PAPER_BANKROLL after every closed trade, so sizing is the same on the
+# hundredth trade as on the first and a losing night cannot shrink the sample
+# or stop it outright. Cumulative P&L, wins/losses and the equity curve are
+# all still tracked — only the capital available to the next trade is pinned.
+S9099_PAPER_FIXED_BANKROLL = os.getenv(
+    "S9099_PAPER_FIXED_BANKROLL", "true").lower() in ("1", "true", "yes")
 # In PAPER mode, top the bankroll back up and clear the loss brakes when they
 # would otherwise halt the session, so data collection continues after a wipe
 # out. Cumulative P&L and the win/loss record are NOT reset — the number of

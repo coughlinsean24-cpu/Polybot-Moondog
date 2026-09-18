@@ -1013,6 +1013,13 @@ class Strategy9099:
         self.max_api_errors: int = config.S9099_MAX_API_ERRORS
         self.market_cooldown: float = config.S9099_MARKET_COOLDOWN
         self.paper_auto_reset: bool = config.S9099_PAPER_AUTO_RESET
+        # Paper only: hold buying power at the starting bankroll so sizing does
+        # not drift with the running P&L. See _fixed_bankroll_active().
+        self.paper_fixed_bankroll: bool = config.S9099_PAPER_FIXED_BANKROLL
+        # Net dollars injected by that pin. Equal and opposite to cumulative
+        # realized P&L, which is exactly what makes it worth keeping: it is the
+        # cross-check that the pin is topping up and nothing else is.
+        self.bankroll_topups: float = 0.0
         self.candidate_max_secs: float = config.S9099_CANDIDATE_MAX_SECS
         self.track_candidates: bool = config.S9099_TRACK_CANDIDATES
         self.track_targets: list[float] = list(config.S9099_TRACK_TARGETS)
@@ -1257,6 +1264,12 @@ class Strategy9099:
                 f"${self.tp_price - self.entry_price_max:.2f} to the take-profit — "
                 f"fees eat most of that"
             )
+        if self.is_live and self.paper_fixed_bankroll:
+            warnings.append(
+                "Fixed buying power is ticked but this is LIVE — it is ignored. "
+                "Position size follows the real USDC balance, which nothing "
+                "tops up"
+            )
         if self.is_live and self.max_position_percent >= 50 and self.size_mode == "percent_bankroll":
             warnings.append(
                 f"LIVE with {self.max_position_percent:.0f}% of the account per trade "
@@ -1321,6 +1334,46 @@ class Strategy9099:
             )
         return blockers
 
+    def _fixed_bankroll_active(self) -> bool:
+        """
+        Is buying power pinned right now?
+
+        Live can never reach this. A real account cannot be topped up, and a
+        strategy that sizes as though it can would bet money that is not there
+        — so the live check is here rather than at the call sites, where one
+        missed branch would be enough.
+        """
+        return (self.paper_fixed_bankroll
+                and not self.is_live
+                and isinstance(self.broker, PaperBroker))
+
+    def _pin_paper_bankroll(self) -> bool:
+        """
+        Put paper buying power back to the starting bankroll.
+
+        Sizing is a percentage of the balance, so without this every loss
+        shrinks the next trade and the sample drifts: the hundredth
+        observation is taken at a different size from the first, and a bad
+        night ends collection altogether. Pinning the balance keeps every
+        trade the same size and keeps the session alive; what the strategy
+        actually earned is in realized_pnl, which this never touches.
+        """
+        if not self._fixed_bankroll_active():
+            return False
+        # Never move the balance under a position that is still working — its
+        # entry cost is spent from this same balance.
+        if any(p.phase in ACTIVE_PHASES for p in self.positions.values()):
+            return False
+        balance = self.broker.balance
+        if abs(balance - self._starting_bankroll) < 1e-9:
+            return False
+        self.bankroll_topups = round(
+            self.bankroll_topups + (self._starting_bankroll - balance), 4
+        )
+        self.broker.balance = self._starting_bankroll
+        self._balance_cache = (self._starting_bankroll, self.clock())
+        return True
+
     def _paper_recover(self) -> bool:
         """
         Put a wiped-out PAPER session back on its feet so it keeps collecting.
@@ -1345,6 +1398,10 @@ class Strategy9099:
         # Never reset out from under a position that is still working.
         if any(p.phase in ACTIVE_PHASES for p in self.positions.values()):
             return False
+
+        # Pinned buying power makes depletion unreachable, so this runs first
+        # and the wipeout path below simply never fires.
+        self._pin_paper_bankroll()
 
         balance = self.available_balance()
         # Enough to clear the exchange minimum at the entry price, plus fees.
@@ -2416,6 +2473,17 @@ class Strategy9099:
                 self.consecutive_losses += 1
                 self.daily_loss += -pos.realized_pnl
 
+        # Restore buying power now rather than waiting for the next evaluation,
+        # so the dashboard is never briefly showing a drawn-down balance that
+        # is about to be topped up anyway. With the balance pinned, the
+        # bankroll column would just read the same number on every row, so it
+        # carries the equity curve instead — what the bankroll WOULD be had
+        # nothing been injected, which is the line worth plotting.
+        if self._pin_paper_bankroll():
+            pos.bankroll_after = round(
+                self._starting_bankroll + self.realized_pnl, 4
+            )
+
         cand = self._entry_candidate(pos)
         if cand:
             cand.trade_id = pos.trade_id
@@ -2803,6 +2871,12 @@ class Strategy9099:
             "paper_resets": self.paper_resets,
             "brake_releases": self.brake_releases,
             "paper_auto_reset": self.paper_auto_reset and not self.is_live,
+            "paper_fixed_bankroll": self._fixed_bankroll_active(),
+            "paper_topped_up": round(self.bankroll_topups, 2),
+            # What the bankroll would be had nothing been injected. With the
+            # balance pinned this is the only number that moves, so it is the
+            # one to read.
+            "equity": round(self._starting_bankroll + self.realized_pnl, 2),
             "params": self.params(),
             "size_preview": self.explain_size(),
         }
@@ -2834,6 +2908,7 @@ class Strategy9099:
             "max_trades_per_day": self.max_trades_per_day,
             "entry_timeout": self.entry_timeout,
             "partial_fill_grace": self.partial_fill_grace,
+            "paper_fixed_bankroll": self.paper_fixed_bankroll,
         }
 
     _NUMERIC_PARAMS = {
@@ -2900,7 +2975,8 @@ class Strategy9099:
                         )
                         continue
                     self.assets = wanted
-                elif key in ("enabled", "auto_trade", "kill_switch"):
+                elif key in ("enabled", "auto_trade", "kill_switch",
+                             "paper_fixed_bankroll", "paper_auto_reset"):
                     setattr(self, key, bool(value))
                 else:
                     continue
@@ -2968,6 +3044,7 @@ class Strategy9099:
             "entry_timeout": config.S9099_ENTRY_TIMEOUT,
             "partial_fill_grace": config.S9099_PARTIAL_FILL_GRACE,
             "assets": list(config.S9099_ASSETS),
+            "paper_fixed_bankroll": config.S9099_PAPER_FIXED_BANKROLL,
         })
         # Not in _NUMERIC_PARAMS/_INT_PARAMS, so set directly.
         self.max_consecutive_losses = config.S9099_MAX_CONSECUTIVE_LOSSES

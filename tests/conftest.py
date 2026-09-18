@@ -209,6 +209,11 @@ def engine(feed, logs, tmp_path):
     eng.max_consecutive_losses = 3
     eng.max_trades_per_day = 40
     eng.entry_price_max = 0.96
+    # These tests are about the accounting that runs when the balance moves
+    # with the P&L. Pinned buying power is a separate mode with its own
+    # invariant (see test_fixed_bankroll.py), so it is off here rather than
+    # quietly changing what every balance assertion means.
+    eng.paper_fixed_bankroll = False
     return eng
 
 

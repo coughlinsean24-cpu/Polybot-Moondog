@@ -104,6 +104,7 @@ def test_healthy_gamma_still_returns_every_slug(monkeypatch):
         lambda event, asset: FakeMarket(event["slug"], asset),
     )
 
-    expected = len(pc._generate_window_timestamps(look_ahead=10, look_behind=1))
+    expected = len(pc._generate_window_timestamps(
+        look_ahead=pc.MARKET_LOOK_AHEAD, look_behind=1))
     markets = pc.fetch_active_markets(assets=["btc"])
     assert len(markets) == expected
