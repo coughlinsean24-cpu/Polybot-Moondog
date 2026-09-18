@@ -970,6 +970,7 @@ class Strategy9099:
         self.max_trades_per_day: int = config.S9099_MAX_TRADES_PER_DAY
         self.max_api_errors: int = config.S9099_MAX_API_ERRORS
         self.market_cooldown: float = config.S9099_MARKET_COOLDOWN
+        self.paper_auto_reset: bool = config.S9099_PAPER_AUTO_RESET
         self.candidate_max_secs: float = config.S9099_CANDIDATE_MAX_SECS
         self.track_candidates: bool = config.S9099_TRACK_CANDIDATES
         self.track_targets: list[float] = list(config.S9099_TRACK_TARGETS)
@@ -1033,6 +1034,7 @@ class Strategy9099:
         self.daily_loss = 0.0
         self.consecutive_losses = 0
         self.api_errors = 0
+        self.paper_resets = 0        # how many times a paper bankroll was wiped out
         self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         self._balance_cache = (0.0, 0.0)  # (value, fetched_at)
@@ -1195,12 +1197,18 @@ class Strategy9099:
             blockers.append(f"{self.api_errors} consecutive API errors")
         if self.max_trades_per_day and self.trades_today >= self.max_trades_per_day:
             blockers.append(f"daily trade cap reached ({self.trades_today})")
-        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
+        # In paper these three self-heal on the next evaluation, so they are
+        # not reported as blockers — they would clear before you finished
+        # reading them.
+        recoverable = self.paper_auto_reset and not self.is_live
+        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss and not recoverable:
             blockers.append(f"daily loss cap reached (${self.daily_loss:.2f})")
-        if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
+        if (self.max_consecutive_losses
+                and self.consecutive_losses >= self.max_consecutive_losses
+                and not recoverable):
             blockers.append(f"{self.consecutive_losses} consecutive losses")
         balance = self.available_balance()
-        if balance < self.min_balance:
+        if balance < self.min_balance and not recoverable:
             blockers.append(f"balance ${balance:.2f} below minimum ${self.min_balance:.2f}")
         if self.min_margin_pct > 0 and self.settlement.binance_price(
                 self.assets[0] if self.assets else "BTC") <= 0:
@@ -1210,9 +1218,62 @@ class Strategy9099:
             )
         return blockers
 
+    def _paper_recover(self) -> bool:
+        """
+        Put a wiped-out PAPER session back on its feet so it keeps collecting.
+
+        Three brakes can halt trading for good: a drained bankroll, the daily
+        loss cap, and the consecutive-loss cap. The last one is a genuine
+        dead end even in live — it only clears on a winning trade, which can
+        never happen while it is blocking trades.
+
+        In paper that just kills the data. Here the bankroll is topped back
+        up and the brakes released, while the cumulative P&L, the win/loss
+        record and the reset count are all kept: three resets in a day is a
+        damning result, and it should be visible rather than hidden behind a
+        session that quietly stopped.
+
+        Live mode never reaches this — a real account cannot be refilled.
+        """
+        if self.is_live or not self.paper_auto_reset:
+            return False
+        if not isinstance(self.broker, PaperBroker):
+            return False
+        # Never reset out from under a position that is still working.
+        if any(p.phase in ACTIVE_PHASES for p in self.positions.values()):
+            return False
+
+        balance = self.available_balance()
+        # Enough to clear the exchange minimum at the entry price, plus fees.
+        needed = max(self.min_balance, self.min_shares * self.entry_price_min * 1.05)
+        reasons = []
+        if balance < needed:
+            reasons.append(f"bankroll down to ${balance:.2f}")
+        if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
+            reasons.append(f"daily loss cap (${self.daily_loss:.2f})")
+        if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
+            reasons.append(f"{self.consecutive_losses} consecutive losses")
+        if not reasons:
+            return False
+
+        self.paper_resets += 1
+        self.broker.balance = self._starting_bankroll
+        self._balance_cache = (self._starting_bankroll, self.clock())
+        self.daily_loss = 0.0
+        self.consecutive_losses = 0
+        self._log(
+            f"PAPER RESET #{self.paper_resets} — {'; '.join(reasons)}. "
+            f"Bankroll back to ${self._starting_bankroll:.2f}. "
+            f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
+            f"({self.wins}W/{self.losses}L).",
+            "warn",
+        )
+        return True
+
     def check_risk_gates(self, market_id: str = "") -> tuple[bool, str]:
         """Account-level guards, independent of any particular market."""
         self._reset_daily()
+        self._paper_recover()
         if not self.enabled:
             return False, "strategy_disabled"
         if self.kill_switch:
@@ -2502,6 +2563,8 @@ class Strategy9099:
             # Anything here means no entry can happen, whatever the market does.
             "not_trading_because": self._not_trading_because(),
             "api_errors": self.api_errors,
+            "paper_resets": self.paper_resets,
+            "paper_auto_reset": self.paper_auto_reset and not self.is_live,
             "params": self.params(),
             "size_preview": self.explain_size(),
         }
@@ -2675,6 +2738,7 @@ class Strategy9099:
                     "candidates_traded": self.candidates_traded,
                     "candidates_rejected": self.candidates_rejected,
                     "candidates_observed": self.candidates_observed,
+                    "paper_resets": self.paper_resets,
                 },
                 "positions": [p.to_dict() for p in self.positions.values()],
                 "traded_markets": sorted(self.traded_markets),

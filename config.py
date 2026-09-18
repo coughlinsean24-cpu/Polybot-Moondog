@@ -257,6 +257,12 @@ S9099_FIXED_DOLLARS = float(os.getenv("S9099_FIXED_DOLLARS", "25"))
 S9099_MAX_POSITION_PERCENT = float(os.getenv("S9099_MAX_POSITION_PERCENT", "10"))
 # Starting bankroll for paper mode (live mode reads the real USDC balance).
 S9099_PAPER_BANKROLL = float(os.getenv("S9099_PAPER_BANKROLL", "500"))
+# In PAPER mode, top the bankroll back up and clear the loss brakes when they
+# would otherwise halt the session, so data collection continues after a wipe
+# out. Cumulative P&L and the win/loss record are NOT reset — the number of
+# resets is itself a result worth having ("wiped out three times today").
+# Never applies in live mode: there is no refilling a real account.
+S9099_PAPER_AUTO_RESET = os.getenv("S9099_PAPER_AUTO_RESET", "true").lower() == "true"
 # Hard ceiling on any single entry, whatever the sizing maths says.
 S9099_MAX_POSITION_DOLLARS = float(os.getenv("S9099_MAX_POSITION_DOLLARS", "100"))
 # Polymarket rejects orders below 5 shares, so a smaller size is no size.

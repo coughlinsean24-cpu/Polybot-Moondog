@@ -986,6 +986,7 @@ def test_loss_counters_and_daily_loss(engine, feed):
     assert engine.losses == 1
     assert engine.daily_loss == pytest.approx(-pos.realized_pnl, abs=1e-6)
 
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
     engine.max_daily_loss = 0.01
     ok, reason = engine.check_risk_gates()
     assert not ok and "max_daily_loss" in reason
@@ -1351,6 +1352,7 @@ def test_not_trading_because_names_blanket_blockers(engine):
     assert any("not a per-share price" in r for r in engine._not_trading_because())
 
     engine.entry_price_min = 0.90
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
     engine.min_balance = 10_000
     assert any("below minimum" in r for r in engine._not_trading_because())
 
@@ -1381,12 +1383,75 @@ def test_kill_switch_and_gates_block_new_entries(engine, feed):
     assert not ok and "api_unhealthy" in reason
 
     engine.api_errors = 0
+    engine.paper_auto_reset = False    # testing the brake, not the recovery
     engine.consecutive_losses = 5
     ok, reason = engine.check_risk_gates()
     assert not ok and "max_consecutive_losses" in reason
 
     engine.consecutive_losses = 0
     engine.min_balance = 10_000
+    ok, reason = engine.check_risk_gates()
+    assert not ok and "below_min_balance" in reason
+
+
+def test_paper_session_recovers_from_a_wipeout(engine, feed):
+    """
+    Paper is for collecting data. A drained bankroll or a tripped loss brake
+    used to end the session silently — and the consecutive-loss brake is a
+    genuine dead end, since it only clears on a win that can no longer happen.
+    """
+    engine.broker.balance = 1.0          # wiped out
+    engine.consecutive_losses = 9
+    engine.daily_loss = 9_999.0
+    engine.realized_pnl = -512.34        # the record so far
+    engine.wins, engine.losses = 3, 12
+    engine._balance_cache = (1.0, 0.0)
+
+    ok, reason = engine.check_risk_gates()
+    assert ok, f"paper should have recovered, got: {reason}"
+    assert engine.paper_resets == 1
+    assert engine.available_balance() == 500.0
+    assert engine.consecutive_losses == 0
+    assert engine.daily_loss == 0.0
+
+    # The record is kept — the reset count is itself the finding.
+    assert engine.realized_pnl == pytest.approx(-512.34)
+    assert (engine.wins, engine.losses) == (3, 12)
+    assert engine.stats()["paper_resets"] == 1
+
+
+def test_recovery_never_happens_mid_position(engine, feed):
+    """Refilling while a position is working would corrupt its accounting."""
+    market, pos = _open_position(engine, feed)
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+
+    engine.check_risk_gates()
+    assert engine.paper_resets == 0, "not while shares are still held"
+
+    # Once it closes, the next check recovers.
+    feed.set(market.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=pos.tp_qty)
+    engine.on_tick([market])
+    assert pos.phase == Phase.CLOSED
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+    engine.check_risk_gates()
+    assert engine.paper_resets == 1
+
+
+def test_live_mode_never_refills_itself(engine, monkeypatch):
+    """There is no topping up a real account."""
+    engine.broker.balance = 1.0
+    engine._balance_cache = (1.0, 0.0)
+    monkeypatch.setattr(type(engine.broker), "name", "LIVE")
+    assert engine.is_live is True
+    assert engine._paper_recover() is False
+    assert engine.paper_resets == 0
+
+    # And with the switch off, paper behaves like live.
+    monkeypatch.setattr(type(engine.broker), "name", "PAPER")
+    engine.paper_auto_reset = False
+    assert engine._paper_recover() is False
     ok, reason = engine.check_risk_gates()
     assert not ok and "below_min_balance" in reason
 

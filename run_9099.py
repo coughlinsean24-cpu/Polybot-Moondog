@@ -91,6 +91,7 @@ class Runner:
             f"TP fills {s['tp_fills']} | exits {s['emergency_exits']} | "
             f"W/L {s['wins']}/{s['losses']} | "
             f"P&L ${s['realized_pnl']:+.2f} | bal ${s['available_balance']:.2f}"
+            + (f" | WIPEOUTS {s['paper_resets']}" if s.get("paper_resets") else "")
         )
         print(line, flush=True)
         if s["rejection_reasons"]:
