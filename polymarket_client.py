@@ -102,7 +102,23 @@ def get_clob_client() -> ClobClient:
 WINDOW_SECONDS = 300  # 5-minute windows
 
 # All 5-minute Up/Down market assets to scan
-MARKET_ASSETS: list[str] = ["btc", "eth", "sol", "xrp"]
+_ALL_ASSETS: list[str] = ["btc", "eth", "sol", "xrp"]
+
+# Which assets to discover markets for. Every discovered market costs two
+# WebSocket subscriptions on the one shared socket, so this is the biggest
+# lever on how much the feed is carrying.
+MARKET_ASSETS: list[str] = [
+    a.strip().lower()
+    for a in os.getenv("MARKET_ASSETS", ",".join(_ALL_ASSETS)).split(",")
+    if a.strip()
+] or list(_ALL_ASSETS)
+
+# How many 5-minute windows ahead to look. This was 10 — an hour of lookahead,
+# which meant ~96 subscribed tokens of which ~90 belonged to markets that would
+# not trade for up to an hour. No strategy here looks further ahead than its
+# tracking window (300s), so 3 windows is still several times the warning any
+# of them needs.
+MARKET_LOOK_AHEAD = int(os.getenv("MARKET_LOOK_AHEAD", "3"))
 
 # Market discovery runs inside the trading loop; these bound how long it can
 # hold that loop.  Per-request timeout first, then an overall deadline across
@@ -121,7 +137,7 @@ def _generate_window_timestamps(look_ahead: int = 10, look_behind: int = 1) -> l
     """
     Generate unix timestamps for nearby 5-min windows.
     look_behind=1 catches the currently-active window that started in the past.
-    look_ahead=10 finds upcoming windows (~50 minutes ahead).
+    look_ahead=N finds N upcoming windows (see MARKET_LOOK_AHEAD).
     """
     base = _current_window_start()
     timestamps = []
@@ -224,7 +240,9 @@ def fetch_active_markets(assets: list[str] | None = None) -> list[MarketWindow]:
         assets = MARKET_ASSETS
 
     markets: list[MarketWindow] = []
-    timestamps = _generate_window_timestamps(look_ahead=10, look_behind=1)
+    timestamps = _generate_window_timestamps(
+        look_ahead=MARKET_LOOK_AHEAD, look_behind=1
+    )
     url = f"{config.GAMMA_URL}/events"
 
     def _fetch_slug(asset_ts: tuple[str, int]) -> Optional[MarketWindow]:

@@ -2850,9 +2850,46 @@ def _schedule_resolution_check(market_id: str, bid: BidRecord,
     t.start()
 
 
+def discovery_assets() -> list[str]:
+    """
+    Which assets to discover markets for.
+
+    Every discovered market costs two subscriptions on the one shared
+    WebSocket, and a socket carrying four assets an hour deep was spending
+    most of its bandwidth on markets nothing here would trade — which is felt
+    as the market we ARE trading updating late.
+
+    MARKET_ASSETS in .env is the explicit answer when it is set. Otherwise,
+    when the automation that uses the other assets is switched off, discovery
+    follows the one strategy that is actually running rather than fetching
+    and subscribing markets for its own sake. Turning that automation back on
+    restores all of them.
+    """
+    if os.getenv("MARKET_ASSETS"):
+        return list(_pm.MARKET_ASSETS)
+
+    other_automation_live = config.TRADING_ENABLED and not config.MANUAL_ONLY
+    if other_automation_live:
+        return list(_pm.MARKET_ASSETS)
+
+    s9099 = engine.s9099
+    focused = [a.lower() for a in (s9099.assets if s9099 else [])]
+    if not focused:
+        return list(_pm.MARKET_ASSETS)
+    return focused
+
+
 def refresh_watch_list():
-    """Discover new 5-min Up/Down markets (all assets) and prune expired ones."""
-    markets = fetch_active_markets()       # BTC + ETH + SOL + XRP + …
+    """Discover new 5-min Up/Down markets and prune expired ones."""
+    wanted = discovery_assets()
+    if wanted != getattr(engine, "_last_discovery_assets", None):
+        engine._last_discovery_assets = list(wanted)
+        engine.add_log(
+            f"Discovering markets for {', '.join(a.upper() for a in wanted)} "
+            f"({len(wanted) * (_pm.MARKET_LOOK_AHEAD + 2) * 2} WS tokens at most)",
+            "info",
+        )
+    markets = fetch_active_markets(assets=wanted)
     now = datetime.now(timezone.utc)
     added = 0
     asset_added: dict[str, int] = {}
@@ -2861,7 +2898,8 @@ def refresh_watch_list():
         if m.end_time > now + timedelta(seconds=engine.bid_window_close):
             if m.market_id not in engine.watch_list:
                 engine.watch_list[m.market_id] = m
-                engine.ws_feed.subscribe(m.token_id_up, m.token_id_down, m.market_id)
+                engine.ws_feed.subscribe(m.token_id_up, m.token_id_down, m.market_id,
+                                         end_epoch=m.end_time.timestamp())
                 data_rec.record_market(
                     market_id=m.market_id, question=m.question,
                     token_id_up=m.token_id_up, token_id_down=m.token_id_down,
@@ -8576,13 +8614,19 @@ function s9099UpdateUI(st, markets) {
     } else {
       let html = '<table style="width:100%;font-size:11px;"><tr style="color:var(--dim);">' +
         '<th align="left">Market</th><th align="left">Left</th><th align="left">Up</th>' +
-        '<th align="left">Down</th><th align="left">Best side</th><th align="left">Status</th></tr>';
+        '<th align="left">Down</th><th align="left">Best side</th>' +
+        '<th align="left">Feed</th><th align="left">Status</th></tr>';
       rows.sort((a, b) => a.secs - b.secs).forEach(m => {
         const up = m.up_ask || 0, dn = m.down_ask || 0;
         const best = Math.max(up, dn);
         const bestSide = up >= dn ? 'Up' : 'Down';
         const inBand = best >= p.entry_price_min && best <= p.entry_price_max;
         const inWindow = m.secs <= p.max_secs_remaining && m.secs >= p.min_secs_remaining;
+        const age = (m.price_age === undefined || m.price_age === null) ? -1 : m.price_age;
+        const ageTxt = age < 0 ? '--' : age.toFixed(1) + 's';
+        const ageCol = age < 0 ? 'var(--dim)'
+                     : age > 15 ? 'var(--red)'
+                     : age > 5 ? 'var(--yellow)' : 'var(--dim)';
         let status = '', color = 'var(--dim)';
         if (inBand && inWindow) { status = 'QUALIFIES'; color = 'var(--green)'; }
         else if (inBand) { status = 'in band, wrong time'; color = 'var(--yellow)'; }
@@ -8594,6 +8638,10 @@ function s9099UpdateUI(st, markets) {
           '<td style="padding:3px 6px;">$' + up.toFixed(2) + '</td>' +
           '<td style="padding:3px 6px;">$' + dn.toFixed(2) + '</td>' +
           '<td style="padding:3px 6px;">' + bestSide + ' $' + best.toFixed(2) + '</td>' +
+          // How long since this market's book last said anything. A price that
+          // has stopped moving looks exactly like a quiet market until you can
+          // see its age.
+          '<td style="padding:3px 6px;color:' + ageCol + ';">' + ageTxt + '</td>' +
           '<td style="padding:3px 6px;color:' + color + ';">' + status + '</td></tr>';
       });
       lm.innerHTML = html + '</table>';

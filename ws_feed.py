@@ -13,6 +13,7 @@ Usage:
     feed.stop()
 """
 
+import os
 import asyncio
 import json
 import threading
@@ -32,6 +33,20 @@ MAX_RECONNECTS = 50        # give up after this many consecutive failures
 SUB_BATCH_SIZE = 50        # max tokens per subscription message
 STALE_THRESHOLD = 60.0     # seconds before a token's data is considered stale
 RESUB_COOLDOWN = 30.0      # min seconds between re-sub attempts for the same token
+
+# How far ahead of a market's close its tokens are worth chasing.
+#
+# A 5-min market an hour out has never traded, so it has no book and sends
+# nothing — which the stale check could not tell apart from a subscription
+# that had genuinely dropped. Every quiet far-future token was therefore
+# re-subscribed every RESUB_COOLDOWN seconds, forever, and every re-sub pulls
+# a full book snapshot back down the one shared socket. With four assets and
+# an hour of lookahead that was ~90 pointless snapshots per cycle competing
+# with the one market actually being traded.
+#
+# Silence from a market that has not started yet is not a fault, so it is not
+# chased. 15 minutes is well beyond any strategy's tracking window.
+RESUB_HORIZON = float(os.getenv("WS_RESUB_HORIZON", "900"))
 
 
 @dataclass
@@ -242,6 +257,8 @@ class PriceFeed:
 
         # token_id → market_id (for dashboard updates)
         self._token_to_market: dict[str, str] = {}
+        # token_id -> market close epoch, for the resub horizon only.
+        self._token_end: dict[str, float] = {}
 
         # Set of asset_ids currently subscribed
         self._subscribed: set[str] = set()
@@ -302,10 +319,19 @@ class PriceFeed:
         self.connected = False
         log.info("WebSocket price feed stopped")
 
-    def subscribe(self, token_id_up: str, token_id_down: str, market_id: str):
-        """Subscribe to price updates for a market's Up and Down tokens."""
+    def subscribe(self, token_id_up: str, token_id_down: str, market_id: str,
+                  end_epoch: float | None = None):
+        """
+        Subscribe to price updates for a market's Up and Down tokens.
+
+        `end_epoch` is when the market closes. It is optional and only used to
+        decide whether a silent token is worth chasing (see RESUB_HORIZON) —
+        prices are handled identically either way.
+        """
         with self._lock:
             for tid in (token_id_up, token_id_down):
+                if end_epoch is not None:
+                    self._token_end[tid] = end_epoch
                 if tid not in self._subscribed:
                     self._pending_subs.append(tid)
                     self._subscribed.add(tid)
@@ -321,6 +347,7 @@ class PriceFeed:
                 self._subscribed.discard(tid)
                 self._prices.pop(tid, None)
                 self._token_to_market.pop(tid, None)
+                self._token_end.pop(tid, None)
 
     def get_price(self, token_id: str) -> LivePrice:
         """Get the latest price for a token. Returns LivePrice (check .valid)."""
@@ -337,17 +364,36 @@ class PriceFeed:
         down = self._prices.get(token_id_down, LivePrice())
         return up.valid and down.valid
 
+    def in_resub_horizon(self, token_id: str) -> bool:
+        """
+        Is this token close enough to its market's close to be worth chasing?
+
+        Unknown close time means yes — a token nothing told us about is not
+        something to quietly stop maintaining.
+        """
+        end = self._token_end.get(token_id)
+        if end is None:
+            return True
+        return (end - time.time()) <= RESUB_HORIZON
+
     def get_stale_tokens(self, resub_eligible_only: bool = False) -> list[str]:
         """Return token_ids that are subscribed but haven't received data recently.
-        If resub_eligible_only=True, only return tokens whose cooldown has expired."""
+        If resub_eligible_only=True, only return tokens whose cooldown has expired
+        AND whose market is near enough for the silence to mean anything."""
         now = time.time()
         stale = []
         for tid in self._subscribed:
             p = self._prices.get(tid)
             if p is None or not p.valid or (now - p.timestamp > STALE_THRESHOLD):
-                if resub_eligible_only and p is not None:
+                if resub_eligible_only:
+                    # A market that has not started trading yet is silent
+                    # because there is nothing to say, not because the
+                    # subscription dropped. Chasing it costs a full book
+                    # snapshot on the socket the live market shares.
+                    if not self.in_resub_horizon(tid):
+                        continue
                     # Fixed cooldown — no exponential backoff (was causing stale tokens to become unrecoverable)
-                    if now - p.last_resub < RESUB_COOLDOWN:
+                    if p is not None and now - p.last_resub < RESUB_COOLDOWN:
                         continue
                 stale.append(tid)
         return stale
@@ -562,6 +608,15 @@ class PriceFeed:
 
                 best_ask = change.get("best_ask")
                 best_bid = change.get("best_bid")
+
+                # A change that carries neither side tells us nothing about
+                # the top of book. Stamping it fresh anyway made a token whose
+                # quoted price had stopped moving look perfectly healthy, so
+                # the stale check never fired and the resubscribe that would
+                # have refilled the book never ran — a stuck price that
+                # reported itself as live.
+                if best_ask is None and best_bid is None:
+                    continue
 
                 if best_ask is not None:
                     price.best_ask = float(best_ask)
