@@ -78,8 +78,19 @@ _BANNER_CASES = [
     ("healthy", "socketConnected=true; botRunning=true; "
                 "lastStateAt=Date.now(); lastTickAt=Date.now(); loopError='';",
      None),
-    ("socket dropped", "socketConnected=false; lastStateAt=Date.now()-45000;",
+    ("socket dropped for good",
+     "socketConnected=false; socketDownSince=Date.now()-45000; "
+     "lastStateAt=Date.now()-45000;",
      "DISCONNECTED"),
+    # Socket.IO reconnects in about a second; a blip that short is not an alarm.
+    ("socket blipped, still inside the grace period",
+     "socketConnected=false; socketDownSince=Date.now()-1000; "
+     "lastStateAt=Date.now()-1000;",
+     None),
+    ("socket flapping", "socketConnected=true; lastStateAt=Date.now(); "
+                        "lastTickAt=Date.now(); "
+                        "reconnectTimes=[Date.now()-5000,Date.now()-3000,Date.now()-1000];",
+     "CONNECTION UNSTABLE"),
     ("loop wedged, tick thread alive",
      "socketConnected=true; lastStateAt=Date.now()-45000; lastTickAt=Date.now(); "
      "loopAge=45; loopPhase='refresh_markets'; loopError='';",
@@ -142,3 +153,77 @@ def test_banner_names_the_right_failure(name, setup, expected):
         assert msg is None, f"{name}: unexpected banner {msg!r}"
     else:
         assert msg and expected in msg, f"{name}: got {msg!r}"
+
+
+# ── One dashboard per port ───────────────────────────────────────────────
+# Werkzeug sets SO_REUSEADDR, and on Windows that lets a second process bind
+# a port another is already listening on. Both accept connections, and the
+# browser's Socket.IO session flaps between them.
+
+def test_port_probe_detects_a_listener(monkeypatch):
+    import socket as _socket
+    import threading
+
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(5)
+
+    stop = threading.Event()
+
+    def _accept():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_accept, daemon=True)
+    t.start()
+    try:
+        assert wd._port_is_taken(port) is True
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        srv.close()
+
+    # Closed again — and a free port must not read as taken, or every start
+    # would refuse to run.
+    assert wd._port_is_taken(port) is False
+
+
+def test_start_refuses_rather_than_binding_a_second_listener(monkeypatch, capsys):
+    """Two servers on one port is worse than not starting: the page would show
+    one copy's numbers while the other holds the positions."""
+    monkeypatch.setattr(wd, "_port_is_taken", lambda *a, **k: True)
+    monkeypatch.setattr(wd, "PID_FILE", "/nonexistent/dashboard.pid")
+
+    with pytest.raises(SystemExit) as exc:
+        wd._kill_old_instances()
+    assert exc.value.code == 1
+    assert "ALREADY RUNNING" in capsys.readouterr().out
+
+
+def test_a_free_port_starts_normally_and_records_the_pid(monkeypatch, tmp_path):
+    pid_file = tmp_path / "dashboard.pid"
+    monkeypatch.setattr(wd, "_port_is_taken", lambda *a, **k: False)
+    monkeypatch.setattr(wd, "PID_FILE", str(pid_file))
+
+    wd._kill_old_instances()        # must not raise, must not exit
+    assert pid_file.read_text().strip() == str(os.getpid())
+
+
+def test_a_stale_pid_file_does_not_kill_this_process(monkeypatch, tmp_path):
+    """The pidfile says who to stop — never us."""
+    pid_file = tmp_path / "dashboard.pid"
+    pid_file.write_text(str(os.getpid()))
+    killed = []
+    monkeypatch.setattr(wd, "PID_FILE", str(pid_file))
+    monkeypatch.setattr(wd, "_port_is_taken", lambda *a, **k: False)
+    monkeypatch.setattr(wd, "_kill_pid", lambda pid: killed.append(pid) or True)
+
+    wd._kill_old_instances()
+    assert killed == []

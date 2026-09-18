@@ -12,6 +12,7 @@ Open:    http://localhost:5050
 """
 
 import io
+import atexit
 import os
 import re
 import sys
@@ -257,7 +258,14 @@ def get_asset_filter(asset: str) -> dict:
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "polybot-snipez-2026")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5050"))
+
+# ping_timeout defaults to 20s, which a busy render or a momentary stall can
+# overrun — and every overrun is a visible disconnect on the page. The ping
+# interval stays at the default so a genuinely dead link is still noticed
+# promptly; only the patience for the reply is raised.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    ping_interval=25, ping_timeout=60)
 
 # ── Bot-loop staleness thresholds (seconds) ─────────────────────────────────
 # The loop normally completes a cycle every 0.5-1.0s.  Past LOOP_SLOW_SECS a
@@ -6250,11 +6258,23 @@ let socketConnected = false;
 //   state         — the trading loop, which is what actually places orders
 // A frozen screen used to look identical in all three cases.
 const LOOP_STALE_SECS = {{ loop_stale_secs }};
+// Socket.IO reconnects on its own in about a second. Painting a full-width
+// red banner for a blip that short is noise pretending to be an alarm, so a
+// drop has to outlast this before it is worth saying anything about.
+const SOCKET_GRACE_SECS = 4;
 let lastStateAt = Date.now();   // start the clock at page load, not at first push
 let lastTickAt = 0;
 let loopAge = -1;
 let loopPhase = '';
 let loopError = '';
+let socketDownSince = 0;
+let reconnectTimes = [];        // epoch ms of each reconnect, last 60s
+
+function recentReconnects() {
+  const cutoff = Date.now() - 60000;
+  reconnectTimes = reconnectTimes.filter(t => t >= cutoff);
+  return reconnectTimes.length;
+}
 
 function updateStaleBanner() {
   const el = document.getElementById('stale-banner');
@@ -6267,11 +6287,22 @@ function updateStaleBanner() {
   // A stopped bot pushes nothing and that is correct, not a stall.
   const expectUpdates = botRunning;
 
-  if (!socketConnected) {
+  const downFor = socketDownSince ? (now - socketDownSince) / 1000 : 0;
+  const flaps = recentReconnects();
+
+  if (!socketConnected && downFor > SOCKET_GRACE_SECS) {
     msg = 'DISCONNECTED FROM BOT — everything below is frozen'
-        + (stateAge > 0 ? ' (last update ' + Math.round(stateAge) + 's ago)' : '')
+        + (stateAge >= 1 ? ' (last update ' + Math.round(stateAge) + 's ago)' : '')
         + '. The bot may still be trading; this page is not watching it.';
     bg = '#2d0d0d'; fg = 'var(--red)'; border = 'var(--red)';
+  } else if (!socketConnected) {
+    msg = '';                       // inside the grace period — it is reconnecting
+  } else if (flaps >= 3) {
+    // Reconnecting over and over is its own fault, and it is not the same as
+    // being offline: the numbers keep arriving, just from an unreliable link.
+    msg = 'CONNECTION UNSTABLE — reconnected ' + flaps + ' times in the last minute. '
+        + 'If this keeps up, check that only one dashboard is running on this port.';
+    bg = '#2d1a00'; fg = 'var(--yellow)'; border = 'var(--yellow)';
   } else if (!expectUpdates) {
     msg = '';
   } else if (stateAge > LOOP_STALE_SECS && tickAge >= 0 && tickAge < 3) {
@@ -6312,14 +6343,17 @@ function switchTab(tab) {
 
 // ── Connection status feedback ──
 socket.on('connect', () => {
+  if (socketDownSince) reconnectTimes.push(Date.now());
   socketConnected = true;
+  socketDownSince = 0;
   console.log('SocketIO connected');
   document.getElementById('btn-run').style.opacity = '1';
   updateStaleBanner();
 });
-socket.on('disconnect', () => {
+socket.on('disconnect', (reason) => {
   socketConnected = false;
-  console.log('SocketIO disconnected');
+  socketDownSince = socketDownSince || Date.now();
+  console.log('SocketIO disconnected:', reason);
   document.getElementById('btn-run').style.opacity = '0.5';
   updateStaleBanner();
 });
@@ -8552,28 +8586,119 @@ function s9099UpdateUI(st, markets) {
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _kill_old_instances():
-    """Kill any already-running web_dashboard.py processes (prevents duplicates)."""
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dashboard.pid")
+
+
+def _port_is_taken(port: int = DASHBOARD_PORT) -> bool:
+    """Is something already listening on the dashboard port?"""
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int) -> bool:
     import subprocess
     try:
-        out = subprocess.check_output(
-            ['wmic', 'process', 'where',
-             "name='python.exe' and CommandLine like '%web_dashboard%'",
-             'get', 'ProcessId'],
-            text=True, stderr=subprocess.DEVNULL
-        )
-        my_pid = os.getpid()
-        for line in out.strip().splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pid = int(line)
-                if pid != my_pid:
-                    print(f"  Killing old instance (PID {pid})...")
-                    subprocess.call(['taskkill', '/F', '/PID', str(pid)],
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+        if os.name == "nt":
+            subprocess.call(["taskkill", "/F", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.kill(pid, 9)
+        return True
     except Exception:
-        pass  # WMIC not available or no matches — fine
+        return False
+
+
+def _kill_old_instances():
+    """
+    Make sure exactly one dashboard is serving the port.
+
+    This used to shell out to `wmic`, which Microsoft deprecated and then
+    removed (Windows 11 24H2), inside a bare `except Exception: pass` — so on
+    a current Windows it silently did nothing.  That matters more than it
+    sounds: Werkzeug sets SO_REUSEADDR, and on Windows that lets a SECOND
+    process bind a port another process is already listening on.  Both then
+    accept connections, the browser's Socket.IO session lands on whichever
+    answers, and a later poll landing on the other one is an unknown session
+    — which the client sees as a disconnect, reconnects, and does again.  The
+    symptom is a dashboard that flaps between connected and disconnected
+    while the numbers on it come from whichever copy answered last.
+
+    The port itself is the reliable signal here, not a process listing, so
+    that is what this checks.  A pidfile says who to stop; the port says
+    whether it worked.
+    """
+    import subprocess
+    old_pid = None
+    try:
+        with open(PID_FILE) as fh:
+            old_pid = int(fh.read().strip())
+    except Exception:
+        old_pid = None
+
+    if old_pid and old_pid != os.getpid():
+        if _kill_pid(old_pid):
+            print(f"  Stopped previous dashboard (PID {old_pid})")
+            for _ in range(20):
+                if not _port_is_taken():
+                    break
+                time.sleep(0.25)
+
+    # Legacy path: a dashboard started before there was a pidfile. Best effort,
+    # and no longer load-bearing — the port check below is what decides.
+    if _port_is_taken():
+        try:
+            out = subprocess.check_output(
+                ['wmic', 'process', 'where',
+                 "name='python.exe' and CommandLine like '%web_dashboard%'",
+                 'get', 'ProcessId'],
+                text=True, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            my_pid = os.getpid()
+            for line in out.strip().splitlines():
+                line = line.strip()
+                if line.isdigit() and int(line) != my_pid:
+                    print(f"  Killing old instance (PID {line})...")
+                    _kill_pid(int(line))
+            for _ in range(20):
+                if not _port_is_taken():
+                    break
+                time.sleep(0.25)
+        except Exception:
+            pass
+
+    if _port_is_taken():
+        # Starting anyway would bind a second listener on Windows and give the
+        # browser two servers to flap between, which is worse than not
+        # starting: the page would show one copy's numbers while the other
+        # holds the positions.
+        print(
+            f"\n  ANOTHER DASHBOARD IS ALREADY RUNNING on port {DASHBOARD_PORT}.\n"
+            f"  This one is stopping rather than starting a second copy —\n"
+            f"  two servers on one port make the page flap between them.\n\n"
+            f"  Close the other window (or end its python task), then start again.\n"
+        )
+        sys.exit(1)
+
+    try:
+        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        with open(PID_FILE, "w") as fh:
+            fh.write(str(os.getpid()))
+        atexit.register(_clear_pid_file)
+    except Exception:
+        pass    # the pidfile is a convenience; the port check is the guard
+
+
+def _clear_pid_file():
+    try:
+        with open(PID_FILE) as fh:
+            if int(fh.read().strip()) == os.getpid():
+                os.unlink(PID_FILE)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
@@ -8618,4 +8743,5 @@ if __name__ == "__main__":
     # ── Bot does NOT auto-start — user must click Start in dashboard ──
     engine.add_log("Waiting for manual start from dashboard...", "info")
 
-    socketio.run(app, host="0.0.0.0", port=5050, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=DASHBOARD_PORT, debug=False,
+                 allow_unsafe_werkzeug=True)
