@@ -24,9 +24,26 @@ import threading
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
-# Fix Windows console encoding before any output
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Fix Windows console encoding before any output.
+#
+# Only when the stream really is a raw console that is not already UTF-8:
+# wrapping unconditionally also wraps whatever a test runner or supervisor has
+# substituted for stdout, and the discarded wrapper closes that file on
+# collection, which takes the host process's output with it.
+def _force_utf8(stream):
+    try:
+        if getattr(stream, "encoding", "").lower().replace("-", "") == "utf8":
+            return stream
+        buf = getattr(stream, "buffer", None)
+        if buf is None:
+            return stream
+        return io.TextIOWrapper(buf, encoding="utf-8", errors="replace")
+    except Exception:
+        return stream
+
+
+sys.stdout = _force_utf8(sys.stdout)
+sys.stderr = _force_utf8(sys.stderr)
 
 import requests as _requests
 
@@ -241,6 +258,13 @@ def get_asset_filter(asset: str) -> dict:
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "polybot-snipez-2026")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# ── Bot-loop staleness thresholds (seconds) ─────────────────────────────────
+# The loop normally completes a cycle every 0.5-1.0s.  Past LOOP_SLOW_SECS a
+# cycle is worth a log line; past LOOP_STALE_SECS the dashboard stops
+# pretending the numbers on screen are current.
+LOOP_SLOW_SECS = 5.0
+LOOP_STALE_SECS = 6.0
 
 # ── Dashboard password (empty = no auth required) ──────────────────────────
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
@@ -1760,6 +1784,31 @@ class Engine:
         self.s9099: Strategy9099 | None = None  # Initialized after ws_feed.start()
         self._s9099_saved_cfg: dict | None = None
 
+        # ── Bot-loop heartbeat ──
+        # The trading loop is one thread: market refresh, bid placement, arb and
+        # the 90/99 strategy all run in it, and a slow HTTP call or a repeating
+        # exception stalls every one of them at once.  Nothing used to say so —
+        # the dashboard simply stopped updating and looked live.  These fields
+        # let push_state() (and the independent 200ms price-tick thread) report
+        # how old the last completed cycle is, and which step it was on.
+        self.loop_beat = 0.0        # time.time() at the end of the last cycle
+        self.loop_cycles = 0
+        self.loop_phase = "idle"    # coarse step name, for the stall log line
+        self.loop_phase_since = 0.0
+        self.loop_last_error = ""
+        self.loop_slow_logged = 0.0
+
+    def beat(self, phase: str):
+        """Mark the loop as entering `phase`. Cheap enough to call every cycle."""
+        self.loop_phase = phase
+        self.loop_phase_since = time.time()
+
+    def loop_age(self) -> float:
+        """Seconds since the trading loop last completed a full cycle."""
+        if not self.loop_beat:
+            return -1.0
+        return time.time() - self.loop_beat
+
     def init_arb(self):
         """Initialize the arb engine (call after ws_feed is ready)."""
         self.arb = ArbEngine(self.ws_feed)
@@ -2959,11 +3008,13 @@ def bot_loop():
 
             # Refresh markets
             if now_ts - last_market_refresh >= config.MARKET_POLL_INTERVAL:
+                engine.beat("refresh_markets")
                 refresh_watch_list()
                 last_market_refresh = now_ts
 
             # Post limit bids on both sides of markets in window
             if config.TRADING_ENABLED:
+                engine.beat("bids")
                 _bid_log_due = (now_ts - getattr(engine, '_last_bid_eval_log', 0)) >= 2.0
                 # Debug: log closest market per asset every 10s
                 if (now_ts - getattr(engine, '_last_bid_debug', 0)) >= 10.0 and engine.watch_list:
@@ -3020,6 +3071,7 @@ def bot_loop():
 
             # Check fills
             if now_ts - last_fill_check >= 3.0:
+                engine.beat("check_fills")
                 check_fills()
                 last_fill_check = now_ts
 
@@ -3028,6 +3080,7 @@ def bot_loop():
             # auto_trade_enabled, so without it the arb engine would keep
             # placing its own orders while "auto-trade" read as OFF.
             if engine.arb and engine.arb.enabled and not config.MANUAL_ONLY:
+                engine.beat("arb")
                 for _arb_mid, _arb_mkt in engine.watch_list.items():
                     if not engine.running:
                         break
@@ -3045,6 +3098,7 @@ def bot_loop():
             # unless every live gate in .env is open), so this is safe to
             # call whatever the dashboard's other toggles say.
             if engine.s9099 and engine.s9099.enabled:
+                engine.beat("s9099")
                 try:
                     engine.s9099.on_tick(list(engine.watch_list.values()))
                 except Exception as _e9099:
@@ -3056,14 +3110,17 @@ def bot_loop():
                 last_ob_monitor = now_ts
 
             # Update price cache
+            engine.beat("update_prices")
             update_prices()
 
             # Push full state to browser every 1.5s (prices covered by 200ms tick)
             if now_ts - last_push >= 1.5:
+                engine.beat("push_state")
                 push_state()
                 last_push = now_ts
 
             # Record ticks
+            engine.beat("record_ticks")
             for mid, mkt in engine.watch_list.items():
                 secs = seconds_until(mkt.end_time)
                 if secs <= 0 or secs > 300:
@@ -3142,6 +3199,25 @@ def bot_loop():
                 )
                 last_heartbeat = now_ts
 
+            # ── Cycle complete ──
+            # cycle_secs is work only (the sleep comes after), which is what
+            # "how long was everything paused for" actually means.
+            engine.beat("sleep")
+            engine.loop_beat = time.time()
+            engine.loop_cycles += 1
+            engine.loop_last_error = ""
+
+            cycle_secs = engine.loop_beat - now_ts
+            if cycle_secs >= LOOP_SLOW_SECS and (
+                engine.loop_beat - engine.loop_slow_logged >= 30
+            ):
+                engine.loop_slow_logged = engine.loop_beat
+                engine.add_log(
+                    f"Slow cycle: {cycle_secs:.1f}s "
+                    f"(trading, arb and 90/99 were all paused for that long)",
+                    "warn",
+                )
+
             # Sleep
             has_active = any(
                 engine.bid_window_close <= seconds_until(mkt.end_time) <= engine.bid_window_open
@@ -3151,8 +3227,17 @@ def bot_loop():
 
         except Exception as e:
             log_error("bot_loop", e)
-            engine.add_log(f"Error: {e}", "error")
+            engine.add_log(f"Error in {engine.loop_phase}: {e}", "error")
             engine.errors += 1
+            engine.loop_last_error = f"{engine.loop_phase}: {e}"
+            # A raise above skips push_state(), so a loop that throws every
+            # cycle leaves the browser showing frozen numbers that still look
+            # live.  Push once here — the payload carries loop_last_error, so
+            # the page can say what is wrong instead of silently aging.
+            try:
+                push_state()
+            except Exception:
+                pass
             time.sleep(5)
 
     # Cleanup
@@ -3288,6 +3373,12 @@ def _price_tick_loop():
                 if payload:
                     payload["ws"] = bf.connected
                     payload["age"] = round(bf.price_age(), 1) if bf.price_age() >= 0 else -1
+                    # This thread is independent of the trading loop, so it
+                    # keeps reporting while the loop is wedged — that is the
+                    # only way the page can see a stall rather than guess at
+                    # a dropped socket.
+                    payload["loop_age"] = round(engine.loop_age(), 1)
+                    payload["loop_phase"] = engine.loop_phase
                     socketio.emit("price_tick", payload)
         except Exception:
             pass
@@ -3372,6 +3463,12 @@ def push_state():
         "daily_spend": round(engine.daily_spend, 2),
         "max_daily_spend": config.MAX_DAILY_SPEND,
         "errors": engine.errors,
+        # Loop heartbeat — lets the page tell "the bot is quiet" apart from
+        # "the bot stopped updating and this screen is a photograph".
+        "loop_age": round(engine.loop_age(), 1),
+        "loop_phase": engine.loop_phase,
+        "loop_cycles": engine.loop_cycles,
+        "loop_error": engine.loop_last_error,
         "ws_connected": ws_stats["connected"],
         "ws_messages": ws_stats["messages"],
         "ws_valid": ws_stats.get("valid_tokens", 0),
@@ -3441,6 +3538,7 @@ def index():
         sv_scanner_auto_bid=engine.scanner_auto_bid,
         sv_manual_exit_default=(config.MANUAL_EXIT_PRICE if config.MANUAL_EXIT_ENABLED else 0),
         sv_manual_only=config.MANUAL_ONLY,
+        loop_stale_secs=LOOP_STALE_SECS,
     )
 
 
@@ -5118,6 +5216,13 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
+<!-- ── Stale-data banner ──
+     Every number on this page is a snapshot pushed by the bot.  When the push
+     stops, nothing about the page changes — it just keeps showing the last one,
+     which reads exactly like a quiet market.  This says so out loud. -->
+<div id="stale-banner" style="display:none;padding:10px 16px;margin:0 0 10px;border-radius:8px;
+     font-size:13px;font-weight:700;text-align:center;"></div>
+
 <!-- ── Strategy Tabs ── -->
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('limit-bid')" id="tab-btn-limit-bid">Limit Bid Strategy</button>
@@ -6138,6 +6243,65 @@ let scannerRunning = false;
 let scannerAutoBid = {{ 'true' if sv_scanner_auto_bid else 'false' }};
 let socketConnected = false;
 
+// ── Freshness tracking ──
+// The page has three independent liveness signals and they fail separately:
+//   socket        — the browser's link to the server
+//   price_tick    — its own 200ms daemon thread
+//   state         — the trading loop, which is what actually places orders
+// A frozen screen used to look identical in all three cases.
+const LOOP_STALE_SECS = {{ loop_stale_secs }};
+let lastStateAt = Date.now();   // start the clock at page load, not at first push
+let lastTickAt = 0;
+let loopAge = -1;
+let loopPhase = '';
+let loopError = '';
+
+function updateStaleBanner() {
+  const el = document.getElementById('stale-banner');
+  if (!el) return;
+  const now = Date.now();
+  const stateAge = lastStateAt ? (now - lastStateAt) / 1000 : -1;
+  const tickAge = lastTickAt ? (now - lastTickAt) / 1000 : -1;
+  let msg = '', bg = '', fg = '', border = '';
+
+  // A stopped bot pushes nothing and that is correct, not a stall.
+  const expectUpdates = botRunning;
+
+  if (!socketConnected) {
+    msg = 'DISCONNECTED FROM BOT — everything below is frozen'
+        + (stateAge > 0 ? ' (last update ' + Math.round(stateAge) + 's ago)' : '')
+        + '. The bot may still be trading; this page is not watching it.';
+    bg = '#2d0d0d'; fg = 'var(--red)'; border = 'var(--red)';
+  } else if (!expectUpdates) {
+    msg = '';
+  } else if (stateAge > LOOP_STALE_SECS && tickAge >= 0 && tickAge < 3) {
+    // Socket is fine and the tick thread is alive, so the trading loop itself
+    // is wedged — bids, arb and the 90/99 strategy are all stopped.
+    msg = 'BOT LOOP STALLED — no cycle for ' + Math.round(Math.max(stateAge, loopAge)) + 's'
+        + (loopPhase ? ' (stuck in: ' + loopPhase + ')' : '')
+        + '. No orders are being placed or managed.'
+        + (loopError ? ' Last error — ' + loopError : '');
+    bg = '#2d1a00'; fg = 'var(--yellow)'; border = 'var(--yellow)';
+  } else if (stateAge > LOOP_STALE_SECS) {
+    msg = 'NO DATA FROM BOT for ' + Math.round(stateAge) + 's — the numbers below are stale.';
+    bg = '#2d0d0d'; fg = 'var(--red)'; border = 'var(--red)';
+  } else if (loopError) {
+    msg = 'Bot loop error in ' + loopPhase + ' — ' + loopError;
+    bg = '#2d1a00'; fg = 'var(--yellow)'; border = 'var(--yellow)';
+  }
+
+  if (!msg) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'block';
+  el.style.background = bg;
+  el.style.color = fg;
+  el.style.border = '1px solid ' + border;
+  el.textContent = msg;
+}
+setInterval(updateStaleBanner, 1000);
+
 // ── Tab Switching ──
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -6151,11 +6315,13 @@ socket.on('connect', () => {
   socketConnected = true;
   console.log('SocketIO connected');
   document.getElementById('btn-run').style.opacity = '1';
+  updateStaleBanner();
 });
 socket.on('disconnect', () => {
   socketConnected = false;
   console.log('SocketIO disconnected');
   document.getElementById('btn-run').style.opacity = '0.5';
+  updateStaleBanner();
 });
 socket.on('connect_error', (err) => {
   console.error('SocketIO connect error:', err);
@@ -6522,6 +6688,11 @@ function fmtTime(secs) {
 // ── Receive full state ──
 socket.on('state', (d) => {
   botRunning = d.running;
+  lastStateAt = Date.now();
+  if (d.loop_age !== undefined) loopAge = d.loop_age;
+  if (d.loop_phase !== undefined) loopPhase = d.loop_phase;
+  loopError = d.loop_error || '';
+  updateStaleBanner();
 
   // Run button
   const btn = document.getElementById('btn-run');
@@ -7422,6 +7593,9 @@ function ahClearEvents() {
 
 // ── Fast per-asset price tick (200ms) ──
 socket.on('price_tick', (d) => {
+  lastTickAt = Date.now();
+  if (d.loop_age !== undefined) loopAge = d.loop_age;
+  if (d.loop_phase !== undefined) loopPhase = d.loop_phase;
   const assets = ['BTC','ETH','SOL','XRP'];
   assets.forEach(a => {
     const t = d[a];

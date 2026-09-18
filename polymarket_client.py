@@ -4,13 +4,15 @@ All price data comes EXCLUSIVELY from Polymarket's own CLOB.
 No external BTC price feeds. The orderbook IS the signal.
 """
 
+import os
 import json
 import time
 import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                TimeoutError as FuturesTimeout)
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs
@@ -101,6 +103,12 @@ WINDOW_SECONDS = 300  # 5-minute windows
 
 # All 5-minute Up/Down market assets to scan
 MARKET_ASSETS: list[str] = ["btc", "eth", "sol", "xrp"]
+
+# Market discovery runs inside the trading loop; these bound how long it can
+# hold that loop.  Per-request timeout first, then an overall deadline across
+# every slug in the poll.
+MARKET_FETCH_TIMEOUT = float(os.getenv("MARKET_FETCH_TIMEOUT", "4"))
+MARKET_FETCH_DEADLINE = float(os.getenv("MARKET_FETCH_DEADLINE", "8"))
 
 
 def _current_window_start() -> int:
@@ -223,7 +231,7 @@ def fetch_active_markets(assets: list[str] | None = None) -> list[MarketWindow]:
         asset, ts = asset_ts
         slug = f"{asset}-updown-5m-{ts}"
         try:
-            resp = requests.get(url, params={"slug": slug}, timeout=8)
+            resp = requests.get(url, params={"slug": slug}, timeout=MARKET_FETCH_TIMEOUT)
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -241,13 +249,37 @@ def fetch_active_markets(assets: list[str] | None = None) -> list[MarketWindow]:
         (a, ts) for a in assets for ts in timestamps
     ]
 
-    # Fetch all slugs in parallel
-    with ThreadPoolExecutor(max_workers=min(24, len(tasks))) as pool:
+    # Fetch all slugs in parallel, under a hard overall deadline.
+    #
+    # This runs inside the single trading loop, so however long it takes is
+    # time in which no bid is placed, cancelled or managed — and a slow Gamma
+    # response used to be able to hold that loop for (waves x timeout)
+    # seconds with nothing on screen saying so.  A poll that comes back short
+    # is harmless: these slugs are regenerated from the clock every poll, so
+    # whatever is missed is picked up on the next one, 60s later and long
+    # before the window it belongs to opens.
+    pool = ThreadPoolExecutor(max_workers=min(24, len(tasks)))
+    try:
         futures = {pool.submit(_fetch_slug, task): task for task in tasks}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                markets.append(result)
+        timed_out = 0
+        try:
+            for future in as_completed(futures, timeout=MARKET_FETCH_DEADLINE):
+                result = future.result()
+                if result:
+                    markets.append(result)
+        except FuturesTimeout:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+                    timed_out += 1
+            log.warning(
+                f"Market discovery hit its {MARKET_FETCH_DEADLINE:.0f}s deadline "
+                f"with {timed_out} of {len(tasks)} slugs outstanding — "
+                f"keeping the {len(markets)} already returned"
+            )
+    finally:
+        # Do not block the trading loop waiting on threads we gave up on.
+        pool.shutdown(wait=False)
 
     asset_counts = {}
     for m in markets:
