@@ -5873,7 +5873,7 @@ DASHBOARD_HTML = r"""
   <div class="stat-card"><div class="stat-label">TP Fills (queue-adj)</div><div class="stat-value green" id="s9099-tpfills">0</div></div>
   <div class="stat-card"><div class="stat-label">99&cent; Price Reached</div><div class="stat-value" id="s9099-reached">0</div></div>
   <div class="stat-card"><div class="stat-label">Emergency Exits</div><div class="stat-value" id="s9099-exits">0</div></div>
-  <div class="stat-card" title="How many times the paper bankroll was wiped out and refilled. Cumulative P&L is NOT reset."><div class="stat-label">Paper Wipeouts</div><div class="stat-value" id="s9099-resets">0</div></div>
+  <div class="stat-card" title="Bankroll actually depleted and refilled / loss brakes cleared without touching the balance. Cumulative P&L is never reset."><div class="stat-label">Wipeouts / Brakes</div><div class="stat-value" id="s9099-resets">0</div></div>
   <div class="stat-card"><div class="stat-label">Crossings (all levels)</div><div class="stat-value" id="s9099-seen">0</div></div>
   <div class="stat-card"><div class="stat-label" id="s9099-entry-label">At Entry Level</div><div class="stat-value" id="s9099-entry-seen">0</div></div>
   <div class="stat-card"><div class="stat-label">Traded</div><div class="stat-value" id="s9099-traded">0</div></div>
@@ -7963,7 +7963,7 @@ function s9099UpdateUI(st, markets) {
   setTxt('s9099-tpfills', st.tp_fills || 0);
   setTxt('s9099-reached', st.tp_price_reached || 0);
   setTxt('s9099-exits', st.emergency_exits || 0);
-  setTxt('s9099-resets', st.paper_resets || 0);
+  setTxt('s9099-resets', (st.paper_resets || 0) + ' / ' + (st.brake_releases || 0));
   const resetCard = document.getElementById('s9099-resets');
   if (resetCard) resetCard.style.color = (st.paper_resets || 0) > 0 ? 'var(--red)' : '';
   setTxt('s9099-seen', st.candidates_seen || 0);

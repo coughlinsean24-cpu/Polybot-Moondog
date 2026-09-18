@@ -1073,7 +1073,8 @@ class Strategy9099:
         self.daily_loss = 0.0
         self.consecutive_losses = 0
         self.api_errors = 0
-        self.paper_resets = 0        # how many times a paper bankroll was wiped out
+        self.paper_resets = 0        # genuine wipeouts: the bankroll was refilled
+        self.brake_releases = 0      # loss brakes cleared, no money invented
         self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         self._balance_cache = (0.0, 0.0)  # (value, fetched_at)
@@ -1285,28 +1286,44 @@ class Strategy9099:
         balance = self.available_balance()
         # Enough to clear the exchange minimum at the entry price, plus fees.
         needed = max(self.min_balance, self.min_shares * self.entry_price_min * 1.05)
-        reasons = []
-        if balance < needed:
-            reasons.append(f"bankroll down to ${balance:.2f}")
+
+        # Two different things, which must not be conflated. Releasing a loss
+        # brake lets trading continue; refilling the bankroll invents money.
+        # Doing both at once hid real losses: the balance read like a fresh
+        # $500 while realized P&L was negative, so the two disagreed with no
+        # way to tell which was right.
+        brakes = []
         if self.max_daily_loss > 0 and self.daily_loss >= self.max_daily_loss:
-            reasons.append(f"daily loss cap (${self.daily_loss:.2f})")
+            brakes.append(f"daily loss cap (${self.daily_loss:.2f})")
         if self.max_consecutive_losses and self.consecutive_losses >= self.max_consecutive_losses:
-            reasons.append(f"{self.consecutive_losses} consecutive losses")
-        if not reasons:
+            brakes.append(f"{self.consecutive_losses} consecutive losses")
+        depleted = balance < needed
+
+        if not brakes and not depleted:
             return False
 
-        self.paper_resets += 1
-        self.broker.balance = self._starting_bankroll
-        self._balance_cache = (self._starting_bankroll, self.clock())
-        self.daily_loss = 0.0
-        self.consecutive_losses = 0
-        self._log(
-            f"PAPER RESET #{self.paper_resets} — {'; '.join(reasons)}. "
-            f"Bankroll back to ${self._starting_bankroll:.2f}. "
-            f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
-            f"({self.wins}W/{self.losses}L).",
-            "warn",
-        )
+        if brakes:
+            self.brake_releases += 1
+            self.daily_loss = 0.0
+            self.consecutive_losses = 0
+            self._log(
+                f"paper brake released ({'; '.join(brakes)}) — counters cleared, "
+                f"bankroll untouched at ${balance:.2f}. "
+                f"Cumulative P&L ${self.realized_pnl:+.2f} ({self.wins}W/{self.losses}L).",
+                "warn",
+            )
+
+        if depleted:
+            self.paper_resets += 1
+            self.broker.balance = self._starting_bankroll
+            self._balance_cache = (self._starting_bankroll, self.clock())
+            self._log(
+                f"PAPER WIPEOUT #{self.paper_resets} — bankroll was ${balance:.2f}, "
+                f"refilled to ${self._starting_bankroll:.2f}. "
+                f"Cumulative P&L stays at ${self.realized_pnl:+.2f} "
+                f"({self.wins}W/{self.losses}L).",
+                "warn",
+            )
         return True
 
     def check_risk_gates(self, market_id: str = "") -> tuple[bool, str]:
@@ -2607,6 +2624,7 @@ class Strategy9099:
             "not_trading_because": self._not_trading_because(),
             "api_errors": self.api_errors,
             "paper_resets": self.paper_resets,
+            "brake_releases": self.brake_releases,
             "paper_auto_reset": self.paper_auto_reset and not self.is_live,
             "params": self.params(),
             "size_preview": self.explain_size(),
@@ -2782,8 +2800,13 @@ class Strategy9099:
                     "candidates_rejected": self.candidates_rejected,
                     "candidates_observed": self.candidates_observed,
                     "paper_resets": self.paper_resets,
+                    "brake_releases": self.brake_releases,
                 },
                 "positions": [p.to_dict() for p in self.positions.values()],
+                # Persisted alongside the counters: restoring wins/losses but
+                # not the trades behind them made the dashboard contradict
+                # itself after every restart.
+                "closed": [p.to_dict() for p in self.closed[-200:]],
                 "traded_markets": sorted(self.traded_markets),
             }
             tmp = self.state_file + ".tmp"
@@ -2812,11 +2835,22 @@ class Strategy9099:
             self._log(f"could not read saved state: {e}", "warn")
             return 0
 
+        # Counters and the trades behind them are restored together or not at
+        # all, so the two can never disagree.
         if payload.get("day") == self.day:
             c = payload.get("counters", {})
             for key, value in c.items():
                 if hasattr(self, key):
                     setattr(self, key, value)
+            for raw in payload.get("closed", []):
+                try:
+                    done = Position.from_dict(raw)
+                except Exception:
+                    continue
+                if done.phase == Phase.CLOSED and done.mode == self.mode:
+                    self.closed.append(done)
+            if self.closed:
+                self._log(f"restored {len(self.closed)} closed trade(s) from today")
 
         restored = 0
         for raw in payload.get("positions", []):
