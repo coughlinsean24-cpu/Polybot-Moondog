@@ -286,7 +286,15 @@ S9099_MIN_SHARES = int(os.getenv("S9099_MIN_SHARES", "5"))
 
 # ── Emergency exit ────────────────────────────────────────────────────────
 # Bail out if the side we bought trades down to this bid.
-S9099_STOP_PRICE = float(os.getenv("S9099_STOP_PRICE", "0.80"))
+#
+# This is the backstop, not the working stop. The velocity rule below fires on
+# a 5c drop in 5s, so on any ordinary move it exits long before the bid gets
+# near this number — which only comes into play on a gap that skips straight
+# past it. At 0.80 it was catching those gaps ON THE WAY DOWN and labelling
+# them stop_price when the velocity rule would have exited at the same bid
+# anyway (_stop_reason checks price first). Lower means the label reflects
+# what actually happened, and the price stop is reserved for a real collapse.
+S9099_STOP_PRICE = float(os.getenv("S9099_STOP_PRICE", "0.60"))
 # Exit anything still open at T-minus this many seconds.  0 disables and lets
 # the position ride into settlement.
 S9099_EXIT_BEFORE_EXPIRY = float(os.getenv("S9099_EXIT_BEFORE_EXPIRY", "3"))

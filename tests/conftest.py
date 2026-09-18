@@ -209,6 +209,11 @@ def engine(feed, logs, tmp_path):
     eng.max_consecutive_losses = 3
     eng.max_trades_per_day = 40
     eng.entry_price_max = 0.96
+    # These tests drive a stop-out by dropping the bid to 0.78, so they need
+    # the stop above it. It is pinned rather than left to the default, which
+    # is a tuning knob and moves. Note pos.stop_price is snapshotted at entry,
+    # so this has to be set before the position opens, not after.
+    eng.stop_price = 0.80
     # These tests are about the accounting that runs when the balance moves
     # with the P&L. Pinned buying power is a separate mode with its own
     # invariant (see test_fixed_bankroll.py), so it is off here rather than
