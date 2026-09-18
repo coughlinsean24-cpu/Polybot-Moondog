@@ -168,6 +168,20 @@ def print_config_summary():
 # the strategy in paper mode — a typo can never promote it to live.
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
+# Hard per-trade dollar ceiling that applies ONLY in live mode, on top of
+# whatever the sizing knobs say.
+#
+# The paper defaults size at 100% of bankroll with no dollar cap, which is
+# right for paper: the bankroll is a fixed $500 and the point is a big, clean
+# sample. In live, "bankroll" is the real USDC balance — so those same
+# settings bet the entire wallet on one 5-minute market, and funding the
+# wallet with more than the intended test amount silently raises the stake.
+# This is the backstop for that: like HARD_MAX_BID_PRICE above, it is not
+# reachable from the dashboard and does not care what the other knobs say.
+S9099_LIVE_MAX_POSITION_DOLLARS = float(
+    os.getenv("S9099_LIVE_MAX_POSITION_DOLLARS", "50")
+)
+
 
 def strategy_9099_is_live() -> bool:
     """True only when every gate is explicitly open. Fail closed."""

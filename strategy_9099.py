@@ -1013,6 +1013,10 @@ class Strategy9099:
         self.max_api_errors: int = config.S9099_MAX_API_ERRORS
         self.market_cooldown: float = config.S9099_MARKET_COOLDOWN
         self.paper_auto_reset: bool = config.S9099_PAPER_AUTO_RESET
+        # Live-only hard per-trade cap. Deliberately not in params()/
+        # set_params(): the dashboard must not be able to raise it.
+        self.live_max_position_dollars: float = (
+            config.S9099_LIVE_MAX_POSITION_DOLLARS)
         # Paper only: hold buying power at the starting bankroll so sizing does
         # not drift with the running P&L. See _fixed_bankroll_active().
         self.paper_fixed_bankroll: bool = config.S9099_PAPER_FIXED_BANKROLL
@@ -1264,6 +1268,29 @@ class Strategy9099:
                 f"${self.tp_price - self.entry_price_max:.2f} to the take-profit — "
                 f"fees eat most of that"
             )
+        if self.is_live:
+            warnings.append(
+                f"LIVE — every trade is hard-capped at "
+                f"${self.live_max_position_dollars:.0f} "
+                f"(S9099_LIVE_MAX_POSITION_DOLLARS), whatever the sizing boxes say"
+            )
+            # Going live means MANUAL_ONLY=false, and that switch does not
+            # belong to this strategy. It re-arms the arb engine, which places
+            # its own orders and is not covered by this strategy's auto-trade
+            # toggle, and it lets the limit-bid engine post if its dashboard
+            # toggle is on. Neither is what "test the 90/99 infrastructure
+            # with $50" means.
+            if config.ARB_ENABLED:
+                warnings.append(
+                    "LIVE and ARB_ENABLED is true — the arb engine places its own "
+                    "real orders and is NOT covered by this strategy's toggles. "
+                    "Set ARB_ENABLED=false for a 90/99-only live test"
+                )
+            if config.TRADING_ENABLED and not config.MANUAL_ONLY:
+                warnings.append(
+                    "LIVE — the limit-bid engine will post real bids too if its "
+                    "Auto-Trade toggle is on. Check it is off"
+                )
         if self.is_live and self.paper_fixed_bankroll:
             warnings.append(
                 "Fixed buying power is ticked but this is LIVE — it is ignored. "
@@ -1547,6 +1574,11 @@ class Strategy9099:
         budget = min(budget, balance)
         if self.max_position_dollars > 0:
             budget = min(budget, self.max_position_dollars)
+        # Live-only hard ceiling, applied last so nothing can raise it: not the
+        # sizing mode, not the dashboard, not a wallet with more in it than the
+        # test was meant to risk.
+        if self.is_live and self.live_max_position_dollars > 0:
+            budget = min(budget, self.live_max_position_dollars)
         if budget <= 0:
             return 0
 
