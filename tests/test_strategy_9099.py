@@ -1353,8 +1353,14 @@ def test_all_blocking_reasons_are_recorded_not_just_the_last(engine, feed, logs)
     cand = engine.candidates[(market.market_id, "Up", 0.90)]
     assert "thin_book" in cand.reason_first
 
-    # Price drops out of the band: the decision closes on price, as before.
+    # Price drops out of the band and stays out until the window shuts.
+    # (The dip alone no longer closes the decision — the price is free to come
+    # back into the band while an entry is still allowed. See test_recross.)
     feed.set(market.token_id_up, ask=0.85, ask_size=100, bid=0.84, bid_size=500)
+    engine.on_tick([market])
+    assert not logs["candidate"].rows, "a dip is not a verdict"
+
+    market.end_time = market_ending_in(5).end_time
     engine.on_tick([market])
 
     row = [r for r in logs["candidate"].rows if r["observe_level"] == 0.90][0]
