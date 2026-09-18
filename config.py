@@ -168,6 +168,20 @@ def print_config_summary():
 # the strategy in paper mode — a typo can never promote it to live.
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 
+# Hard per-trade dollar ceiling that applies ONLY in live mode, on top of
+# whatever the sizing knobs say.
+#
+# The paper defaults size at 100% of bankroll with no dollar cap, which is
+# right for paper: the bankroll is a fixed $500 and the point is a big, clean
+# sample. In live, "bankroll" is the real USDC balance — so those same
+# settings bet the entire wallet on one 5-minute market, and funding the
+# wallet with more than the intended test amount silently raises the stake.
+# This is the backstop for that: like HARD_MAX_BID_PRICE above, it is not
+# reachable from the dashboard and does not care what the other knobs say.
+S9099_LIVE_MAX_POSITION_DOLLARS = float(
+    os.getenv("S9099_LIVE_MAX_POSITION_DOLLARS", "50")
+)
+
 
 def strategy_9099_is_live() -> bool:
     """True only when every gate is explicitly open. Fail closed."""
@@ -286,7 +300,15 @@ S9099_MIN_SHARES = int(os.getenv("S9099_MIN_SHARES", "5"))
 
 # ── Emergency exit ────────────────────────────────────────────────────────
 # Bail out if the side we bought trades down to this bid.
-S9099_STOP_PRICE = float(os.getenv("S9099_STOP_PRICE", "0.80"))
+#
+# This is the backstop, not the working stop. The velocity rule below fires on
+# a 5c drop in 5s, so on any ordinary move it exits long before the bid gets
+# near this number — which only comes into play on a gap that skips straight
+# past it. At 0.80 it was catching those gaps ON THE WAY DOWN and labelling
+# them stop_price when the velocity rule would have exited at the same bid
+# anyway (_stop_reason checks price first). Lower means the label reflects
+# what actually happened, and the price stop is reserved for a real collapse.
+S9099_STOP_PRICE = float(os.getenv("S9099_STOP_PRICE", "0.60"))
 # Exit anything still open at T-minus this many seconds.  0 disables and lets
 # the position ride into settlement.
 S9099_EXIT_BEFORE_EXPIRY = float(os.getenv("S9099_EXIT_BEFORE_EXPIRY", "3"))
