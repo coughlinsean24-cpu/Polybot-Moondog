@@ -1566,6 +1566,121 @@ def test_an_unfilled_entry_still_appears(engine, feed):
     assert trades[0]["pnl"] == 0
 
 
+def test_a_position_is_managed_after_its_market_leaves_the_list(engine, feed):
+    """
+    The caller prunes closed markets about a minute after expiry. A position
+    still open then used to stop being advanced entirely — no stop, no expiry
+    exit, no settlement — and sat in TP_PENDING for the life of the process.
+    """
+    market, pos = _open_position(engine, feed, secs=30)
+    assert pos.phase == Phase.TP_PENDING
+    engine._resolve_fn = lambda mid: {"resolved": True, "winner": "Up"}
+
+    # The market expires and the caller stops passing it.
+    market.end_time = datetime.now(timezone.utc) - timedelta(seconds=120)
+    pos.end_time_iso = market.end_time.isoformat()
+    feed.set(market.token_id_up, ask=0, ask_size=0, bid=0, bid_size=0)
+
+    engine.on_tick([])          # nothing in the watch list at all
+    assert pos.unwatched_since > 0, "it noticed"
+    engine.on_tick([])
+    assert pos.phase == Phase.CLOSED, "and finished it"
+    assert pos.market_result == "Up"
+    assert market.market_id not in engine.positions
+
+
+def test_a_filtered_out_asset_still_gets_its_position_closed(engine, feed):
+    """
+    Narrowing Assets to BTC while an ETH position is open must not strand it.
+    """
+    market, pos = _open_position(engine, feed, secs=30)
+    market.asset = "ETH"
+    pos.asset = "ETH"
+    engine.set_params({"assets": "BTC"})
+    engine._resolve_fn = lambda mid: {"resolved": True, "winner": "Up"}
+
+    # The market is still being passed in, but the filter skips it.
+    feed.set(market.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=pos.tp_qty)
+    engine.on_tick([market])
+    assert pos.phase == Phase.CLOSED, "the held position still gets managed"
+    assert pos.exit_reason == "tp_filled"
+
+
+def test_settled_shares_return_their_cash_to_the_paper_balance(engine, feed):
+    """
+    Shares that settle rather than sell never pass through the broker. Not
+    crediting them left the cash permanently spent, which then read as a
+    wipeout and got refilled — inventing the money twice.
+    """
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    start = engine.available_balance()
+
+    market, pos = _open_position(engine, feed, secs=30)
+    spent = pos.entry_filled_qty * pos.entry_fill_price
+    assert engine.broker.balance == pytest.approx(start - spent, abs=0.01)
+
+    # No bid to sell into: it is held to resolution and settles at $1.
+    engine.exit_before_expiry = 3
+    engine._resolve_fn = lambda mid: {"resolved": True, "winner": pos.side}
+    market.end_time = datetime.now(timezone.utc) + timedelta(seconds=1)
+    pos.end_time_iso = market.end_time.isoformat()
+    feed.set(market.token_id_up, ask=0.99, ask_size=10, bid=0.0, bid_size=0)
+    engine.on_tick([market])
+    engine.on_tick([market])
+
+    assert pos.phase == Phase.CLOSED
+    assert pos.settled_value == 1.0
+    held = pos.entry_filled_qty
+    assert engine.broker.balance == pytest.approx(
+        start - spent + held - pos.fees_total, abs=0.01), "the settled shares paid out"
+    assert engine.paper_resets == 0, "so it was never mistaken for a wipeout"
+    assert engine.available_balance(max_age=0.0) > start
+
+
+@pytest.mark.parametrize("exit_path", ["take_profit", "settle_win", "settle_loss", "stop_out"])
+def test_bankroll_always_equals_start_plus_pnl(engine, feed, exit_path):
+    """
+    The one invariant that makes paper results trustworthy. It was broken two
+    ways: settled shares never paid back into the balance, and fees came out
+    of the P&L but never out of the balance.
+    """
+    engine.size_mode = "percent_bankroll"
+    engine.max_position_percent = 100
+    engine.max_position_dollars = 0
+    start = engine.available_balance()
+
+    market, pos = _open_position(engine, feed, secs=60)
+
+    if exit_path == "take_profit":
+        feed.set(market.token_id_up, ask=1.00, ask_size=10, bid=0.99, bid_size=pos.tp_qty)
+        engine.on_tick([market])
+    elif exit_path == "stop_out":
+        feed.set(market.token_id_up, ask=0.81, ask_size=500, bid=0.78, bid_size=500)
+        engine.on_tick([market])
+        engine.on_tick([market])
+    else:
+        winner = pos.side if exit_path == "settle_win" else (
+            "Down" if pos.side == "Up" else "Up")
+        engine._resolve_fn = lambda mid: {"resolved": True, "winner": winner}
+        engine.exit_before_expiry = 3
+        market.end_time = datetime.now(timezone.utc) + timedelta(seconds=1)
+        pos.end_time_iso = market.end_time.isoformat()
+        feed.set(market.token_id_up, ask=0.99, ask_size=10, bid=0.0, bid_size=0)
+        engine.on_tick([market])
+        engine.on_tick([market])
+
+    assert pos.phase == Phase.CLOSED, f"{exit_path} did not finish"
+    assert engine.broker.balance == pytest.approx(start + engine.realized_pnl, abs=0.01), (
+        f"{exit_path}: bankroll ${engine.broker.balance:.2f} does not match "
+        f"${start:.2f} + P&L ${engine.realized_pnl:+.2f}"
+    )
+    assert pos.fees_total > 0, "fees were charged..."
+    # ...and they left the balance, not just the P&L.
+    assert engine.broker.balance < start + pos.gross_pnl
+
+
 def test_max_open_positions_is_enforced(engine, feed):
     engine.max_open_positions = 1
     m1, _ = _open_position(engine, feed, market_id="0xone")
